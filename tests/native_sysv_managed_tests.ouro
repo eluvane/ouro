@@ -1,0 +1,276 @@
+import "../compiler/native/sysv_managed.ouro",
+  "../compiler/native/codegen_assembly.ouro",
+  "native_codegen_assembly_tests.ouro",
+  "native_sysv_fixtures.ouro",
+  "../std/test.ouro";
+
+def sysvm_test_words (actual : List (List Nat)) (expected : List (List Nat)) : Bool :=
+    (fix compare (left : List (List Nat)) (right : List (List Nat)) : Bool :=
+      match left, right with
+      | Nil, Nil => True | Nil, Cons _ _ => False | Cons _ _, Nil => False
+      | Cons a more_a, Cons b more_b => andb (pe_bytes_equal a b) (compare more_a more_b) end) actual expected;
+
+def sysvm_test_encoded (name : String) (actual : Either NativeCodegenError CodegenEncoded)
+    (bytes : List Nat) (fixups : List (List Nat)) (calls : List (List Nat)) : Test :=
+    match actual with | Left _ => test_fail name "assembly rejected"
+    | Right encoded => match encoded with | CodegenEncodedParts got patches sites => assert_true name
+        (andb (pe_bytes_equal got bytes)
+          (andb (sysvm_test_words (map PeFixup (List Nat) assembly_test_fixup patches) fixups)
+            (sysvm_test_words (map NativeCallSite (List Nat)
+              (fun (site : NativeCallSite) => match site with | NativeCallAt block instruction rva => [block,instruction,rva] end) sites) calls))) end end;
+
+def sysvm_test_native_error (error : NativeCodegenError) : String :=
+    match error with
+    | NativeMirError _ => "mir" | NativePeError _ => "pe"
+    | NativeEncodingError problem => match problem with
+      | X64ByteOutOfRange byte => str_concat "byte:" (str_of_nat byte)
+      | X64DisplacementOutOfRange => "displacement" | X64StackPointerIndex => "index"
+      | X64ShiftOutOfRange width count => str_concat
+          (match width with | X64Bits32 => "shift32:" | X64Bits64 => "shift64:" end) (str_of_nat count) end
+    | NativeMissingSlot id => str_concat "slot:" (str_of_nat id)
+    | NativeMissingLabel id => str_concat "label:" (str_of_nat id)
+    | NativeCodeTooLarge => "size" end;
+
+def sysvm_test_error_text (error : SysvCallError) : String :=
+    match error with
+    | SysvFrameTooLarge size => str_concat "frame:" (str_of_nat size)
+    | SysvArgumentOutOfRange index => str_concat "arg:" (str_of_nat index)
+    | SysvOffsetOutOfRange offset => str_concat "offset:" (str_of_nat offset)
+    | SysvUnknownFunction id => str_concat "function:" (str_of_nat id)
+    | SysvCodegenRejected error => sysvm_test_native_error error end;
+
+def sysvm_test_atoms (name : String) (actual : Either SysvCallError (List CodegenAtom))
+    (bytes : List Nat) (fixups : List (List Nat)) (calls : List (List Nat)) : Test :=
+    match actual with
+    | Left error => test_fail name (sysvm_test_error_text error)
+    | Right atoms => sysvm_test_encoded name (codegen_assemble atoms 0 0) bytes fixups calls end;
+
+def sysvm_test_error (A : Type) (name : String) (actual : Either SysvCallError A) (expected : String) : Test :=
+    match actual with | Left error => assert_eq name (sysvm_test_error_text error) expected
+    | Right _ => test_fail name "invalid input accepted" end;
+
+def sysvm_test_slots (slots : List CodegenSlot) : List (List Nat) :=
+    map CodegenSlot (List Nat) (fun (slot : CodegenSlot) => match slot with
+      | CodegenSlotAt id ty offset => [id,mir_type_code ty,offset] end) slots;
+
+def sysvm_test_frame (name : String) (function : MirFunction) (allocation : Nat)
+    (expected : List (List Nat)) : Test :=
+    match sysv_managed_frame function with | Left _ => test_fail name "frame rejected"
+    | Right frame => match frame with | CodegenFrameOf got slots => assert_true name
+        (andb (eq_nat got allocation) (sysvm_test_words (sysvm_test_slots slots) expected)) end end;
+
+def sysvm_test_word (ty : MirType) (value : Nat) : MirValue :=
+    MirBits ty (X64Words64 (pe_word32 value) (pe_word32 0));
+
+def sysvm_test_function (id : Nat) (args : List MirLocal) (locals : List MirLocal)
+    (instructions : List MirInstruction) : MirFunction :=
+    MirFunctionDef id [102] args locals (Just MirType MirU32) 0
+      [MirBlockDef 0 instructions (MirReturn (Just MirValue (sysvm_test_word MirU32 42)))];
+
+def sysvm_test_six : MirFunction :=
+    sysvm_test_function 4 (sysv_fixture_args 6 MirManagedPtr) [] [];
+
+def sysvm_test_eight : MirFunction :=
+    sysvm_test_function 4 (sysv_fixture_args 8 MirManagedPtr) []
+      [MirCall(MirMayGc, Nothing Nat, MirDirect 7, replicate MirValue (sysvm_test_word MirU64 0) 8)];
+
+def sysvm_test_pair : MirFunction :=
+    sysvm_test_function 2 [] [MirLocalDef 0 MirManagedPtr,MirLocalDef 1 MirUSize] [];
+
+def sysvm_test_program : MirProgram :=
+    MirProgramDef [sysvm_test_function 1 [] [] [], sysvm_test_pair,
+      sysvm_test_function 3 [] [] [], sysvm_test_six] [] [] 1;
+
+def sysvm_test_empty : MirProgram := MirProgramDef [] [] [] 0;
+
+def sysvm_test_alloc_slots : List CodegenSlot :=
+    [CodegenSlotAt 0 MirManagedPtr 0,CodegenSlotAt 1 MirUSize 8];
+
+def sysvm_test_alloc_bytes (windows : Bool) : List Nat :=
+    concat_map (List Nat) Nat (fun (part : List Nat) => part)
+      [[72,141,5,0,0,0,0,76,139,80,40,73,129,250,0,16,0,0,15,130,26,0,0,0,
+        73,129,234,0,16,0,0,72,139,68,36,8,73,57,194,15,130,5,0,0,0,233,29,0,0,0],
+       (match windows with
+        | True => [72,141,5,0,0,0,0,72,137,193,232,0,0,0,0,129,248,1,0,0,0,15,132,2,0,0,0,15,11]
+        | False => [72,141,5,0,0,0,0,72,137,199,232,0,0,0,0,129,248,1,0,0,0,15,132,2,0,0,0,15,11] end),
+       (match windows with
+        | True => [72,141,5,0,0,0,0,72,137,193,72,141,5,0,0,0,0,72,137,194,76,139,68,36,8,232,0,0,0,0]
+        | False => [72,141,5,0,0,0,0,72,137,199,72,141,5,0,0,0,0,72,137,198,72,139,84,36,8,232,0,0,0,0] end),
+       [72,129,248,0,0,0,0,15,133,2,0,0,0,15,11,73,137,195,72,129,224,7,0,0,0,
+        72,129,248,0,0,0,0,15,132,2,0,0,0,15,11,72,141,5,0,0,0,0,76,139,16,77,57,218,
+        15,132,2,0,0,0,15,11,72,141,5,0,0,0,0,77,139,19,73,57,194,15,132,2,0,0,0,15,11,
+        72,139,68,36,8,77,139,83,8,73,57,194,15,132,2,0,0,0,15,11,77,139,83,24,
+        73,129,250,0,0,0,0,15,132,2,0,0,0,15,11,76,137,28,36]];
+
+def sysvm_test_alloc_fixups : List (List Nat) :=
+    [[0,0,3,7,0,2],[0,0,53,57,0,2],[0,0,61,65,0,4],[0,0,82,86,0,2],
+     [0,0,92,96,0,9],[0,0,105,109,0,3],[0,0,152,156,0,2],[0,0,173,177,0,9]];
+
+def sysvm_test_spill (name : String) (function : MirFunction) (expected : List Nat) : Test :=
+    match function with | MirFunctionDef _ _ args _ _ _ _ =>
+      match sysv_managed_frame function with | Left _ => test_fail name "frame rejected"
+      | Right frame => match frame with | CodegenFrameOf allocation slots =>
+          sysvm_test_atoms name (sysv_spill_args slots allocation args 0) expected [] [] end end end;
+
+def sysvm_test_data_words (object : MirData) : List Nat :=
+    match object with | MirDataDef id writable bytes =>
+      append Nat [id,match writable with | True => 1 | False => 0 end] bytes end;
+
+def sysvm_test_data (name : String) (actual : Either SysvCallError (List MirData))
+    (expected : List (List Nat)) : Test :=
+    match actual with | Left _ => test_fail name "data rejected"
+    | Right objects => assert_true name
+        (sysvm_test_words (map MirData (List Nat) sysvm_test_data_words objects) expected) end;
+
+def sysvm_test_large (count : Nat) (rooted : Bool) : MirFunction :=
+    sysvm_test_function 1 [] (match rooted with
+      | False => sysv_fixture_args count MirU64
+      | True => match count with | Z => [] | S rest => Cons MirLocal (MirLocalDef 0 MirManagedPtr)
+          (map MirLocal MirLocal (fun (local : MirLocal) => match local with | MirLocalDef id ty => MirLocalDef (S id) ty end)
+            (sysv_fixture_args rest MirU64)) end end) [];
+
+def sysvm_test_limit (name : String) (count : Nat) (rooted : Bool) : Test :=
+    match sysv_managed_frame (sysvm_test_large count rooted) with
+    | Left _ => test_fail name "frame rejected"
+    | Right frame => match frame with | CodegenFrameOf allocation slots => assert_true name
+        (andb (eq_nat allocation 4088)
+          (andb (eq_nat (length CodegenSlot slots) count)
+            (sysvm_test_words (sysvm_test_slots slots)
+              (map MirLocal (List Nat) (fun (local : MirLocal) => match local with | MirLocalDef id _ =>
+                [id,match andb rooted (eq_nat id 0) with | True => 6 | False => 2 end,add (match rooted with | True => 32 | False => 0 end) (mul 8 id)] end)
+                (sysv_fixture_args count MirU64))))) end end;
+
+def sysvm_test_laws : List Test :=
+    [sysvm_test_encoded "Win64 allocation preserves complete bytes, guards and boundaries"
+       (match codegen_managed_alloc sysvm_test_empty sysvm_test_alloc_slots 7 8 0 3 4 9 (MirUse 1) with
+        | Left error => Left NativeCodegenError CodegenEncoded error | Right atoms => codegen_assemble atoms 0 0 end)
+       (sysvm_test_alloc_bytes True) sysvm_test_alloc_fixups [[7,8,4161],[7,8,4205]],
+     sysvm_test_atoms "SysV allocation preserves complete bytes, guards and boundaries"
+       (sysv_managed_alloc sysvm_test_empty sysvm_test_alloc_slots 7 8 0 3 4 9 (MirUse 1))
+       (sysvm_test_alloc_bytes False) sysvm_test_alloc_fixups [[7,8,4161],[7,8,4205]],
+     sysvm_test_error (List CodegenAtom) "Allocation size read fails before missing destination"
+       (sysv_managed_alloc sysvm_test_empty [] 7 8 99 3 4 9 (MirUse 98)) "slot:98",
+     sysvm_test_error (List CodegenAtom) "Allocation refuses a missing result slot"
+       (sysv_managed_alloc sysvm_test_empty sysvm_test_alloc_slots 7 8 99 3 4 9 (MirUse 1)) "slot:99",
+     match sysv_managed_alloc sysvm_test_empty sysvm_test_alloc_slots 7 8 0 3 4 9
+       (MirBits MirUSize (X64Words64 (X64Bytes32 256 0 0 0) (pe_word32 0))) with
+     | Left _ => test_fail "Allocation assembly rejects malformed size bytes" "selection rejected before assembly"
+     | Right atoms => match codegen_assemble atoms 0 0 with
+       | Right _ => test_fail "Allocation assembly rejects malformed size bytes" "invalid byte accepted"
+       | Left error => assert_eq "Allocation assembly rejects malformed size bytes" (sysvm_test_native_error error) "byte:256" end end,
+     sysvm_test_frame "Rootless empty frame remains scalar SysV" (sysvm_test_function 1 [] [] []) 8 [],
+     sysvm_test_frame "Managed locals reserve one separate shadow header" sysvm_test_pair 72 [[0,6,32],[1,4,40]],
+     sysvm_test_frame "Six managed arguments keep the SysV ABI and collector prefix" sysvm_test_six 104
+       [[0,6,32],[1,6,40],[2,6,48],[3,6,56],[4,6,64],[5,6,72]],
+     sysvm_test_frame "Eight managed arguments separate outgoing stack slots and roots" sysvm_test_eight 120
+       [[0,6,32],[1,6,40],[2,6,48],[3,6,56],[4,6,64],[5,6,72],[6,6,80],[7,6,88]],
+     sysvm_test_frame "Rooted callers keep all outgoing stack argument storage"
+       (sysvm_test_function 4 (sysv_fixture_args 8 MirManagedPtr) []
+         [MirCall(MirMayGc, Nothing Nat, MirDirect 7, replicate MirValue (sysvm_test_word MirU64 0) 11)]) 136
+       [[0,6,40],[1,6,48],[2,6,56],[3,6,64],[4,6,72],[5,6,80],[6,6,88],[7,6,96]],
+     match sysv_managed_frame sysvm_test_eight with
+     | Left _ => test_fail "SysV roots satisfy the retained collector range" "frame rejected"
+     | Right frame => match frame with | CodegenFrameOf allocation slots =>
+         let roots : List NativeRootSlot := codegen_root_slots slots in
+         assert_true "SysV roots satisfy the retained collector range"
+           (andb (eq_nat (length NativeRootSlot roots) 8)
+             (all NativeRootSlot (fun (root : NativeRootSlot) => match root with | NativeRootAt _ offset =>
+               andb (leb_nat 32 offset) (leb_nat (add offset 8) (sub allocation 24)) end) roots)) end end,
+     sysvm_test_frame "Rootless eight-argument caller retains scalar offsets"
+       (sysvm_test_function 1 (sysv_fixture_args 8 MirU64) []
+         [MirCall(MirMayGc, Nothing Nat, MirDirect 7, replicate MirValue (sysvm_test_word MirU64 0) 8)]) 88
+       [[0,2,16],[1,2,24],[2,2,32],[3,2,40],[4,2,48],[5,2,56],[6,2,64],[7,2,72]],
+     sysvm_test_spill "Six incoming arguments spill from the SysV registers in order" sysvm_test_six
+       [72,137,248,72,137,68,36,32,72,137,240,72,137,68,36,40,72,137,208,72,137,68,36,48,
+        72,137,200,72,137,68,36,56,76,137,192,72,137,68,36,64,76,137,200,72,137,68,36,72],
+     sysvm_test_spill "Eight incoming arguments use allocation plus return-address stack base" sysvm_test_eight
+       [72,137,248,72,137,68,36,32,72,137,240,72,137,68,36,40,72,137,208,72,137,68,36,48,
+        72,137,200,72,137,68,36,56,76,137,192,72,137,68,36,64,76,137,200,72,137,68,36,72,
+        72,139,132,36,128,0,0,0,72,137,68,36,80,72,139,132,36,136,0,0,0,72,137,68,36,88],
+     match sysv_managed_frame sysvm_test_eight with | Left _ => test_fail "Outgoing arguments preserve their source slots" "frame rejected"
+     | Right frame => match frame with | CodegenFrameOf _ slots => sysvm_test_atoms "Outgoing arguments preserve their source slots"
+         (sysv_arguments slots (map Nat MirValue MirUse [0,1,2,3,4,5,6,7]) 0)
+         [72,139,68,36,32,72,137,199,72,139,68,36,40,72,137,198,72,139,68,36,48,72,137,194,
+          72,139,68,36,56,72,137,193,72,139,68,36,64,73,137,192,72,139,68,36,72,73,137,193,
+          72,139,68,36,80,72,137,4,36,72,139,68,36,88,72,137,68,36,8] [] [] end end,
+     sysvm_test_limit "Scalar frame accepts the 4088-byte boundary" 511 False,
+     sysvm_test_limit "Rooted frame accepts the 4088-byte boundary" 504 True,
+     sysvm_test_error CodegenFrame "Scalar frame refuses crossing a page" (sysv_managed_frame (sysvm_test_large 512 False)) "frame:4104",
+     sysvm_test_error CodegenFrame "Rooted frame refuses crossing a page" (sysv_managed_frame (sysvm_test_large 505 True)) "frame:4104",
+     sysvm_test_error X64Displacement "Stack argument rejects register index" (sysv_stack_offset 5 0) "arg:5",
+     sysvm_test_error X64Displacement "Stack argument rejects overflowing displacement"
+       (sysv_stack_offset 7 pe_max_rva) (str_concat "offset:" (str_of_nat (add pe_max_rva 8))),
+     sysvm_test_error (List CodegenAtom) "Incoming arguments refuse missing stable slots"
+       (sysv_spill_args [] 72 [MirLocalDef 0 MirManagedPtr] 0) "slot:0",
+     sysvm_test_error (List CodegenAtom) "Incoming stack offset failure precedes missing slot"
+       (sysv_spill_args [] pe_max_rva [MirLocalDef 0 MirManagedPtr] 6)
+       (str_concat "offset:" (str_of_nat (add pe_max_rva 8))),
+     sysvm_test_error (List CodegenAtom) "SysV direct call refuses an unknown function"
+       (sysv_call_target sysvm_test_program [] (MirDirect 99)) "function:99",
+     match mir_validate mir_default_limits sysvm_test_program with
+     | Left _ => test_fail "Descriptor fixture satisfies complete MIR and GC checks" "mir rejected"
+     | Right _ => test_ok "Descriptor fixture satisfies complete MIR and GC checks" end,
+     sysvm_test_data "Mixed frames keep original function-index descriptor IDs and exact root offsets"
+       (sysv_managed_shadow_data [sysvm_test_function 1 [] [] [],sysvm_test_pair,
+         sysvm_test_function 3 [] [] [],sysvm_test_six] 7)
+       [[8,0,1,0,0,0,0,0,0,0,32,0,0,0,0,0,0,0],
+        [10,0,6,0,0,0,0,0,0,0,32,0,0,0,0,0,0,0,40,0,0,0,0,0,0,0,48,0,0,0,0,0,0,0,
+          56,0,0,0,0,0,0,0,64,0,0,0,0,0,0,0,72,0,0,0,0,0,0,0]],
+     sysvm_test_data "Runtime context preserves zero prefix, budget and owner footer"
+       (sysv_managed_runtime_data sysvm_test_program)
+       [append Nat [6,1] (replicate Nat 0 88),
+        [8,0,1,0,0,0,0,0,0,0,32,0,0,0,0,0,0,0],
+        [10,0,6,0,0,0,0,0,0,0,32,0,0,0,0,0,0,0,40,0,0,0,0,0,0,0,48,0,0,0,0,0,0,0,
+          56,0,0,0,0,0,0,0,64,0,0,0,0,0,0,0,72,0,0,0,0,0,0,0]],
+     sysvm_test_data "Scalar program adds no managed runtime data" (sysv_managed_runtime_data sysvm_test_empty) [],
+     sysvm_test_error (List MirData) "Descriptor symbol overflow is rejected before frame work"
+       (sysv_managed_shadow_data [sysvm_test_large 512 False] (S pe_max_rva))
+       (str_concat "offset:" (str_of_nat (S pe_max_rva))),
+     sysvm_test_error (List MirData) "Descriptor traversal does not skip an oversized rootless function"
+       (sysv_managed_shadow_data [sysvm_test_pair,sysvm_test_large 512 False] 7) "frame:4104",
+     sysvm_test_error (List MirData) "Runtime symbol overflow refuses context allocation"
+       (sysv_managed_runtime_data (MirProgramDef [sysvm_test_function pe_max_rva [] [MirLocalDef 0 MirManagedPtr] []] [] [] pe_max_rva))
+       (str_concat "offset:" (str_of_nat (add pe_max_rva 2))),
+     match sysv_managed_context_size 0 with
+     | Left _ => test_fail "Empty descriptor context keeps both footer words" "size rejected"
+     | Right bytes => assert_true "Empty descriptor context keeps both footer words" (eq_nat bytes 56) end,
+     match sysv_managed_context_size (sub (mul 8 pe_byte3_place) 4) with
+     | Left _ => test_fail "Context size accepts the last representable aligned extent" "size rejected"
+     | Right bytes => assert_true "Context size accepts the last representable aligned extent" (eq_nat bytes (sub pe_max_rva 7)) end,
+     sysvm_test_error Nat "Context size rejects the first overflowing aligned extent"
+       (sysv_managed_context_size (sub (mul 8 pe_byte3_place) 3))
+       (str_concat "offset:" (str_of_nat (add pe_max_rva 9))),
+     sysvm_test_encoded "Entry initializes exact SysV shadow descriptor whitelist"
+       (codegen_assemble (codegen_runtime_initialize sysvm_test_program 1) 0 0)
+       [72,141,5,0,0,0,0,73,137,194,184,2,0,0,0,73,137,66,32,72,141,5,0,0,0,0,
+        73,137,66,40,184,2,0,0,0,73,137,66,48,72,141,5,0,0,0,0,73,137,66,56,
+        184,2,0,0,0,73,137,66,64]
+       [[0,0,3,7,0,6],[0,0,22,26,0,8],[0,0,42,46,0,10]] [],
+     sysvm_test_encoded "Nonentry never initializes a second context"
+       (codegen_assemble (codegen_runtime_initialize sysvm_test_program 2) 0 0) [] [] [],
+     sysvm_test_atoms "Managed context uses a symbol LEA and exact destination slot"
+       (sysv_managed_context sysvm_test_program [CodegenSlotAt 0 MirRawPtr 24] 0)
+       [72,141,5,0,0,0,0,72,137,68,36,24] [[0,0,3,7,0,6]] [],
+     sysvm_test_error (List CodegenAtom) "Managed context refuses a missing destination"
+       (sysv_managed_context sysvm_test_program [] 99) "slot:99",
+     match sysv_managed_frame sysvm_test_pair with
+     | Left error => test_fail "SysV frame links the shadow header after its locals" (sysvm_test_error_text error)
+     | Right frame => match frame with | CodegenFrameOf allocation slots =>
+         sysvm_test_atoms "SysV frame links the shadow header after its locals"
+           (sysv_from_codegen (List CodegenAtom) (codegen_shadow_enter sysvm_test_program 2 allocation slots))
+           [72,141,5,0,0,0,0,76,139,80,8,76,137,84,36,48,72,141,5,0,0,0,0,
+            72,137,68,36,56,72,137,100,36,64,76,141,84,36,48,72,141,5,0,0,0,0,76,137,80,8]
+           [[0,0,3,7,0,6],[0,0,19,23,0,8],[0,0,41,45,0,6]] [] end end,
+     sysvm_test_encoded "SysV shadow leave verifies ownership before unlinking"
+       (codegen_assemble (codegen_shadow_leave sysvm_test_program 72 [CodegenSlotAt 0 MirManagedPtr 32,CodegenSlotAt 1 MirUSize 40] 7 8) 0 0)
+       [72,141,5,0,0,0,0,76,141,84,36,48,76,139,88,8,77,57,218,15,132,2,0,0,0,15,11,76,139,84,36,48,76,137,80,8]
+       [[0,0,3,7,0,6]] [],
+     sysvm_test_error (List CodegenAtom) "Rooted shadow entry refuses an unknown function"
+       (sysv_from_codegen (List CodegenAtom) (codegen_shadow_enter sysvm_test_program 99 72 [CodegenSlotAt 0 MirManagedPtr 32,CodegenSlotAt 1 MirUSize 40])) "label:99",
+     sysvm_test_encoded "Dead roots clear while live call operands remain intact"
+       (codegen_assemble (codegen_clear_dead_roots
+         [CodegenSlotAt 0 MirManagedPtr 32,CodegenSlotAt 1 MirManagedPtr 40,CodegenSlotAt 2 MirU64 48] [0]) 0 0)
+       [184,0,0,0,0,72,137,68,36,40] [] []];
+
+-- @entry main
+def main : IO Unit := test_run sysvm_test_laws;

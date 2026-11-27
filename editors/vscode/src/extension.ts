@@ -11,8 +11,8 @@ import { type TrustedLaunch, trustedLaunch } from "./launch_policy";
 let client: LanguageClient | undefined;
 let channel: LogOutputChannel | undefined;
 
-// The checkout the toolchain runs from: an explicit setting, else the first
-// workspace folder. The server resolves relative import paths against it.
+// The server uses this checkout as its working directory and workspace root.
+// Relative imports resolve from the owning document.
 function ouroRoot(): string | undefined {
 	const configured = workspace.getConfiguration("ouro").get<string>("root");
 	if (configured && configured.length > 0) {

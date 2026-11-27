@@ -65,7 +65,8 @@ def load_cases(corpus: Path = CORPUS) -> list[dict]:
             raise ValueError(f"duplicate lex case name: {name}")
         names.append(name)
         path = corpus / case["file"]
-        if not path.is_file() or not path.resolve().is_relative_to(corpus.resolve()):
+        resolved = path.resolve() if path.is_file() else None
+        if resolved is None or not (resolved.is_relative_to(corpus) or resolved.is_relative_to(corpus.resolve())):
             raise ValueError(f"lex fixture escapes corpus or is missing: {case['file']}")
         language = case.get("language")
         if not isinstance(language, str) or not language:
@@ -115,8 +116,7 @@ def native_argv() -> list[str] | None:
     built = ROOT / "_build" / "native" / "run" / "lex_driver.exe"
     if built.is_file():
         return [str(built)]
-    # `ouro1.sh run` lowers the driver to C. That path is opt-in: this host's
-    # generated C has exceeded clang's default bracket-nesting limit.
+    # The fallback builds and runs a Windows PE, so it requires explicit opt-in.
     if os.environ.get("OURO_STRUCTURAL_LEX_BUILD") == "1" and COMPILER.is_file() and OURO1.is_file():
         return ["sh", str(OURO1), "run", str(DRIVER)]
     return None

@@ -1,10 +1,9 @@
 # Compiler checking
 
-`compiler/file_elab.ouro` owns Ouro's declaration checker. The frontend,
-program builds, evaluation, compiler-source builds, and LSP checking use this
-implementation. The former independent OCaml and Python Core checkers and
-their replay drivers are retired. The historical filename of this page remains
-stable for existing links.
+The [declaration checker](../compiler/file_elab.ouro) serves the frontend,
+program builds, evaluation, compiler-source builds, and LSP. The independent
+OCaml and Python replay paths are described in the
+[archived artifact contract](kernel_core_artifact.md#archived-json-format).
 
 ## Core and declarations
 
@@ -13,12 +12,14 @@ let-bindings, global constants, inductives, constructors, dependent cases,
 structural fixpoints, and typed literal forms. De Bruijn indices identify local
 binders; display names do not determine equality.
 
-`check_declarations` checks exact Core. `check_module` checks the source
-declaration plan and requires every selected declaration to be present. Both
-start with an empty environment and use the same declaration rules. A
-declaration is available to later declarations only after its type, body, or
-inductive descriptor has passed checking. Unknown globals, duplicate names,
-invalid constructor references, and unresolved literals remain errors.
+`check_declarations` accepts two modes. `CheckExactCore` checks the supplied
+Core terms as written. `CheckSourceCore` refines annotations and bodies before
+checking them. `check_module` uses `CheckSourceCore` to check the complete
+source declaration plan and rejects a plan with a missing required declaration.
+Both start with an empty environment and use the same declaration rules.
+Later declarations can use a declaration only after the checker accepts it.
+Unknown globals, duplicate names, invalid constructor references, and
+unresolved literals remain errors.
 
 Import collection computes an ordered module closure. The frontend checks all
 its declarations, including imported bodies and effect roots, before making a
@@ -26,34 +27,36 @@ its declarations, including imported bodies and effect roots, before making a
 handler combinations cannot skip declaration checking. Cycles and incomplete
 dependency input fail at the import or declaration boundary.
 
-Source-only APIs have no filesystem or supplied dependency inventory. They
-reject any unresolved import with the missing-unit error (`92`) before
-lowering, including unused imports and imports in effect roots. Call
-`compile_checked_units` with the complete module closure for importing source;
-direct compiler invocations supply that closure with `--unit`. The declaration
-entry point also rejects residual imports rather than dropping them from its
-checking plan. Comments and string contents are not import declarations.
+Source-only entry points such as `compile_checked_source` have no filesystem
+access or dependency inventory. They report missing-unit error `92` before
+lowering for any unresolved import, including unused imports and imports in
+effect roots. `compile_checked_from_decls` also rejects unresolved imports.
+For source with imports, pass the complete module closure to
+`compile_checked_units` or supply it with `--unit` when invoking the compiler
+directly. The lexer distinguishes imports from the same text in comments
+and string literals.
 
 ## Entry points and results
 
 | Entry point or type | Contract |
 | --- | --- |
-| `check_declarations` | Check an ordered Core declaration list with a cancellation callback. |
-| `check_module` | Check the complete source plan and required declaration set. |
+| `check_declarations` | Check an ordered Core declaration list in the selected mode. Takes a cancellation callback. |
+| `check_module` | Check the complete source plan in source mode and verify the required declaration set. |
 | `DeclarationResult` | Complete accepted environment, or the failing declaration, phase, and typed failure. |
 | `infer_checked`, `check_term_checked` | Checked term inference and expected-type checking. |
 | `whnf_checked`, `normalize_checked`, `conv_checked` | Bounded pure reduction and conversion with explicit malformed-input and resource outcomes. |
 
 `CheckFailure` distinguishes type failures, malformed Core, reduction failures,
 resource limits, unsupported features, cancellation, internal failures, and
-primitive-contract failures. `NormalizeResult` has no successful partial value:
-exhaustion stays `NormalizeExhausted`. Host diagnostics preserve this
-classification when mapping it to command exit status and diagnostic codes.
+primitive-contract failures. `NormalizeResult` reports exhaustion as
+`NormalizeExhausted`. Typed callers receive the original failure. Command-line
+diagnostics map failures to compatibility codes, so distinct failure classes
+can share a numeric code.
 
-The cancellation callback is polled at declaration boundaries, including
-before the first declaration. A cancelled or failed module does not return its
-accepted prefix as a successful module. Compatibility result views for older
-Ouro fixtures call the same checker and contain no separate typing traversal.
+`check_declarations` polls its cancellation callback at declaration boundaries,
+including before the first declaration. A failed or cancelled check returns a
+typed error. Only a completed check returns the accepted environment.
+Compatibility result views for older Ouro fixtures use the same checker.
 
 ## Inductives, cases, and structural recursion
 
@@ -114,8 +117,10 @@ observable reduction budget. Input-work limits reject excessive input with a
 typed resource failure before recursive checking. The same work limit charges
 demanded local-definition expansion and lifting before materializing let
 substitutions, including declaration candidates before source refinement.
-Closed atomic aliases are retained in resolved form so linear alias chains
-remain linear work. Open and compound definitions retain their binder scope.
+The local-definition work check reuses the resolved value when an alias names
+the immediately preceding closed atomic definition. This avoids traversing
+earlier definitions repeatedly in those chains. Open and compound definitions
+retain their binder scope.
 Sort and function views require positive fuel and project already exposed
 `CSort` and `CPi` fields directly without intermediate `Maybe` values. Aliases
 and other heads retain the original bounded reduction path and typed failures;
@@ -130,15 +135,21 @@ semantic tests.
 
 ## Regression commands
 
-The retained laws cover the previous kernel corpus's useful semantic contracts.
-Typed generated properties exercise substitutions, scopes, reduction, checking,
-and rejection classes. OuroSmith rebuilds source mutants and requires the
-designated law to reject each fault after a clean baseline.
+Use the checker commands in the validation matrix.
+[CI validation matrix](ci.md#validation-matrix)
+
+The retained laws cover semantic contracts from the archived kernel corpus.
+Generated properties exercise substitution, scope, reduction, type checking,
+and rejection classes. For checker fault injection, OuroSmith first runs the
+designated law on the unmodified checker, then requires the same law to
+detect its assigned source mutation.
+[OuroSmith fault injection](ouro_smith.md#process-limits-and-fault-injection)
 
 The hardening suite executes retained laws in three cache modes. Scale and
 checked-API depth probes enforce their own complete input and resource
-contracts. [CI](ci.md#local-profiles) owns the required commands, profiles,
-and report validation.
+contracts.
+[CI profiles and report validation](ci.md#local-profiles)
+
 [Core artifacts](kernel_core_artifact.md) distinguishes the current checked
 snapshot from the archived JSON corpus.
 

@@ -2,6 +2,7 @@
 -- acceptance marker, and preserve manifest selection and error ordering.
 
 import "../std/test.ouro",
+  "../std/fs_walk.ouro",
   "../tools/test/manifest.ouro",
   "../tools/test/suites.ouro";
 
@@ -17,15 +18,27 @@ def suite_contract_manifest : String :=
 def suite_contract_rows (rows : List ManifestRow) : String :=
     str_join(",", map ManifestRow String manifest_row_id rows);
 
+private def suite_contract_large_manifest : String :=
+    str_unlines ((fix lines (remaining : Nat) (rows : List String) : List String :=
+      match remaining with
+      | Z => rows
+      | S next => lines next
+          (Cons String (str_cat3 "CASE." (show_nat next) "\ttests/a.ouro\tcheck\tpass\t0\t") rows)
+      end) 40 []);
+
 def suite_contract_registered (path : String) : Bool :=
     any SuiteFixture (fun (fixture : SuiteFixture) =>
       str_eq(path, suite_fixture_path fixture)) compiler_check_suite_fixtures;
 
-def suite_contract_unregistered (names : List String) : String :=
-    str_join "," (filter String (fun (name : String) =>
-      andb (str_starts name "compiler_")
-        (andb (str_ends name "_tests.ouro")
-          (notb (suite_contract_registered (str_concat "tests/" name))))) names);
+def suite_contract_unregistered (paths : List String) : String :=
+    str_join "," (filter String (fun (path : String) =>
+      let compiler : Bool := andb
+        (orb (str_starts path "tests/compiler_") (str_starts path "tests/compiler/"))
+        (str_ends path "_tests.ouro") in
+      let quality : Bool := andb (str_starts path "tests/quality_")
+        (andb (str_ends path "_regressions.ouro")
+          (notb (str_eq path "tests/quality_crypto_native_regressions.ouro"))) in
+      andb (orb compiler quality) (notb (suite_contract_registered path))) paths);
 
 def suite_contract_fixture (name : String) : SuiteFixture :=
     MkSuiteFixture name (str_cat3 "tests/" name ".ouro") Z SuiteGoldenNone;
@@ -34,9 +47,72 @@ def suite_contract_fixtures : List SuiteFixture :=
     map String SuiteFixture suite_contract_fixture ["a", "b", "c", "d", "e", "f", "g", "h", "i", "j", "k", "l", "m", "n", "o", "p", "source_spans"];
 
 def suite_contract_selected (shard : String) : String :=
-    match compiler_suite_selection shard suite_contract_fixtures with
+    let partition : List (List SuiteFixture) := compiler_suite_shards suite_contract_fixtures in
+    match compiler_suite_selection_from_partition shard suite_contract_fixtures partition with
     | Nothing => "invalid"
     | Just fixtures => str_join(",", map SuiteFixture String suite_fixture_name fixtures)
+    end;
+
+private def suite_contract_byte_fixture (suffix : Nat) : SuiteFixture :=
+    let key : String := str_of_codes [107, 0, suffix] in
+    MkSuiteFixture key key Z SuiteGoldenNone;
+
+private def suite_contract_byte_partition (last_regular : SuiteFixture) : List SuiteFixture :=
+    append SuiteFixture [suite_contract_byte_fixture 97, suite_contract_byte_fixture 98]
+      (append SuiteFixture (take(SuiteFixture, 13, drop SuiteFixture 2 suite_contract_fixtures))
+        [last_regular, suite_contract_fixture "source_spans"]);
+
+private def suite_contract_shard_order (fixtures : List SuiteFixture) : Bool :=
+    let partition : List (List SuiteFixture) := compiler_suite_shards fixtures in
+    let same_paths : List SuiteFixture -> List SuiteFixture -> Bool :=
+      list_eq SuiteFixture (fun (a : SuiteFixture) (b : SuiteFixture) =>
+        str_eq (suite_fixture_path a) (suite_fixture_path b)) in
+    (fix agree (shards : List (List SuiteFixture)) (index : Nat) : Bool :=
+      match shards with
+      | Nil => eq_nat index 17
+      | Cons shard rest =>
+          let numbered : String := str_concat (show_nat index) "/16" in
+          match compiler_suite_selection numbered fixtures with
+          | Nothing => False
+          | Just expected =>
+              match compiler_suite_selection_from_partition numbered fixtures partition with
+              | Nothing => False
+              | Just selected => andb (same_paths shard expected)
+                  (andb (same_paths expected selected) (agree rest (S index)))
+              end
+          end
+      end) partition 1;
+
+private def suite_contract_uses_checked_partition : Bool :=
+    let partition : List (List SuiteFixture) := compiler_suite_shards suite_contract_fixtures in
+    let first : List SuiteFixture := nth(List SuiteFixture, [], 0, partition) in
+    let second : List SuiteFixture := nth(List SuiteFixture, [], 1, partition) in
+    let reordered : List (List SuiteFixture) :=
+      append (List SuiteFixture) [second, first] (drop (List SuiteFixture) 2 partition) in
+    andb (compiler_suite_partition_valid suite_contract_fixtures reordered)
+      (match compiler_suite_selection_from_partition "1/16" suite_contract_fixtures reordered with
+       | Nothing => False
+       | Just selected => str_eq (str_join "," (map SuiteFixture String suite_fixture_name selected)) "b"
+       end);
+
+private def suite_contract_rejects_unbalanced_sizes : Bool :=
+    let fixtures : List SuiteFixture := append SuiteFixture (take(SuiteFixture, 16, suite_contract_fixtures))
+      [suite_contract_fixture "q", suite_contract_fixture "source_spans"] in
+    let partition : List (List SuiteFixture) := compiler_suite_shards fixtures in
+    let first : List SuiteFixture := nth(List SuiteFixture, [], 0, partition) in
+    let second : List SuiteFixture := nth(List SuiteFixture, [], 1, partition) in
+    let redistributed : List (List SuiteFixture) := append (List SuiteFixture)
+      [append SuiteFixture first (tail SuiteFixture second), take(SuiteFixture, 1, second)]
+      (drop (List SuiteFixture) 2 partition) in
+    andb (compiler_suite_partition_valid fixtures partition)
+      (notb (compiler_suite_partition_valid fixtures redistributed));
+
+private def suite_contract_rejects_replacement (fixture : SuiteFixture) : Bool :=
+    match compiler_suite_shards suite_contract_fixtures with
+    | Nil => False
+    | Cons first rest =>
+        let changed : List SuiteFixture := Cons SuiteFixture fixture (tail SuiteFixture first) in
+        notb (compiler_suite_partition_valid suite_contract_fixtures (Cons (List SuiteFixture) changed rest))
     end;
 
 def suite_contract_laws : List Test :=
@@ -57,13 +133,25 @@ def suite_contract_laws : List Test :=
          | MkPair rows errors => andb (str_eq(suite_contract_rows rows, "CASE.first,CASE.second"))
              (nullb String errors)
          end)
+    , assert_eq "manifest filters by trimmed first column before validating selected rows"
+        (match manifest_parse ["CASE."]
+          " \r\t# CASE.comment\n\tCASE.not-an-id\n CASE.first \ttests/a.ouro\tcheck\tpass\t0\t CHECK_OK \r\nCASE.no-tab\nOTHER.bad\ttoo\tfew\nCASE.bad\ttoo\tfew\n" with
+         | MkPair rows errors => str_concat(manifest_rows_text rows, str_join "|" errors)
+         end)
+        "CASE.first|tests/a.ouro|check|pass|CHECK_OK\nline 4: expected exactly six tab-separated columns|line 6: expected exactly six tab-separated columns"
     , assert_eq "manifest parser preserves initial rows and errors"
         (match manifest_parse_lines_go ["CASE."] 7
-          ["CASE.bad\tonly-two", "CASE.first\ttests/first.ouro\tcheck\tpass\t0\t"]
-          [suite_contract_second] ["earlier issue"] with
+          ["CASE.bad\tonly-two", "CASE.third\ttests/third.ouro\tcheck\tpass\t0\t", "CASE.no-tab"]
+          [suite_contract_second, suite_contract_first] ["earlier issue", "next issue"] with
          | MkPair rows errors => str_cat3(suite_contract_rows rows, "|", str_join "|" errors)
          end)
-        "CASE.second,CASE.first|earlier issue|line 7: expected exactly six tab-separated columns"
+        "CASE.second,CASE.first,CASE.third|earlier issue|next issue|line 7: expected exactly six tab-separated columns|line 9: expected exactly six tab-separated columns"
+    , assert_eq "manifest shared prefix does not select rows on its own"
+        (match manifest_parse ["CASE.long.", "CASE.low."]
+          "CASE.low.a\ttests/a.ouro\tcheck\tpass\t0\t\nCASE.loose\tbad\nCASE.long.bad\tbad\nOTHER.bad\tbad\nCASE.long.b\ttests/b.ouro\tcheck\tpass\t0\t\n" with
+         | MkPair rows errors => str_cat3(suite_contract_rows rows, "|", str_join "|" errors)
+         end)
+        "CASE.low.a,CASE.long.b|line 3: expected exactly six tab-separated columns"
     , assert_eq "duplicate checks retain earlier ids and report every duplicate"
         (str_join "|" (manifest_duplicate_errors_go ["CASE.first"]
           [suite_contract_first, suite_contract_second, suite_contract_first]))
@@ -74,6 +162,23 @@ def suite_contract_laws : List Test :=
          | MkPair _ errors => str_join "|" errors
          end)
         "duplicate id: CASE.first"
+    , assert_eq "manifest row errors precede duplicate diagnostics"
+        (match manifest_parse ["CASE."]
+          "CASE.first\ttests/a.ouro\tcheck\tpass\t0\t\nCASE.bad\nCASE.first\ttests/b.ouro\tcheck\tpass\t0\t\nCASE.next\tbad\n" with
+         | MkPair _ errors => str_join "|" errors
+         end)
+        "line 2: expected exactly six tab-separated columns|line 4: expected exactly six tab-separated columns|duplicate id: CASE.first"
+    , assert_true "large manifest accepts distinct ids"
+        (match manifest_parse ["CASE."] suite_contract_large_manifest with
+         | MkPair rows errors => andb (eq_nat (length ManifestRow rows) 40) (nullb String errors)
+         end)
+    , assert_eq "large manifest still reports every duplicate in source order"
+        (match manifest_parse ["CASE."]
+          (str_concat suite_contract_large_manifest
+            "\nCASE.bad\nCASE.31\ttests/a.ouro\tcheck\tpass\t0\t\nCASE.2\ttests/b.ouro\tcheck\tpass\t0\t\nCASE.31\ttests/c.ouro\tcheck\tpass\t0\t\n") with
+         | MkPair _ errors => str_join "|" errors
+         end)
+        "line 41: expected exactly six tab-separated columns|duplicate id: CASE.31|duplicate id: CASE.2|duplicate id: CASE.31"
     , assert_eq "manifest positive row rejects failed checker with marker"
         (manifest_process_issue suite_contract_first (MkProcResult 1 "CHECK_OK" "") "CHECK_OK")
         "expected pass"
@@ -88,8 +193,27 @@ def suite_contract_laws : List Test :=
         ""
     , assert_true "constructor closure laws remain registered"
         (suite_contract_registered "tests/constructor_closure_tests.ouro")
+    , assert_true "native formatter selftest process laws remain registered"
+        (suite_contract_registered "tests/native_fmt_selftest_tests.ouro")
     , assert_true "option precheck laws remain registered"
         (suite_contract_registered "tests/args_structural_tests.ouro")
+    , assert_true "native toolchain model laws remain in compiler checking"
+        (suite_contract_registered "tests/native_toolchain_model_tests.ouro")
+    , assert_true "lower local lookup laws remain registered"
+        (suite_contract_registered "tests/compiler_lower_lookup_tests.ouro")
+    , assert_true "future reference laws remain registered"
+        (suite_contract_registered "tests/compiler_future_reference_tests.ouro")
+    , assert_true "native toolchain runtime fixtures require the Windows argument-aware owner"
+        (all String (fun (path : String) => notb (suite_contract_registered path))
+          ["tests/native_toolchain_reader_tests.ouro", "tests/native_toolchain_io_tests.ouro",
+           "tests/native_managed/toolchain_protocol_child.ouro"])
+    , assert_true "binary String crypto laws require the native runtime"
+        (notb (suite_contract_registered "tests/quality_crypto_native_regressions.ouro"))
+    , assert_eq "unregistered compiler and portable quality laws are reported"
+        (suite_contract_unregistered ["tests/compiler_new_tests.ouro", "tests/compiler/diagnostics/new_tests.ouro",
+          "tests/compiler/diagnostics/helpers.ouro", "tests/compiler/diagnostics/compiler_fault_tests.ouro",
+          "tests/quality_new_regressions.ouro", "tests/quality_crypto_native_regressions.ouro"])
+        "tests/compiler_new_tests.ouro,tests/compiler/diagnostics/new_tests.ouro,tests/quality_new_regressions.ouro"
     , assert_eq "compiler full selection preserves order" (suite_contract_selected "all") "a,b,c,d,e,f,g,h,i,j,k,l,m,n,o,p,source_spans"
     , assert_eq "compiler first shard preserves order" (suite_contract_selected "1/16") "a,p"
     , assert_eq "compiler second shard" (suite_contract_selected "2/16") "b"
@@ -119,6 +243,26 @@ def suite_contract_laws : List Test :=
     , assert_true "compiler complete inventory partition is exact and regular shards balanced"
         (compiler_suite_partition_valid compiler_check_suite_fixtures
           (compiler_suite_shards compiler_check_suite_fixtures))
+    , assert_true "compiler distributed shards agree with numbered selection"
+        (all (List SuiteFixture) suite_contract_shard_order
+          [[], [suite_contract_fixture "source_spans"], suite_contract_fixtures, compiler_check_suite_fixtures])
+    , assert_true "compiler numbered selection uses the checked partition" suite_contract_uses_checked_partition
+    , assert_true "compiler partition compares complete byte paths across shard order"
+        (let fixtures : List SuiteFixture := suite_contract_byte_partition (suite_contract_byte_fixture 99) in
+          compiler_suite_partition_valid fixtures (compiler_suite_shards fixtures))
+    , assert_true "compiler partition rejects duplicate byte paths in a complete inventory"
+        (let (MkSuiteFixture _ path _ _) := suite_contract_byte_fixture 97 in
+          let fixtures : List SuiteFixture := suite_contract_byte_partition
+            (MkSuiteFixture "other_name" path Z SuiteGoldenNone) in
+          notb (compiler_suite_partition_valid fixtures (compiler_suite_shards fixtures)))
+    , assert_true "compiler partition rejects duplicate byte names with distinct paths"
+        (let (MkSuiteFixture name _ _ _) := suite_contract_byte_fixture 97 in
+          let fixtures : List SuiteFixture := suite_contract_byte_partition
+            (MkSuiteFixture name "tests/different.ouro" Z SuiteGoldenNone) in
+          notb (compiler_suite_partition_valid fixtures (compiler_suite_shards fixtures)))
+    , assert_true "compiler partition rejects replacement paths with unchanged shard sizes"
+        (all SuiteFixture suite_contract_rejects_replacement
+          [suite_contract_fixture "b", suite_contract_fixture "unknown"])
     , assert_true "compiler missing shard cannot pass"
         (notb (compiler_suite_partition_valid suite_contract_fixtures
           (take(List SuiteFixture, 15, compiler_suite_shards suite_contract_fixtures))))
@@ -149,6 +293,8 @@ def suite_contract_laws : List Test :=
     , assert_true "compiler imbalanced partition cannot pass"
         (notb (compiler_suite_partition_valid suite_contract_fixtures
           [suite_contract_fixtures, [], [], [], [], [], [], [], [], [], [], [], [], [], [], []]))
+    , assert_true "compiler nonempty shards with a size difference of two cannot pass"
+        suite_contract_rejects_unbalanced_sizes
     , assert_true "compiler duplicate inventory cannot pass"
         (let fixtures : List SuiteFixture := [suite_contract_fixture "a", suite_contract_fixture "a"] in
           notb (compiler_suite_partition_valid(fixtures, compiler_suite_shards fixtures)))
@@ -156,23 +302,30 @@ def suite_contract_laws : List Test :=
         (notb (compiler_suite_partition_valid [] [[], [], [], [], [], [], [], [], [], [], [], [], [], [], [], []]))
     ];
 
+def suite_contract_run (paths : List String) : IO Unit :=
+    (do let! empty_run := manifest_run_rows_go "." "." "UNUSED"
+         [] 4 2 [MkManifestResult "earlier" "pass" 0 "earlier.out" ""];
+       test_run (append Test suite_contract_laws
+         [ assert_eq "all compiler and portable quality test files belong to the required suite"
+             (suite_contract_unregistered paths) ""
+         , assert_eq "empty manifest execution preserves its initial state"
+             (str_join ","
+               [ show_nat (manifest_run_count empty_run)
+               , show_nat (manifest_run_failures empty_run)
+               , str_join "|" (map ManifestResult String manifest_result_id
+                   (manifest_run_results empty_run)) ])
+             "4,2,earlier"
+         ]));
+
 -- @entry main
 def main : IO Unit :=
     (do let! files := fs_list_checked "tests";
-        match files with
-        | Left error => do eprintln (fs_error_message error); exit 1
-        | Right names =>
-            do let! empty_run := manifest_run_rows_go "." "." "UNUSED"
-                 [] 4 2 [MkManifestResult "earlier" "pass" 0 "earlier.out" ""];
-               test_run (append Test suite_contract_laws
-                 [ assert_eq "all compiler test files belong to the required suite"
-                     (suite_contract_unregistered names) ""
-                 , assert_eq "empty manifest execution preserves its initial state"
-                     (str_join ","
-                       [ show_nat (manifest_run_count empty_run)
-                       , show_nat (manifest_run_failures empty_run)
-                       , str_join "|" (map ManifestResult String manifest_result_id
-                           (manifest_run_results empty_run)) ])
-                     "4,2,earlier"
-                 ])
-        end);
+       match files with
+       | Left error => do eprintln (fs_error_message error); exit 1
+       | Right names =>
+           do let! nested := fs_walk_ouro_checked "tests/compiler";
+              let failed : IO Unit := (do eprintln (fs_walk_message nested); exit 1) in
+              if let FsWalkComplete paths := nested then
+                suite_contract_run (append String (map String String (fs_child "tests") names) paths)
+              else failed
+       end);

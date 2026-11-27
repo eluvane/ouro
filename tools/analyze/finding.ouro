@@ -10,7 +10,8 @@
 import "../../std/data.ouro",
   "../../std/listx.ouro",
   "../../std/string_prims.ouro",
-  "../quality/diagnostic.ouro";
+  "../quality/diagnostic.ouro",
+  "../quality/order.ouro";
 
 -- code, definition line (1-based; Z when unknown), definition name, witness.
 inductive Finding : Type :=
@@ -288,21 +289,15 @@ def claim_rules : List (Pair String RuleRow) :=
 -- The trust family is forbid-level in the registry; every other structured
 -- family reports warnings.
 def rule_severity (r : RuleRow) : String :=
-    match prim_string_eq(rule_family r, "trust") with
-    | True => "error"
-    | False => "warning"
-    end;
+    if prim_string_eq(rule_family r, "trust") then "error" else "warning";
 
 def rule_rows : List (Pair String RuleRow) :=
     append (Pair String RuleRow) shape_rules claim_rules;
 
 def rule_of_code (code : String) : RuleRow :=
-    match lookup String RuleRow prim_string_eq code rule_rows with
-    | Just r => r
-    | Nothing =>
-        MkRule "structured" "unknown" "structured analyzer finding"
-          "See tools/analyze/README.md for the family table."
-    end;
+    lookup String RuleRow prim_string_eq code rule_rows ??
+      MkRule "structured" "unknown" "structured analyzer finding"
+        "See tools/analyze/README.md for the family table.";
 
 def finding_cat (a : String) (b : String) : String := prim_string_concat a b;
 
@@ -324,9 +319,9 @@ def show_witness (f : Finding) : String :=
         finding_cat3("def ", finding_def f, finding_cat(": ", finding_witness f))
     end;
 
-def finding_diagnostic (path : String) (f : Finding) : QualityDiagnostic :=
-    let r : RuleRow := rule_of_code (finding_code f) in
-    let level : QualityLevel := match prim_string_eq(rule_severity r, "error") with
+private def finding_diagnostic_with_rule (path : String) (f : Finding) (r : RuleRow)
+    (severity : String) : QualityDiagnostic :=
+    let level : QualityLevel := match prim_string_eq severity "error" with
       | True => QualityDeny | False => QualityWarn end in
     MkQualityDiagnostic (MkQualityRule(finding_code f, rule_family r, rule_name r))
       level (MkQualityLocation path (shown_line (finding_line f)) 1)
@@ -334,47 +329,132 @@ def finding_diagnostic (path : String) (f : Finding) : QualityDiagnostic :=
 
 -- Keep the public text shape while all renderer inputs share one contract.
 def show_finding (path : String) (f : Finding) : String :=
-    quality_text_analyzer (rule_severity (rule_of_code (finding_code f)))
-      (finding_diagnostic path f);
+    let r : RuleRow := rule_of_code (finding_code f) in
+    let severity : String := rule_severity r in
+    quality_text_analyzer severity (finding_diagnostic_with_rule path f r severity);
 
 def finding_eq (a : Finding) (b : Finding) : Bool :=
-    andb (prim_string_eq(finding_code a, finding_code b))
-      (andb (eq_nat(finding_line a, finding_line b))
-        (andb (prim_string_eq(finding_def a, finding_def b))
-          (prim_string_eq(finding_witness a, finding_witness b))));
+    if eq_nat (finding_line a) (finding_line b) then
+      if prim_string_eq (finding_code a) (finding_code b) then
+        if prim_string_eq (finding_def a) (finding_def b) then
+          prim_string_eq (finding_witness a) (finding_witness b)
+        else False
+      else False
+    else False;
 
 def str_lt (a : String) (b : String) : Bool :=
     andb(prim_string_le a b, notb (prim_string_eq a b));
 
 -- Line, then code, then witness: deterministic output for golden files.
 def finding_le (a : Finding) (b : Finding) : Bool :=
-    match ltb_nat(finding_line a, finding_line b) with
-    | True => True
-    | False =>
-        match eq_nat(finding_line a, finding_line b) with
-        | False => False
-        | True =>
-            match str_lt(finding_code a, finding_code b) with
-            | True => True
-            | False =>
-                match prim_string_eq(finding_code a, finding_code b) with
-                | False => False
-                | True => prim_string_le(finding_witness a, finding_witness b)
-                end
-            end
-        end
+    match compareNat (finding_line a) (finding_line b) with
+    | LT => True
+    | GT => False
+    | EQ =>
+        if prim_string_eq (finding_code a) (finding_code b) then
+          prim_string_le (finding_witness a) (finding_witness b)
+        else prim_string_le (finding_code a) (finding_code b)
     end;
 
-def dedupe_findings : List Finding -> List Finding :=
-  fix dedupe_findings (xs : List Finding) : List Finding :=
-    match xs with
-    | Nil => Nil Finding
-    | Cons f rest =>
-        match elem Finding finding_eq f rest with
-        | True => dedupe_findings rest
-        | False => Cons Finding f (dedupe_findings rest)
+private def finding_bytes_order (left : String) (right : String) : Ordering :=
+    let left_size : Nat := prim_string_length left in
+    let right_size : Nat := prim_string_length right in
+    (fix compare (remaining : Nat) (offset : Nat) : Ordering :=
+      match remaining with
+      | Z => compareNat left_size right_size
+      | S more => match compareNat (prim_string_byte_at left offset) (prim_string_byte_at right offset) with
+        | LT => LT
+        | GT => GT
+        | EQ => compare more (add offset 1)
         end
+      end) (minNat left_size right_size) Z;
+
+-- The C host orders strings up to NUL. Break ties by the full byte sequence.
+private def finding_string_order (left : String) (right : String) : Ordering :=
+    if prim_string_eq left right then EQ
+    else if prim_string_le left right then
+      if prim_string_le right left then finding_bytes_order left right else LT
+    else GT;
+
+private def finding_duplicate_order (left : Finding) (right : Finding) : Ordering :=
+    match compareNat (finding_line left) (finding_line right) with
+    | LT => LT
+    | GT => GT
+    | EQ => match finding_string_order (finding_code left) (finding_code right) with
+      | LT => LT
+      | GT => GT
+      | EQ => match finding_string_order (finding_def left) (finding_def right) with
+        | LT => LT
+        | GT => GT
+        | EQ => finding_string_order (finding_witness left) (finding_witness right)
+        end
+      end
+    end;
+
+-- Stable grouping puts the last occurrence at the end of each run.
+private def finding_duplicate_positions : List (Pair Nat Finding) -> List Nat :=
+  fix collect (rows : List (Pair Nat Finding)) : List Nat :=
+    match rows with
+    | Nil => []
+    | Cons row rest => match rest with
+      | Nil => []
+      | Cons next _ =>
+          let (MkPair position finding) := row in
+          if finding_eq finding (snd Nat Finding next) then Cons Nat position (collect rest)
+          else collect rest
+      end
+    end;
+
+private def findings_without_positions : List Finding -> List Nat -> Nat -> List Finding :=
+  fix filter_rows (rows : List Finding) (positions : List Nat) (position : Nat) : List Finding :=
+    match rows with
+    | Nil => []
+    | Cons row rest => match positions with
+      | Nil => rows
+      | Cons remove next =>
+          if eq_nat remove position then filter_rows rest next (add position 1)
+          else Cons Finding row (filter_rows rest positions (add position 1))
+      end
+    end;
+
+private def dedupe_few_findings : List Finding -> List Finding :=
+  fix dedupe (xs : List Finding) : List Finding :=
+    match xs with
+    | Nil => []
+    | Cons f rest =>
+        if elem Finding finding_eq f rest then dedupe rest
+        else Cons Finding f (dedupe rest)
+    end;
+
+def dedupe_findings (xs : List Finding) : List Finding :=
+    match drop Finding 8 xs with
+    | Nil => dedupe_few_findings xs
+    | Cons _ _ =>
+        let indexed_rows : List (Pair Nat Finding) :=
+          (fix index_rows (rows : List Finding) (position : Nat) : List (Pair Nat Finding) :=
+            match rows with
+            | Nil => []
+            | Cons row rest => Cons (Pair Nat Finding) (MkPair Nat Finding position row)
+                (index_rows rest (add position 1))
+            end) xs Z in
+        let grouped : List (Pair Nat Finding) := quality_sort (Pair Nat Finding)
+          (fun (left : Pair Nat Finding) (right : Pair Nat Finding) =>
+            match finding_duplicate_order (snd Nat Finding left) (snd Nat Finding right) with
+            | GT => False
+            | LT => True
+            | EQ => True
+            end) indexed_rows in
+        let positions : List Nat := quality_sort Nat leb_nat (finding_duplicate_positions grouped) in
+        findings_without_positions xs positions Z
     end;
 
 def sort_findings (xs : List Finding) : List Finding :=
-    sort_insert Finding finding_le xs;
+    match drop Finding 8 xs with
+    | Nil => sort_insert Finding finding_le xs
+    | Cons _ _ =>
+        let nul : String := prim_string_of_char_codes [0] in
+        -- A binary code can tie in string order while differing in byte equality.
+        if any Finding (fun (f : Finding) => prim_string_contains (finding_code f) nul) xs then
+          sort_insert Finding finding_le xs
+        else quality_sort Finding finding_le xs
+    end;

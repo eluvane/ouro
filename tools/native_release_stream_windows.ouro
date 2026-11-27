@@ -1,0 +1,323 @@
+import "native_release_stream_model.ouro",
+  "../runtime/platform/windows_fs_bounded.ouro",
+  "../runtime/raw_buffer.ouro",
+  "../runtime/platform/windows_common.ouro",
+  "../runtime/platform/windows_file.ouro",
+  "../runtime/platform/windows_file_bounded.ouro",
+  "../runtime/platform/windows_file_managed.ouro",
+  "../runtime/platform/windows_path.ouro",
+  "../runtime/platform/windows_text.ouro",
+  "../runtime/platform/windows_x64.ouro";
+
+private def native_release_stream_transfer (bytes : Nat) (one : USize) (zero : USize) (chunk : USize)
+    (source_length : RawPtr USize) (source_count : RawPtr U32) (probe : RawPtr U8)
+    (stage_count : RawPtr U32) (pass : IO (Either NativeReleaseStreamError Unit))
+    (fail : NativeReleaseStreamError -> IO (Either NativeReleaseStreamError Unit))
+    (reader : RawPtr U8) (writer : RawPtr U8) (size : USize) (payload : RawPtr U8)
+    : IO (Either NativeReleaseStreamError Unit) :=
+    let write : Nat -> USize -> USize -> IO (Either NativeReleaseStreamError Unit) :=
+      fix write (fuel : Nat) (remaining : USize) (offset : USize)
+          : IO (Either NativeReleaseStreamError Unit) :=
+        match fuel with
+        | Z => fail ReleaseStreamGuard
+        | S rest => if usize_equal remaining zero then pass
+          else
+            do let! output := raw_add U8 payload chunk;
+               let! valid := raw_buffer_range output chunk offset remaining;
+               if valid then
+                 do let! at := raw_add U8 output offset;
+                    let! status := raw_windows_file_write writer at remaining stage_count;
+                    if u32_equal(status, u32_sub status status) then
+                      do let! actual := raw_load_u32 stage_count;
+                         let got : USize := raw_u32_to_size actual in
+                         match native_release_stream_progress True (bounded_file_usize_to_nat remaining)
+                             (bounded_file_u32_to_nat actual) with
+                         | Left error => fail error
+                         | Right _ => write(rest, usize_sub remaining got, usize_add offset got)
+                         end
+                    else
+                      fail (ReleaseStreamOutput ReleaseStreamWrite (bounded_file_u32_to_nat status))
+               else fail ReleaseStreamGuard
+        end in
+    let copy : Nat -> USize -> IO (Either NativeReleaseStreamError Unit) :=
+      fix copy (fuel : Nat) (remaining : USize) : IO (Either NativeReleaseStreamError Unit) :=
+        match fuel with
+        | Z => fail ReleaseStreamGuard
+        | S rest => if usize_equal remaining zero then
+            match! windows_bounded_read_complete raw_windows_file_length raw_windows_file_read
+              reader size source_length source_count probe one with
+            | WindowsBoundedReadGuard => fail ReleaseStreamGuard
+            | WindowsBoundedReadValue result => match result with
+              | Left error => fail (ReleaseStreamInput error) | Right _ => pass end
+            end
+          else
+            let requested : USize := match usize_less remaining chunk with | True => remaining | False => chunk end in
+            do let! valid := raw_buffer_range payload chunk zero requested;
+               if valid then
+                 do let! status := raw_windows_file_read reader payload requested source_count;
+                    if u32_equal(status, u32_sub status status) then
+                      do let! actual := raw_load_u32 source_count;
+                         let got : USize := raw_u32_to_size actual in
+                         match native_release_stream_progress False (bounded_file_usize_to_nat requested)
+                             (bounded_file_u32_to_nat actual) with
+                         | Left error => fail error
+                         | Right count =>
+                           do let! text := windows_bounded_read_bytes payload one count zero ([] : List Nat);
+                              let! output := raw_add U8 payload chunk;
+                              let! valid_output := raw_buffer_range output chunk zero got;
+                              if andb valid_output (eq_nat (str_len text) count) then
+                                match!
+                                  windows_fs_bounded_copy text output one count 0 zero with
+                                | WindowsBoundedReadGuard => fail ReleaseStreamGuard
+                                | WindowsBoundedReadValue result => match result with
+                                  | Left error => fail (ReleaseStreamInput error)
+                                  | Right _ => match! write (S count) got zero with
+                                    | Left error => fail error | Right _ => copy(rest, usize_sub remaining got) end
+                                  end
+                                end
+                              else fail ReleaseStreamGuard
+                         end
+                    else
+                      fail (ReleaseStreamInput (FsBoundedReadOsError "read" (bounded_file_u32_to_nat status)))
+               else fail ReleaseStreamGuard
+        end in
+    copy (S bytes) size;
+
+-- Handles and original allocation bases stay within this deferred worker.
+def native_release_stream_copy_checked (cap : Nat) (bytes : Nat) (source : String) (stage : String)
+    : IO (Either NativeReleaseStreamFailure NativeReleaseClosedStage) :=
+    match native_release_stream_plan_checked cap bytes source stage with
+    | Left error => io_pure(Either NativeReleaseStreamFailure NativeReleaseClosedStage,
+        Left NativeReleaseStreamFailure NativeReleaseClosedStage (NativeReleaseStreamFailureOf False error))
+    | Right _ => match usize_from_nat 1, u32_from_nat 15 with
+      | Just one, Just shift =>
+        let zero : USize := usize_sub one one in
+        let two : USize := usize_add one one in
+        let four : USize := usize_add two two in
+        let eight : USize := usize_add four four in
+        let sixteen : USize := usize_add eight eight in
+        let thirtytwo : USize := usize_add sixteen sixteen in
+        let sixtyfour : USize := usize_add thirtytwo thirtytwo in
+        let controls : USize := usize_add sixtyfour sixteen in
+        let wide_capacity : USize := usize_shift_left one shift in
+        let chunk : USize := usize_add wide_capacity wide_capacity in
+        let input_capacity : USize := usize_add chunk wide_capacity in
+        let path_storage : USize := usize_add input_capacity chunk in
+        let storage : USize := usize_add(controls, usize_add path_storage path_storage) in
+        let flags : U32 := raw_size_to_u32 (usize_add
+            (usize_shift_left(one, raw_size_to_u32 (usize_sub eight one)))
+            (usize_shift_left(one, raw_size_to_u32 (usize_add sixteen (usize_add four one))))) in
+        do let! owner := raw_pages_allocate storage eight;
+           let! owner_bits := raw_to_bits U8 owner;
+           match usize_equal owner_bits zero with
+           | True => do exit 73;
+               io_pure(Either NativeReleaseStreamFailure NativeReleaseClosedStage,
+                 Left NativeReleaseStreamFailure NativeReleaseClosedStage
+                   (NativeReleaseStreamFailureOf False ReleaseStreamGuard))
+           | False =>
+             do let! source_length := raw_cast U8 USize owner;
+                let! source_count_at := raw_add U8 owner eight;
+                let! source_count := raw_cast U8 U32 source_count_at;
+                let! probe := raw_add U8 source_count_at four;
+                let! reader_at := raw_add U8 owner sixteen;
+                let! reader_cell := raw_cast U8 USize reader_at;
+                let! source_kind := raw_add U8 reader_at eight;
+                let! stage_length_at := raw_add U8 owner thirtytwo;
+                let! stage_length := raw_cast U8 USize stage_length_at;
+                let! stage_count_at := raw_add U8 stage_length_at eight;
+                let! stage_count := raw_cast U8 U32 stage_count_at;
+                let! writer_at := raw_add U8 stage_length_at sixteen;
+                let! writer_cell := raw_cast U8 USize writer_at;
+                let! stage_kind := raw_add U8 writer_at eight;
+                let! payload_at := raw_add U8 owner sixtyfour;
+                let! payload_cell := raw_cast U8 USize payload_at;
+                let! source_input := raw_add U8 owner controls;
+                let! source_wide := raw_add U8 source_input input_capacity;
+                let! stage_input := raw_add U8 source_input path_storage;
+                let! stage_wide := raw_add U8 stage_input input_capacity;
+                let pass : IO (Either NativeReleaseStreamError Unit) :=
+                    io_pure(Either NativeReleaseStreamError Unit, Right NativeReleaseStreamError Unit MkUnit) in
+                let fail : NativeReleaseStreamError -> IO (Either NativeReleaseStreamError Unit) :=
+                    fun (error : NativeReleaseStreamError) =>
+                      io_pure(Either NativeReleaseStreamError Unit, Left NativeReleaseStreamError Unit error) in
+                let close : RawPtr USize -> IO Bool := fun (cell : RawPtr USize) =>
+                  do let! bits := raw_load_usize cell;
+                     if usize_equal bits zero then io_pure(Bool, True)
+                     else
+                       do let! file_handle := raw_from_bits U8 bits;
+                                   let! status := raw_windows_file_close file_handle;
+                                   if u32_equal(status, u32_sub status status) then
+                                     do raw_store_usize cell zero; io_pure(Bool, True)
+                                   else io_pure(Bool, False) in
+                let convert : Bool -> String -> RawPtr U8 -> RawPtr U8 -> RawPtr U32
+                    -> IO (Either NativeReleaseStreamError USize) :=
+                  fun (is_stage : Bool) (path : String) (input : RawPtr U8)
+                      (wide : RawPtr U8) (count : RawPtr U32) =>
+                    let reject : NativeReleaseStreamError -> IO (Either NativeReleaseStreamError USize) :=
+                        fun (error : NativeReleaseStreamError) =>
+                          io_pure(Either NativeReleaseStreamError USize, Left NativeReleaseStreamError USize error) in
+                    match usize_from_nat (str_len path) with
+                    | Nothing => reject ReleaseStreamGuard
+                    | Just path_bytes =>
+                      do let! valid := raw_buffer_range input input_capacity zero path_bytes;
+                         let! copied := if valid then
+                             windows_fs_bounded_copy path input one (str_len path) 0 zero
+                           else io_pure(WindowsBoundedReadOutcome, WindowsBoundedReadGuard);
+                         match copied with
+                         | WindowsBoundedReadGuard => reject ReleaseStreamGuard
+                         | WindowsBoundedReadValue result => match result with
+                           | Left error => reject (native_release_stream_path_error is_stage error)
+                           | Right _ =>
+                             do let! status := raw_windows_utf8_to_utf16 input path_bytes wide (usize_sub wide_capacity one) count;
+                                if u32_equal(status, u32_sub status status) then
+                                  do let! actual := raw_load_u32 count;
+                                     let units : USize := raw_u32_to_size actual in
+                                     if
+                                       raw_bool_and (usize_less zero units) (usize_less units wide_capacity) then
+                                       match u8_from_nat 0 with
+                                       | Nothing => reject ReleaseStreamGuard
+                                       | Just nul =>
+                                         do let! terminator := raw_add U8 wide (usize_add units units);
+                                            raw_store_u8 terminator nul;
+                                            let! second := raw_add U8 terminator one;
+                                            raw_store_u8 second nul;
+                                            let! terminated := raw_windows_path_valid wide units one;
+                                            if terminated then
+                                              io_pure(Either NativeReleaseStreamError USize,
+                                                Right NativeReleaseStreamError USize units)
+                                            else reject ReleaseStreamGuard
+                                       end
+                                     else reject ReleaseStreamGuard
+                                else
+                                  reject (native_release_stream_path_error is_stage
+                                    (FsBoundedReadOsError "path conversion" (bounded_file_u32_to_nat status)))
+                           end
+                         end
+                    end in
+                let kind : Bool -> RawPtr U8 -> RawPtr U8 -> IO (Either NativeReleaseStreamError Unit) :=
+                  fun (is_stage : Bool) (file_handle : RawPtr U8) (buffer : RawPtr U8) =>
+                    do let! status := windows_file_information file_handle (raw_size_to_u32 (usize_add eight one))
+                                        buffer (raw_size_to_u32 eight);
+                       if u32_equal(status, u32_sub status status) then
+                         do let! failure := raw_windows_last_failure one;
+                                    fail (if is_stage then
+                                        ReleaseStreamOutput ReleaseStreamKind (bounded_file_u32_to_nat failure)
+                                      else
+                                        ReleaseStreamInput (FsBoundedReadOsError "kind" (bounded_file_u32_to_nat failure)))
+                       else
+                         do let! attributes := raw_cast U8 U32 buffer;
+                            let! loaded := raw_load_u32 attributes;
+                            let mask : USize := usize_add sixteen
+                                (usize_shift_left(one, raw_size_to_u32 (usize_add eight two))) in
+                            if usize_equal(usize_and(raw_u32_to_size loaded, mask), zero) then pass
+                            else
+                              fail (native_release_stream_path_error is_stage FsBoundedReadUnsafeEntry) in
+                let finish : RawPtr U8 -> IO (Either NativeReleaseStreamError Unit) := fun (writer : RawPtr U8) =>
+                  do let! flushed := raw_windows_file_flush writer;
+                     if u32_equal(flushed, u32_sub flushed flushed) then
+                       do let! status := raw_windows_file_length writer stage_length;
+                                  if u32_equal(status, u32_sub status status) then
+                                    do let! actual := raw_load_usize stage_length;
+                                               io_pure(Either NativeReleaseStreamError Unit,
+                                                 native_release_stream_stage_length bytes (bounded_file_usize_to_nat actual))
+                                  else
+                                    fail (ReleaseStreamOutput ReleaseStreamLength (bounded_file_u32_to_nat status))
+                     else
+                       fail (ReleaseStreamOutput ReleaseStreamFlush (bounded_file_u32_to_nat flushed)) in
+                let write_stage : RawPtr U8 -> USize -> RawPtr U8 -> IO (Either NativeReleaseStreamError Unit) :=
+                  fun (reader : RawPtr U8) (size : USize) (payload : RawPtr U8) =>
+                    -- Final sizing uses the stage handle's own read-attributes right.
+                    let access : U32 := raw_size_to_u32 (usize_add
+                        (usize_shift_left(one, raw_size_to_u32 (usize_sub(usize_add sixteen sixteen, two))))
+                        (usize_shift_left(one, raw_size_to_u32 (usize_sub eight one)))) in
+                    do let! writer := windows_create_file stage_wide access (raw_size_to_u32 zero)
+                                        (raw_null U8) (raw_size_to_u32 one) flags (raw_null U8);
+                       let! valid := raw_windows_handle_valid writer one;
+                       if valid then
+                         do let! bits := raw_to_bits U8 writer;
+                                    raw_store_usize writer_cell bits;
+                                    match! kind True writer stage_kind with
+                                    | Left error => fail error
+                                    | Right _ => match! native_release_stream_transfer bytes one zero chunk
+                              source_length source_count probe stage_count pass fail reader writer size payload with
+                            | Left error => fail error | Right _ => finish writer end
+                                    end
+                       else
+                         do let! failure := raw_windows_last_failure one;
+                                     fail (ReleaseStreamOutput ReleaseStreamCreate (bounded_file_u32_to_nat failure)) in
+                let read_source : IO (Either NativeReleaseStreamError Unit) :=
+                  let access : U32 := raw_size_to_u32
+                      (usize_shift_left(one, raw_size_to_u32 (usize_sub(usize_add sixteen sixteen, one)))) in
+                  do let! reader := windows_create_file source_wide access (raw_size_to_u32 one)
+                                      (raw_null U8) (raw_size_to_u32 (usize_add two one)) flags (raw_null U8);
+                     let! valid := raw_windows_handle_valid reader one;
+                     if valid then
+                       do let! bits := raw_to_bits U8 reader;
+                          raw_store_usize reader_cell bits;
+                          match! kind False reader source_kind with
+                          | Left error => fail error
+                          | Right _ =>
+                            do let! status := raw_windows_file_length reader source_length;
+                               if u32_equal(status, u32_sub status status) then
+                                 do let! size := raw_load_usize source_length;
+                                    match native_release_stream_source_length cap bytes (bounded_file_usize_to_nat size) with
+                                    | Left error => fail error
+                                    | Right _ =>
+                                      do let! payload := if usize_equal size zero then
+                                          io_pure(RawPtr U8, raw_null U8)
+                                        else raw_pages_allocate (usize_add chunk chunk) eight;
+                                         let! allocated_payload_bits := raw_to_bits U8 payload;
+                                         raw_store_usize payload_cell allocated_payload_bits;
+                                         match orb (usize_equal size zero) (notb (usize_equal allocated_payload_bits zero)) with
+                                         | False => fail ReleaseStreamGuard | True => write_stage reader size payload end
+                                    end
+                               else
+                                 fail (ReleaseStreamInput (FsBoundedReadOsError "length" (bounded_file_u32_to_nat status)))
+                          end
+                     else
+                       do let! failure := raw_windows_last_failure one;
+                                   fail (ReleaseStreamInput (FsBoundedReadOsError "open" (bounded_file_u32_to_nat failure))) in
+                let run : IO (Either NativeReleaseStreamError Unit) :=
+                  match! convert False source source_input source_wide source_count with
+                  | Left error => fail error
+                  | Right _ => match! convert True stage stage_input stage_wide stage_count with | Left error => fail error | Right _ => read_source end
+                  end in
+                do let! result := run;
+                   let! writer_bits := raw_load_usize writer_cell;
+                   let created : Bool := notb (usize_equal writer_bits zero) in
+                   -- Cleanup attempts every acquired resource before applying terminal precedence.
+                   do let! writer_closed := close writer_cell;
+                      let! reader_closed := close reader_cell;
+                      let! payload_bits := raw_load_usize payload_cell;
+                      let! payload_released := (if usize_equal payload_bits zero then
+                          io_pure(Bool, True)
+                        else
+                          do let! payload := raw_from_bits U8 payload_bits; raw_pages_release payload);
+                      let! owner_released := raw_pages_release owner;
+                      if
+                        andb(andb writer_closed reader_closed, andb payload_released owner_released) then
+                        match result with
+                        | Left error =>
+                          do match native_release_stream_is_guard error with | False => io_unit | True => exit 73 end;
+                             io_pure(Either NativeReleaseStreamFailure NativeReleaseClosedStage,
+                               Left NativeReleaseStreamFailure NativeReleaseClosedStage (NativeReleaseStreamFailureOf created error))
+                        | Right _ => io_pure(Either NativeReleaseStreamFailure NativeReleaseClosedStage,
+                            Right NativeReleaseStreamFailure NativeReleaseClosedStage (NativeReleaseClosedStageOf stage bytes))
+                        end
+                      else
+                        do exit 73;
+                          io_pure(Either NativeReleaseStreamFailure NativeReleaseClosedStage,
+                            Left NativeReleaseStreamFailure NativeReleaseClosedStage
+                              (NativeReleaseStreamFailureOf created ReleaseStreamGuard))
+           end
+      | Just _, Nothing => do exit 73;
+          io_pure(Either NativeReleaseStreamFailure NativeReleaseClosedStage,
+            Left NativeReleaseStreamFailure NativeReleaseClosedStage (NativeReleaseStreamFailureOf False ReleaseStreamGuard))
+      | Nothing, Just _ => do exit 73;
+          io_pure(Either NativeReleaseStreamFailure NativeReleaseClosedStage,
+            Left NativeReleaseStreamFailure NativeReleaseClosedStage (NativeReleaseStreamFailureOf False ReleaseStreamGuard))
+      | Nothing, Nothing => do exit 73;
+          io_pure(Either NativeReleaseStreamFailure NativeReleaseClosedStage,
+            Left NativeReleaseStreamFailure NativeReleaseClosedStage (NativeReleaseStreamFailureOf False ReleaseStreamGuard))
+      end
+    end;

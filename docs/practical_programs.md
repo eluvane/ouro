@@ -1,12 +1,16 @@
 # Practical Ouro programs
 
-These small CLI and file programs exercise stdin, checked files, config,
-CSV/JSON, typed arguments, validation, and process commands. For reusable APIs,
-see the [practical standard library](practical_stdlib.md#modules).
+These samples show how to read stdin and files, parse configuration and data,
+validate arguments, and run child processes. Their building blocks are listed
+in the [standard-library module guide](practical_stdlib.md#modules).
 
 ## Runnable examples
 
-Build and run a stdin word-count style tool:
+Run the examples from the repository root in a POSIX-compatible shell.
+[Build the toolchain](getting_started.md#build-the-bootstrap-toolchain) before
+starting. The first program counts bytes, lines, and words in a sample file
+read from stdin with `read_all`. Use small inputs within the
+[stdin read limit](practical_stdlib.md#linedata-processors).
 
 ```sh
 sh scripts/build_tool.sh samples/examples/io_word_count.ouro _build/tools/io_word_count
@@ -21,7 +25,8 @@ lines=2
 words=7
 ```
 
-Build and run a checked file/config lookup tool:
+The second program reads `samples/examples/app_config.kv` relative to the
+repository root and looks up three keys.
 
 ```sh
 sh scripts/build_tool.sh samples/examples/file_kv_lookup.ouro _build/tools/file_kv_lookup
@@ -56,11 +61,13 @@ samples. For one JSON/CSV/config/filesystem/process CLI, see
 
 ## Test path
 
-The [sample suite](ci.md#local-profiles) compares committed `.golden` output
-where present.
+The sample suite compares registered examples with their committed
+`.golden` output where present. Find the command in the
+[CI validation matrix](ci.md#validation-matrix).
 
-For generated properties and API documentation checks, see
-[OuroSmith](ouro_smith.md) and [CI](ci.md#local-profiles).
+See [OuroSmith](ouro_smith.md) for generated properties and
+[documentation and repository checks](ci.md#documentation-and-repository-checks)
+for API documentation validation.
 
 ## Current limits
 

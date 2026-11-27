@@ -3,9 +3,11 @@
 -- Unknown higher-order callees are effect barriers, not assumed pure.
 import "semantic_contract_model.ouro",
   "semantic_unit.ouro",
+  "../../std/listx.ouro",
   "../../std/natx.ouro",
   "../../compiler/path.ouro",
   "../../compiler/semantic_scope.ouro",
+  "../../compiler/source_name_index.ouro",
   "structural_model.ouro";
 
 -- Roles: 0 ordinary; 1 raw read; 2 raw write; 3 raw process; 4 exit;
@@ -20,10 +22,11 @@ import "semantic_contract_model.ouro",
 -- 43 list reversal; 44 Nat minimum; 45 Nat maximum; 46 Nat power;
 -- 47 text replacement; 48 text search predicate; 49 byte lookup; 50 byte slice;
 -- 51 Result constructor test; 52 Result default; 53 Maybe default; 54 Just.
--- Result-only range: 200 Nothing; 201 success map; 202 error map (E,F,A);
+-- Result/Maybe range: 200 Nothing; 201 success map; 202 error map (E,F,A);
 -- 203 mapLeft (E,A,F); 204 bind; 205 and_then; 206 or_else; 207 fold;
 -- 208 to_maybe; 209 from_maybe; 210 map2; 211 to_unit; 212 mapMaybe;
--- 213 maybe fold. Higher-order roles require separate callback purity proof.
+-- 213 maybe fold; 214 Maybe bind; 215 lazy Maybe unwrap; 216 lazy Result unwrap.
+-- Higher-order roles require purity proof for callbacks they can invoke.
 -- 55 list emptiness; 56 head; 57 last; 58 replicate; 59 intersperse;
 -- 60 singleton; 61 nth; 62 tail. These new roles are direct contracts only.
 -- Cost/purity/default policy are independent.
@@ -58,6 +61,7 @@ def cm_contracts : List CmContract :=
       CmContractOf "" "ouro.process.capture" 3 False 0 False,
       CmContractOf "" "ouro.process.inherit" 3 False 0 False,
       CmContractOf "" "ouro.process.capture_bounded" 3 False 0 False,
+      CmContractOf "" "ouro.process.capture_bounded_at" 3 False 0 False,
       CmContractOf "" "ouro.runtime.exit" 4 False 0 False,
       CmContractOf "" "ouro.runtime.stdout.write" 5 False 0 False,
       CmContractOf "" "ouro.runtime.stderr.write" 6 False 0 False,
@@ -144,6 +148,7 @@ def cm_contracts : List CmContract :=
       CmContractOf "std/result.ouro" "result_or" 52 True 0 True,
       CmContractOf "std/result.ouro" "result_or_else" 206 False 0 True,
       CmContractOf "std/result.ouro" "result_unwrap_or" 52 True 0 True,
+      CmContractOf "std/result.ouro" "result_unwrap_or_else" 216 False 0 False,
       CmContractOf "std/result.ouro" "result_is_ok" 51 True 0 True,
       CmContractOf "std/result.ouro" "result_is_err" 51 True 0 True,
       CmContractOf "std/result.ouro" "result_to_maybe" 208 True 0 True,
@@ -162,6 +167,8 @@ def cm_contracts : List CmContract :=
       CmContractOf "std/data.ouro" "either" 207 False 0 True,
       CmContractOf "std/data.ouro" "mapMaybe" 212 False 0 False,
       CmContractOf "std/data.ouro" "maybe" 213 False 0 True,
+      CmContractOf "std/data.ouro" "maybe_bind" 214 False 0 False,
+      CmContractOf "std/data.ouro" "maybe_unwrap_or_else" 215 False 0 False,
       CmContractOf "std/validation.ouro" "validation_is_valid" 0 False 0 True,
       CmContractOf "std/validation.ouro" "validation_errors" 0 False 0 True,
       CmContractOf "std/validation.ouro" "validation_render" 0 False 0 True,
@@ -197,7 +204,7 @@ def cm_contracts : List CmContract :=
     ];
 
 def cm_result_contract_role (role : Nat) : Bool :=
-    andb(leb_nat 200 role, leb_nat role 213);
+    andb(leb_nat 200 role, leb_nat role 216);
 
 def cm_contract_key (row : CmContract) : String :=
     prim_string_concat (cm_contract_module row)
@@ -208,11 +215,11 @@ def cm_contract_key (row : CmContract) : String :=
 -- a purity/must-observe promise. Empty owners are reserved for intrinsic ABI IDs.
 def cm_contract_consistent (row : CmContract) : Bool :=
     let role : Nat := cm_contract_role row in
-    andb (notb (andb(cm_contract_pure row, elem Nat eq_nat role [1,2,3,4,5,6,7,8,23,24,201,202,203,204,205,206,207,210,212,213])))
+    andb (notb (andb(cm_contract_pure row, elem Nat eq_nat role [1,2,3,4,5,6,7,8,23,24,201,202,203,204,205,206,207,210,212,213,214,215,216])))
       (andb (notb (andb(cm_contract_policy row, elem Nat eq_nat role [8,23,24])))
-        (match eq_nat(prim_string_length (cm_contract_module row), 0) with
-         | False => True
-         | True => prim_string_starts(cm_contract_name row, "ouro.") end));
+        (if eq_nat(prim_string_length (cm_contract_module row), 0) then
+            prim_string_starts(cm_contract_name row, "ouro.")
+          else True));
 
 def cm_validate_contracts (rows : List CmContract) : Either QualityInputError Unit :=
     (fix go (remaining : List CmContract) (keys : List String) : Either QualityInputError Unit :=
@@ -223,17 +230,20 @@ def cm_validate_contracts (rows : List CmContract) : Either QualityInputError Un
           let key : String := cm_contract_key row in
           let canonical : String := prim_string_of_char_codes
             (canon_path(Nil Nat, prim_string_to_char_codes module_path)) in
-          match orb (elem String prim_string_eq key keys)
+          if
+            orb (elem String prim_string_eq key keys)
               (orb (eq_nat(prim_string_length (cm_contract_name row), 0))
                 (orb (notb (prim_string_eq canonical module_path))
                   (orb (andb (ltb_nat(62, cm_contract_role row))
                           (notb (cm_result_contract_role (cm_contract_role row))))
                     (orb (ltb_nat(1, cm_contract_cost row))
-                      (notb (cm_contract_consistent row)))))) with
-          | True => Left QualityInputError Unit (QualityInvalidInput (prim_string_concat "malformed semantic API registry: " key))
-          | False => go(rest, Cons String key keys)
-          end
+                      (notb (cm_contract_consistent row)))))) then
+            Left QualityInputError Unit (QualityInvalidInput (prim_string_concat "malformed semantic API registry: " key))
+          else go(rest, Cons String key keys)
       end) rows [];
+
+private def cm_intrinsic_providers : List String :=
+    ["std/runtime.ouro", "std/string_prims.ouro", "runtime/native_types.ouro"];
 
 def cm_contract_for (unit : ClippySemanticUnit) (decl : ScDecl) : CmContract :=
     let module_path : String := cm_string(cm_intern unit, sc_decl_module decl) in
@@ -246,61 +256,134 @@ def cm_contract_for (unit : ClippySemanticUnit) (decl : ScDecl) : CmContract :=
       match rows with
       | Nil => CmContractOf module_path name 0 False 0 False
       | Cons row rest =>
-          let same : Bool := match eq_nat(prim_string_length (cm_contract_module row), 0) with
-            | True => andb (notb (eq_nat(prim_string_length intrinsic_key, 0)))
+          let same : Bool := if eq_nat(prim_string_length (cm_contract_module row), 0) then
+              andb (notb (eq_nat(prim_string_length intrinsic_key, 0)))
                 (andb (prim_string_eq(intrinsic_key, cm_contract_name row))
-                  (elem String prim_string_eq module_path
-                    ["std/runtime.ouro", "std/string_prims.ouro", "runtime/native_types.ouro"]))
-            | False => andb (prim_string_eq(module_path, cm_contract_module row))
-                (prim_string_eq(name, cm_contract_name row))
-            end in
+                  (elem String prim_string_eq module_path cm_intrinsic_providers))
+            else
+              andb (prim_string_eq(module_path, cm_contract_module row))
+                (prim_string_eq(name, cm_contract_name row)) in
           match same with | True => row | False => go rest end
       end) cm_contracts;
 
 def cm_registered_name (intern : InternState) (text : String) : Maybe Nat :=
-    match intern with | MkIntern identifiers _ _ _ =>
-      (fix go (names : List (Pair (List Nat) Nat)) : Maybe Nat :=
-        match names with
-        | Nil => Nothing Nat
-        | Cons item rest => match item with | MkPair codes id =>
-          match prim_string_eq(text, prim_string_of_char_codes codes) with
-          | True => Just Nat id | False => go rest end end
-        end) identifiers
-    end;
+    let (MkIntern identifiers _ _ _) := intern in
+    (fix go (names : List (Pair (List Nat) Nat)) : Maybe Nat :=
+      match names with
+      | Nil => Nothing Nat
+      | Cons item rest => let (MkPair codes id) := item in
+        match prim_string_eq(text, prim_string_of_char_codes codes) with
+        | True => Just Nat id | False => go rest end
+      end) identifiers;
 
-def cm_validate_contract_bindings (unit : ClippySemanticUnit) (rows : List CmContract) : Either QualityInputError Unit :=
+private def cm_id_for_text (index : SourceNameIndex) (text : String) : Maybe Nat :=
+    source_name_index_lookup (prim_string_to_char_codes text) index;
+
+-- The import policy can leave an empty stub. Only loaded units bind API rows.
+private def cm_loaded_contract_paths (unit : ClippySemanticUnit) : SourceNameIndex :=
+    let intern : InternState := cm_intern unit in
+    let entry_path : String := cm_string intern (cm_entry unit) in
+    foldl SrcUnit SourceNameIndex (fun (index : SourceNameIndex) (source_unit : SrcUnit) =>
+      let (MkSrcUnit id _) := source_unit in
+      let path : String := cm_string intern id in
+      let loaded : Bool := match src_unit_decls source_unit with
+        | Nil => notb (cm_skip_import_for entry_path path)
+        | Cons _ _ => True
+        end in
+      if loaded then source_name_index_insert (prim_string_to_char_codes path) id index else index)
+      SourceNameIndexEmpty (cm_units unit);
+
+private def cm_contract_names (unit : ClippySemanticUnit) : SourceNameIndex :=
+    let (MkIntern identifiers _ _ _) := cm_intern unit in
+    source_name_index_from identifiers;
+
+private def cm_validate_contract_bindings_with_names (unit : ClippySemanticUnit)
+    (names : SourceNameIndex) (rows : List CmContract) : Either QualityInputError Unit :=
+    let intern : InternState := cm_intern unit in
+    let loaded_paths : SourceNameIndex := cm_loaded_contract_paths unit in
     (fix go (remaining : List CmContract) : Either QualityInputError Unit :=
       match remaining with
       | Nil => Right QualityInputError Unit MkUnit
       | Cons row rest =>
           let owner : String := cm_contract_module row in
-          let entry_path : String := cm_string(cm_intern unit, cm_entry unit) in
-          -- Harvest stubs have empty declarations. A directly kept import still
-          -- carries declarations. An empty stub is not an identity for contracts.
-          let loaded : Bool := any SrcUnit (fun (source_unit : SrcUnit) => match source_unit with
-            | MkSrcUnit id _ =>
-                andb (prim_string_eq(owner, cm_string(cm_intern unit, id)))
-                  (orb (match src_unit_decls source_unit with
-                        | Nil => False
-                        | Cons _ _ => True
-                        end)
-                    (notb (cm_skip_import_for entry_path owner)))
-            end) (cm_units unit) in
-          match orb(eq_nat(prim_string_length owner, 0), notb loaded) with
-          | True => go rest
-          | False =>
-              let valid : Bool := match cm_registered_name(cm_intern unit, cm_contract_name row) with
+          if eq_nat(prim_string_length owner, 0) then go rest
+          else match cm_id_for_text loaded_paths owner with
+          | Nothing => go rest
+          | Just _ =>
+            let valid : Bool := match cm_id_for_text names (cm_contract_name row) with
+              | Nothing => False
+              | Just name => match sc_lookup_global(name, cm_index unit) with
                 | Nothing => False
-                | Just name => match sc_lookup_global(name, cm_index unit) with
-                  | Nothing => False
-                  | Just decl => prim_string_eq(owner, cm_string(cm_intern unit, sc_decl_module decl)) end
-                end in
-              match valid with
-              | True => go rest
-              | False => Left QualityInputError Unit (QualityInvalidInput (prim_string_concat("stale or ambiguous semantic API registry identity: ", cm_contract_key row)))
-              end
+                | Just decl => prim_string_eq(owner, cm_string(intern, sc_decl_module decl)) end
+              end in
+            if valid then go rest
+            else
+              Left QualityInputError Unit (QualityInvalidInput (prim_string_concat("stale or ambiguous semantic API registry identity: ", cm_contract_key row)))
           end
       end) rows;
+
+def cm_validate_contract_bindings (unit : ClippySemanticUnit) (rows : List CmContract) : Either QualityInputError Unit :=
+    cm_validate_contract_bindings_with_names unit (cm_contract_names unit) rows;
+
+-- Numeric identities are local to the current intern pools. Intrinsics use
+-- single-ID keys and named entries use owner/name keys. Keep registry order.
+private inductive CmNumericContracts : Type :=
+  | CmNumericContractsOf : SourceNameIndex -> List Nat -> CmNumericContracts;
+
+private def cm_bind_numeric_contracts (intern : InternState) (names : SourceNameIndex) : CmNumericContracts :=
+    let (MkIntern _ _ strings _) := intern in
+    let values : SourceNameIndex := source_name_index_from strings in
+    let providers : List Nat := foldl String (List Nat)
+      (fun (ids : List Nat) (path : String) => match cm_id_for_text values path with
+        | Nothing => ids
+        | Just id => Cons Nat id ids
+        end) [] cm_intrinsic_providers in
+    let matches : SourceNameIndex :=
+      (fix go (rows : List CmContract) (position : Nat) (index : SourceNameIndex) : SourceNameIndex :=
+        match rows with
+        | Nil => index
+        | Cons row rest =>
+            let owner : String := cm_contract_module row in
+            let name : String := cm_contract_name row in
+            let next : SourceNameIndex := if eq_nat(prim_string_length owner, 0) then
+                match cm_id_for_text values name with
+                | Nothing => index
+                | Just intrinsic_id => source_name_index_insert [intrinsic_id] position index
+                end
+              else match cm_id_for_text values owner with
+                | Nothing => index
+                | Just module_id => match cm_id_for_text names name with
+                  | Nothing => index
+                  | Just name_id => source_name_index_insert [module_id, name_id] position index
+                  end
+                end in
+            go rest (S position) next
+        end) cm_contracts 0 SourceNameIndexEmpty in
+    CmNumericContractsOf matches providers;
+
+private def cm_candidate_contracts : List (Maybe CmContract) :=
+    map CmContract (Maybe CmContract) (fun (row : CmContract) => Just CmContract row) cm_contracts;
+
+private def cm_numeric_contract (bindings : CmNumericContracts) (decl : ScDecl) : Maybe CmContract :=
+    let (CmNumericContractsOf matches providers) := bindings in
+    let owner : Nat := sc_decl_module decl in
+    let named : Maybe Nat := source_name_index_lookup [owner, sc_decl_name decl] matches in
+    let position : Maybe Nat := match sc_decl_intrinsic decl with
+      | Nothing => named
+      | Just intrinsic_id => if elem Nat eq_nat owner providers then
+          match source_name_index_lookup [intrinsic_id] matches with
+          | Nothing => named
+          | Just abi_rank => match named with
+            | Nothing => Just Nat abi_rank
+            | Just named_rank => Just Nat (minNat abi_rank named_rank)
+            end
+          end
+        else named
+      end in
+    match position with
+    | Nothing => Nothing CmContract
+    | Just rank => nth (Maybe CmContract) (Nothing CmContract) rank cm_candidate_contracts
+    end;
 
 -- Explicit owner classifications, not basenames or directory-prefix exemptions.
 -- Owners still receive ignored-result and error-loss diagnostics. Only the raw
@@ -323,17 +406,30 @@ def cm_boundaries : List ClippyBoundaryFact :=
 
 def cm_boundary (unit : ClippySemanticUnit) (owner : ScDecl) (role : Nat) : Bool :=
     let module_path : String := cm_string(cm_intern unit, sc_decl_module owner) in
-    any ClippyBoundaryFact (fun (item : ClippyBoundaryFact) => match item with
-      | CmBoundary path kind => andb (prim_string_eq path module_path)
-          (orb (eq_nat kind 3)
-            (orb (andb(eq_nat kind 1, elem Nat eq_nat role [1,2,7,8]))
-              (andb(eq_nat kind 2, eq_nat role 3))))
-      end) cm_boundaries;
+    any ClippyBoundaryFact (fun (item : ClippyBoundaryFact) => let (CmBoundary path kind) := item in
+      andb (prim_string_eq path module_path)
+        (orb (eq_nat kind 3)
+          (orb (andb(eq_nat kind 1, elem Nat eq_nat role [1,2,7,8]))
+            (andb(eq_nat kind 2, eq_nat role 3))))) cm_boundaries;
+
+private def cm_classify_type_decl (fuel : Nat) (decl : ScDecl) (role : Nat)
+    (follow : Expr -> Either QualityInputError Nat) : Either QualityInputError Nat :=
+    if eq_nat role 12 then Right QualityInputError Nat 1
+    else if eq_nat role 13 then Right QualityInputError Nat 2
+    else match sc_decl_body decl with
+      | Nothing => Right QualityInputError Nat 0
+      | Just body => match sc_type_result(fuel, sc_decl_type decl) with
+        | Left error => Left QualityInputError Nat (QualityInvalidInput (sc_error_message error))
+        | Right result => if let ESort _ := (result : Expr) then follow body
+          else Right QualityInputError Nat 0
+        end
+      end;
 
 -- Result classes: 0 unknown/ordinary, 1 Either, 2 Maybe; +10 for an IO action.
 -- Follow only type-level aliases, with a closed budget. A local type parameter
 -- is never resolved as a same-spelled global type.
-def cm_type_class (unit : ClippySemanticUnit) : Nat -> List Nat -> Expr -> Either QualityInputError Nat :=
+private def cm_type_class_with_roles (unit : ClippySemanticUnit) (role_for : ScDecl -> Nat)
+    : Nat -> List Nat -> Expr -> Either QualityInputError Nat :=
   fix go (fuel : Nat) (locals : List Nat) (term : Expr) : Either QualityInputError Nat :=
     match fuel with
     | Z => Left QualityInputError Nat (QualityInvalidInput "semantic type-alias traversal exhausted")
@@ -342,119 +438,42 @@ def cm_type_class (unit : ClippySemanticUnit) : Nat -> List Nat -> Expr -> Eithe
       | ELam name _ body => go remaining (Cons Nat name locals) body
       | EEffectRow result _ => go remaining locals result
       | EAscribe value _ => go remaining locals value
-      | EVar name => match elem Nat eq_nat name locals with
-        | True => Right QualityInputError Nat 0
-        | False => match cm_global_decl unit name with
+      | EVar name => if elem Nat eq_nat name locals then Right QualityInputError Nat 0
+        else
+          match cm_global_decl unit name with
           | Nothing => Left QualityInputError Nat (QualityInvalidInput (prim_string_concat "unresolved result type: "
               (cm_name(cm_intern unit, name))))
-          | Just decl =>
-              let role : Nat := cm_contract_role (cm_contract_for unit decl) in
-              match eq_nat role 12 with
-              | True => Right QualityInputError Nat 1
-              | False => match eq_nat role 13 with
-                | True => Right QualityInputError Nat 2
-                | False => match sc_decl_body decl with
-                  | Nothing => Right QualityInputError Nat 0
-                  | Just body => match sc_type_result(remaining, sc_decl_type decl) with
-                    | Left error => Left QualityInputError Nat
-                        (QualityInvalidInput (sc_error_message error))
-                    | Right result => match result with
-                      | ESort _ => go remaining locals body
-                      | EVar _ => Right QualityInputError Nat 0
-                      | EHole _ => Right QualityInputError Nat 0
-                      | ENat _ => Right QualityInputError Nat 0
-                      | ERange _ _ _ => Right QualityInputError Nat 0
-                      | EApp _ _ => Right QualityInputError Nat 0
-                      | ELam _ _ _ => Right QualityInputError Nat 0
-                      | EPi _ _ _ => Right QualityInputError Nat 0
-                      | ELet _ _ _ _ => Right QualityInputError Nat 0
-                      | EAscribe _ _ => Right QualityInputError Nat 0
-                      | EMatch _ _ => Right QualityInputError Nat 0
-                      | EIf _ _ _ => Right QualityInputError Nat 0
-                      | EIfLet _ _ _ _ => Right QualityInputError Nat 0
-                      | ECoalesce _ _ => Right QualityInputError Nat 0
-                      | EFix _ _ _ _ => Right QualityInputError Nat 0
-                      | EEffectRow _ _ => Right QualityInputError Nat 0
-                      | EPerform _ _ => Right QualityInputError Nat 0
-                      | EDo _ => Right QualityInputError Nat 0
-                      | EHandle _ _ => Right QualityInputError Nat 0
-                      | EBranch _ _ _ => Right QualityInputError Nat 0
-                      | ENoBranch => Right QualityInputError Nat 0
-                      | EBinder _ _ _ => Right QualityInputError Nat 0
-                      | ENoBinder => Right QualityInputError Nat 0
-                      | EMultiMatch _ _ => Right QualityInputError Nat 0
-                      | EStr _ => Right QualityInputError Nat 0
-                      | EDoBind _ _ => Right QualityInputError Nat 0
-                      | EList _ => Right QualityInputError Nat 0
-                      | EListSpread _ _ => Right QualityInputError Nat 0
-                      | ESpan _ _ _ => Right QualityInputError Nat 0
-                      | EFallible _ _ _ _ => Right QualityInputError Nat 0
-                      | EOpen _ _ => Right QualityInputError Nat 0
-                      | ENamedCall _ _ => Right QualityInputError Nat 0
-                      end
-                    end
-                  end
-                end
-              end
+          | Just decl => cm_classify_type_decl remaining decl (role_for decl)
+              (fun (body : Expr) => go remaining locals body)
           end
-        end
-      | EApp _ _ => match sc_spine term [] with
-        | MkPair head arguments => match head with
-          | EVar name => match elem Nat eq_nat name locals with
-            | True => Right QualityInputError Nat 0
-            | False => match cm_global_decl unit name with
-              | Nothing => Left QualityInputError Nat (QualityInvalidInput (prim_string_concat "unresolved applied result type: "
-                  (cm_name(cm_intern unit, name))))
-              | Just decl =>
-                  let role : Nat := cm_contract_role (cm_contract_for unit decl) in
-                  match eq_nat role 14 with
-                  | True => match arguments with
-                    | Cons payload more => match more with
-                      | Cons _ _ => Left QualityInputError Nat (QualityInvalidInput "malformed IO result type")
-                      | Nil => match go remaining locals payload with
-                        | Left error => Left QualityInputError Nat error
-                        | Right value => Right QualityInputError Nat (add 10 value)
-                        end
+      | EApp _ _ => let (MkPair head arguments) := sc_spine term [] in
+        if let EVar name := (head : Expr) then
+          if elem Nat eq_nat name locals then Right QualityInputError Nat 0
+          else
+            match cm_global_decl unit name with
+            | Nothing => Left QualityInputError Nat (QualityInvalidInput (prim_string_concat "unresolved applied result type: "
+                (cm_name(cm_intern unit, name))))
+            | Just decl =>
+                let role : Nat := role_for decl in
+                if eq_nat role 14 then
+                  match arguments with
+                  | Cons payload more => match more with
+                    | Cons _ _ => Left QualityInputError Nat (QualityInvalidInput "malformed IO result type")
+                    | Nil => match go remaining locals payload with
+                      | Left error => Left QualityInputError Nat error
+                      | Right value => Right QualityInputError Nat (add 10 value)
                       end
-                    | Nil => Left QualityInputError Nat (QualityInvalidInput "missing IO result type")
                     end
-                  | False => go remaining locals head
+                  | Nil => Left QualityInputError Nat (QualityInvalidInput "missing IO result type")
                   end
-              end
+                else match remaining with
+                  -- An applied non-IO type spends one step on its head.
+                  | Z => Left QualityInputError Nat (QualityInvalidInput "semantic type-alias traversal exhausted")
+                  | S after_head => cm_classify_type_decl after_head decl role
+                      (fun (body : Expr) => go after_head locals body)
+                  end
             end
-          | EHole _ => Right QualityInputError Nat 0
-          | ESort _ => Right QualityInputError Nat 0
-          | ENat _ => Right QualityInputError Nat 0
-          | ERange _ _ _ => Right QualityInputError Nat 0
-          | EApp _ _ => Right QualityInputError Nat 0
-          | ELam _ _ _ => Right QualityInputError Nat 0
-          | EPi _ _ _ => Right QualityInputError Nat 0
-          | ELet _ _ _ _ => Right QualityInputError Nat 0
-          | EAscribe _ _ => Right QualityInputError Nat 0
-          | EMatch _ _ => Right QualityInputError Nat 0
-          | EIf _ _ _ => Right QualityInputError Nat 0
-          | EIfLet _ _ _ _ => Right QualityInputError Nat 0
-          | ECoalesce _ _ => Right QualityInputError Nat 0
-          | EFix _ _ _ _ => Right QualityInputError Nat 0
-          | EEffectRow _ _ => Right QualityInputError Nat 0
-          | EPerform _ _ => Right QualityInputError Nat 0
-          | EDo _ => Right QualityInputError Nat 0
-          | EHandle _ _ => Right QualityInputError Nat 0
-          | EBranch _ _ _ => Right QualityInputError Nat 0
-          | ENoBranch => Right QualityInputError Nat 0
-          | EBinder _ _ _ => Right QualityInputError Nat 0
-          | ENoBinder => Right QualityInputError Nat 0
-          | EMultiMatch _ _ => Right QualityInputError Nat 0
-          | EStr _ => Right QualityInputError Nat 0
-          | EDoBind _ _ => Right QualityInputError Nat 0
-          | EList _ => Right QualityInputError Nat 0
-          | EListSpread _ _ => Right QualityInputError Nat 0
-          | ESpan _ _ _ => Right QualityInputError Nat 0
-          | EFallible _ _ _ _ => Right QualityInputError Nat 0
-          | EOpen _ _ => Right QualityInputError Nat 0
-          | ENamedCall _ _ => Right QualityInputError Nat 0
-          end
-        end
+        else Right QualityInputError Nat 0
       | EHole _ => Right QualityInputError Nat 0
       | ESort _ => Right QualityInputError Nat 0
       | ENat _ => Right QualityInputError Nat 0
@@ -484,6 +503,9 @@ def cm_type_class (unit : ClippySemanticUnit) : Nat -> List Nat -> Expr -> Eithe
       end
     end;
 
+def cm_type_class (unit : ClippySemanticUnit) : Nat -> List Nat -> Expr -> Either QualityInputError Nat :=
+    cm_type_class_with_roles unit (fun (decl : ScDecl) => cm_contract_role (cm_contract_for unit decl));
+
 inductive CmApi : Type :=
   | CmApiOf : ScDecl -> CmContract -> Nat -> Nat -> CsFunctionContract -> CmApi;
 
@@ -503,49 +525,41 @@ def cm_api_summary (item : CmApi) : CsFunctionContract :=
     match item with | CmApiOf _ _ _ _ value => value end;
 
 def cm_api_with_summary (item : CmApi) (summary : CsFunctionContract) : CmApi :=
-    match item with | CmApiOf decl contract arity result _ =>
-      CmApiOf decl contract arity result summary end;
+    let (CmApiOf decl contract arity result _) := item in CmApiOf decl contract arity result summary;
 
 -- Registered properties are independent: a checked operation can have an
 -- unknown effect. Unknown effects never become pure through a wrapper.
 def cm_seed_summary (decl : ScDecl) (contract : CmContract) : CsFunctionContract :=
     let role : Nat := cm_contract_role contract in
     let pure : Bool := cm_contract_pure contract in
-    match orb(pure, orb(notb (eq_nat role 0), cm_contract_policy contract)) with
-    | False => cs_unknown decl CsPending
-    | True =>
-        let effects : CsEffect := match pure with
-          | True => CsPure
-          | False => match elem Nat eq_nat role [1,7,23] with
-            | True => CsFilesystemRead
-            | False => match elem Nat eq_nat role [2,8] with
-              | True => CsFilesystemWrite
-              | False => match elem Nat eq_nat role [3,4] with
-                | True => CsProcess
-                | False => match elem Nat eq_nat role [5,6] with
-                  | True => CsReporting | False => CsUnknownEffect end
-                end
-              end
-            end
-          end in
-        let result : CsResult := match elem Nat eq_nat role [8,23,24] with
-          | True => CsRequiredResult
-          | False => match eq_nat role 10 with
-            | True => CsFailureResult
-            | False => match eq_nat role 11 with
-              | True => CsSuccessResult
-              | False => match cm_contract_policy contract with
-                | True => CsPolicyResult | False => CsUnknownResult end
-              end
-            end
-          end in
-        CsContract (sc_decl_module decl) (sc_decl_name decl) CsComplete effects result
-          CsUnknownOrigin [] (Just(Nat, cm_contract_cost contract))
-          (match pure with | True => Just Bool False | False => Nothing Bool end)
-          (match orb (cm_result_contract_role role)
-              (elem Nat eq_nat role [10,11,15,16,17,18,19,20,21,22,26,27,28,29,30,31,32,33,34,35,36,37,40,41,42,43,44,45,46,47,48,49,50,51,52,53,54]) with
-           | True => role | False => 0 end)
-    end;
+    if orb(pure, orb(notb (eq_nat role 0), cm_contract_policy contract)) then
+      let effects : CsEffect := if pure then CsPure
+        else
+          if elem Nat eq_nat role [1,7,23] then CsFilesystemRead
+          else
+            if elem Nat eq_nat role [2,8] then CsFilesystemWrite
+            else
+              if elem Nat eq_nat role [3,4] then CsProcess
+              else
+                match elem Nat eq_nat role [5,6] with
+                | True => CsReporting | False => CsUnknownEffect end in
+      let result : CsResult := if elem Nat eq_nat role [8,23,24] then CsRequiredResult
+        else
+          if eq_nat role 10 then CsFailureResult
+          else
+            if eq_nat role 11 then CsSuccessResult
+            else
+              match cm_contract_policy contract with
+              | True => CsPolicyResult | False => CsUnknownResult end in
+      CsContract (sc_decl_module decl) (sc_decl_name decl) CsComplete effects result
+        CsUnknownOrigin [] (Just(Nat, cm_contract_cost contract))
+        (match pure with | True => Just Bool False | False => Nothing Bool end)
+        (if
+            orb (cm_result_contract_role role)
+              (elem Nat eq_nat role [10,11,15,16,17,18,19,20,21,22,26,27,28,29,30,31,32,33,34,35,36,37,40,41,42,43,44,45,46,47,48,49,50,51,52,53,54]) then
+            role
+          else 0)
+    else cs_unknown decl CsPending;
 
 inductive CmApiIndex : Type :=
   | CmApiEmpty : CmApiIndex
@@ -554,59 +568,78 @@ inductive CmApiIndex : Type :=
 -- The source record is not a completed contract. Attach it only to the
 -- declaration that supplied it; registered contracts keep their own priority.
 def cm_seed_origin (fact : CsOriginFact) : CmApiIndex -> CmApiIndex :=
-    match fact with | CsOriginOf owner name origin =>
-      fix go (index : CmApiIndex) : CmApiIndex :=
-        match index with
-        | CmApiEmpty => CmApiEmpty
-        | CmApiNode api left right => match compareNat(name, sc_decl_name (cm_api_decl api)) with
-          | LT => CmApiNode api (go left) right
-          | GT => CmApiNode api left (go right)
-          | EQ =>
-              let summary : CsFunctionContract := cm_api_summary api in
-              let pending : Bool := match cs_status summary with
-                | CsPending => True | CsActive => False | CsComplete => False
-                | CsUnsupported => False | CsCycle => False | CsDepth => False | CsBudget => False end in
-              match andb pending (andb (eq_nat(owner, sc_decl_module (cm_api_decl api)))
-                  (eq_nat(sc_decl_kind (cm_api_decl api), 0))) with
-              | False => index
-              | True => CmApiNode (cm_api_with_summary(api, cs_with_origin summary origin)) left right
-              end
-          end
+    let (CsOriginOf owner name origin) := fact in
+    fix go (index : CmApiIndex) : CmApiIndex :=
+      match index with
+      | CmApiEmpty => CmApiEmpty
+      | CmApiNode api left right => match compareNat(name, sc_decl_name (cm_api_decl api)) with
+        | LT => CmApiNode api (go left) right
+        | GT => CmApiNode api left (go right)
+        | EQ =>
+            let summary : CsFunctionContract := cm_api_summary api in
+            let pending : Bool := match cs_status summary with
+              | CsPending => True | CsActive => False | CsComplete => False
+              | CsUnsupported => False | CsCycle => False | CsDepth => False | CsBudget => False end in
+            if
+              andb pending (andb (eq_nat(owner, sc_decl_module (cm_api_decl api)))
+                (eq_nat(sc_decl_kind (cm_api_decl api), 0))) then
+              CmApiNode (cm_api_with_summary(api, cs_with_origin summary origin)) left right
+            else index
         end
-    end;
+      end;
 
 -- Harvested compiler signatures may name types that the skip+keep cone
 -- does not load. Classify those as ordinary (0) instead of failing the
 -- selected file. Missing Either/IO proof on a skipped type is a skip
 -- bug; checked APIs live in std/ and stay harvestable.
-def cm_build_api_tree (unit : ClippySemanticUnit) : ScIndex -> Either QualityInputError CmApiIndex :=
+private def cm_build_api_tree_with_names (unit : ClippySemanticUnit) (names : SourceNameIndex)
+    : ScIndex -> Either QualityInputError CmApiIndex :=
+  let intern : InternState := cm_intern unit in
+  let contracts : CmNumericContracts := cm_bind_numeric_contracts intern names in
+  let role_for (decl : ScDecl) : Nat := match cm_numeric_contract contracts decl with
+    | Nothing => 0
+    | Just selected => cm_contract_role selected
+    end in
   fix go (index : ScIndex) : Either QualityInputError CmApiIndex :=
     match index with
     | ScEmpty => Right QualityInputError CmApiIndex CmApiEmpty
     | ScNode decl left right =>
-      let result : Nat := match cm_type_class unit cm_type_alias_fuel [] (sc_decl_type decl) with
+      let result : Nat := match cm_type_class_with_roles unit role_for cm_type_alias_fuel [] (sc_decl_type decl) with
         | Right class => class
         | Left _ => 0
         end in
-      match go left with
-      | Left error => Left QualityInputError CmApiIndex error
-      | Right l => match go right with
-        | Left error => Left QualityInputError CmApiIndex error
-        | Right r => Right QualityInputError CmApiIndex (CmApiNode
-            (CmApiOf decl (cm_contract_for unit decl)
-              (sc_pi_arity (sc_decl_type decl)) result
-              (cm_seed_summary(decl, cm_contract_for unit decl))) l r)
-        end
+      let? (Left, Right) : Either QualityInputError CmApiIndex do
+        let left_apis : CmApiIndex := (go left)?;
+        let right_apis : CmApiIndex := (go right)?;
+        let contract : CmContract := match cm_numeric_contract contracts decl with
+          | Just selected => selected
+          | Nothing => CmContractOf (cm_string(intern, sc_decl_module decl))
+              (cm_name(intern, sc_decl_name decl)) 0 False 0 False
+          end;
+        CmApiNode
+          (CmApiOf decl contract (sc_pi_arity (sc_decl_type decl)) result
+            (cm_seed_summary decl contract)) left_apis right_apis
       end
+    end;
+
+private def cm_build_apis_with_names (unit : ClippySemanticUnit) (names : SourceNameIndex)
+    (index : ScIndex) : Either QualityInputError CmApiIndex :=
+    let? (Left, Right) : Either QualityInputError CmApiIndex do
+      let apis : CmApiIndex := (cm_build_api_tree_with_names unit names index)?;
+      foldl CsOriginFact CmApiIndex
+        (fun (table : CmApiIndex) (fact : CsOriginFact) => cm_seed_origin fact table)
+        apis (cm_origins unit)
     end;
 
 def cm_build_apis (unit : ClippySemanticUnit) (index : ScIndex)
     : Either QualityInputError CmApiIndex :=
-    match cm_build_api_tree unit index with
+    cm_build_apis_with_names unit (cm_contract_names unit) index;
+
+def cm_build_checked_apis (unit : ClippySemanticUnit) : Either QualityInputError CmApiIndex :=
+    let names : SourceNameIndex := cm_contract_names unit in
+    match cm_validate_contract_bindings_with_names unit names cm_contracts with
     | Left error => Left QualityInputError CmApiIndex error
-    | Right apis => Right QualityInputError CmApiIndex
-        (foldl CsOriginFact CmApiIndex (fun (table : CmApiIndex) (fact : CsOriginFact) =>
-          cm_seed_origin fact table) apis (cm_origins unit))
+    | Right _ => cm_build_apis_with_names unit names (cm_index unit)
     end;
 
 def cm_api_lookup (name : Nat) : CmApiIndex -> Maybe CmApi :=
@@ -626,10 +659,9 @@ def cm_api_lookup_global (unit : ClippySemanticUnit) (name : Nat)
     | Nothing => Nothing CmApi
     | Just resolved => match cm_api_lookup resolved index with
       | Nothing => Nothing CmApi
-      | Just api => match cm_decl_visible (cm_entry unit) (cm_api_decl api) (cm_units unit) with
-        | True => Just CmApi api
-        | False => Nothing CmApi
-        end
+      | Just api => if cm_decl_visible (cm_entry unit) (cm_api_decl api) (cm_units unit) then
+          Just CmApi api
+        else Nothing CmApi
       end
     end;
 

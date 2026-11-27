@@ -32,15 +32,13 @@ def cw_wire (requested : Nat) (frames : String) (completed : Nat) (status : Stri
 def cw_accept (paths : List String) (wire : String) (count : Nat) (ok : Bool) : Bool :=
     match cg_wire_session cw_config paths wire (Nil QrFinding) with
     | Left _ => False
-    | Right reply => match reply with
-      | MkCgWireResult findings completed passed => andb (eq_nat count completed)
-          (match ok with
-           | True => passed
-           | False => andb (notb passed)
-               (any QrFinding (fun (finding : QrFinding) =>
-                 prim_string_eq(qr_find_level finding, "fatal")) findings)
-           end)
-      end
+    | Right reply => let (MkCgWireResult findings completed passed) := reply in
+      andb (eq_nat count completed)
+        (if ok then passed
+          else
+            andb (notb passed)
+              (any QrFinding (fun (finding : QrFinding) =>
+                prim_string_eq(qr_find_level finding, "fatal")) findings))
     end;
 
 def cw_reject (paths : List String) (wire : String) : Bool :=
@@ -74,24 +72,92 @@ def cw_truncations : Nat -> String -> Bool :=
 
 def cw_good : String := cw_wire 1 (cw_root 0 "a.ouro" (cw_snapshot "")) 1 "ok";
 
+private def cw_offset_proofs : Nat -> List CgSProof :=
+  fix go (count : Nat) : List CgSProof :=
+    match count with
+    | Z => Nil CgSProof
+    | S offset => Cons CgSProof (MkCgSProof "OURO-CLIPPY-REDUNDANT-001" "retain" offset
+        (Just (Pair Nat Nat) (MkPair Nat Nat offset offset)) "offset") (go offset)
+    end;
+
+private def cw_locations_match (source : String) : Nat -> List QrFinding -> Bool :=
+  fix go (count : Nat) (findings : List QrFinding) : Bool :=
+    match count with
+    | Z => nullb QrFinding findings
+    | S offset => match findings with
+      | Nil => False
+      | Cons finding rest =>
+          let (MkPair line column) := cg_s_line_col source offset in
+          andb (andb (eq_nat line (qr_find_line finding)) (eq_nat column (qr_find_col finding)))
+            (go offset rest)
+      end
+    end;
+
+private def cw_all_offsets (source : String) : Bool :=
+    let count : Nat := S (prim_string_length source) in
+    cw_locations_match source count
+      (cg_s_attach [] "project" "a.ouro" source [] (cw_offset_proofs count));
+
+def cw_proof_positions : Bool :=
+    let code : String := "OURO-CLIPPY-REDUNDANT-001" in
+    let prefix : String := "-- ouro-clippy:disable=OURO-CLIPPY-REDUNDANT-001 reason=review\r\n" in
+    let source : String := prim_string_concat prefix "  éX\ndef retain : Nat := Z;" in
+    let offset : Nat := add (prim_string_length prefix) 4 in
+    let snapshot : String := cw_text [cg_s_protocol, "\nok\n",
+      prim_string_of_nat (prim_string_length source), "\n", source, "\n2\n",
+      "OURO-CLIPPY-REDUNDANT-001\r\nretain\r\n1\r\n-\r\n-\r\nfallback\r\n",
+      "OURO-CLIPPY-REDUNDANT-001\r\nretain\r\n2\r\n", prim_string_of_nat offset, "\r\n",
+      prim_string_of_nat (S offset), "\r\nexact\r\n"] in
+    let wire : String := cw_wire 2 (cw_text
+      [cw_root 0 "a.ouro" snapshot, cw_root 1 "b.ouro" (cw_snapshot "")]) 2 "ok" in
+    let rule : QrClippy := MkQrClippy code "redundant" "retain" "test" "review"
+      [MkPair String String "project" "warn"] in
+    let config : CgWireConfig := MkCgWireConfig [MkPair String QrClippy code rule] "project" "." "." in
+    match cg_wire_session config ["a.ouro", "b.ouro"] wire (Nil QrFinding) with
+    | Left _ => False
+    | Right reply => let (MkCgWireResult findings completed passed) := reply in
+      match findings with
+      | Nil => False
+      | Cons exact rest => match rest with
+        | Nil => False
+        | Cons fallback tail => andb (andb passed (eq_nat completed 2))
+          (andb (nullb QrFinding tail)
+            (andb (andb (eq_nat(qr_find_line exact, 2)) (eq_nat(qr_find_col exact, 5)))
+              (andb (andb (eq_nat(qr_find_line fallback, 3)) (eq_nat(qr_find_col fallback, 1)))
+                (andb (prim_string_eq(qr_find_witness exact, "definition `retain`, expression #2: exact"))
+                  (andb (prim_string_eq(qr_find_witness fallback, "definition `retain`, expression #1: fallback"))
+                    (andb (match qr_find_mark exact with
+                      | Just mark => prim_string_eq mark "line:2" | Nothing => False end)
+                      (match qr_find_mark fallback with | Just _ => False | Nothing => True end)))))))
+        end
+      end
+    end;
+
+def cw_bad_proof_ordinal : Bool :=
+    let snapshot : String := cw_text [cg_s_protocol, "\nok\n1\nx\n1\n",
+      "OURO-CLIPPY-REDUNDANT-001\nretain\n01\n0\n1\nlet\n"] in
+    let wire : String := cw_wire 1 (cw_root 0 "a.ouro" snapshot) 1 "ok" in
+    match cg_wire_session cw_config ["a.ouro"] wire (Nil QrFinding) with
+    | Left error => if let QualityInvalidInput message := (error : QualityInputError) then
+        prim_string_eq message "structural worker returned a non-numeric expression ordinal"
+      else False
+    | Right _ => False
+    end;
+
 def cw_resumed_error : Bool :=
     let prefix : String := cw_wire 3 (cw_text
       [cw_root 0 "a.ouro" cw_error, cw_root 1 "a.ouro" (cw_snapshot "")]) 2 "error" in
     match cg_wire_session(cw_config, cw_repeat 3, prefix, Nil QrFinding) with
     | Left _ => False
-    | Right first => match first with
-      | MkCgWireResult findings completed passed =>
-          andb (eq_nat completed 2) (andb (notb passed)
-            (match cg_wire_session cw_config ["a.ouro"] cw_good findings with
-             | Left _ => False
-             | Right second => match second with
-               | MkCgWireResult retained resumed valid =>
-                   andb (eq_nat resumed 1) (andb valid
-                     (any QrFinding (fun (finding : QrFinding) =>
-                       prim_string_eq(qr_find_level finding, "fatal")) retained))
-               end
-             end))
-      end
+    | Right first => let (MkCgWireResult findings completed passed) := first in
+      andb (eq_nat completed 2) (andb (notb passed)
+        (match cg_wire_session cw_config ["a.ouro"] cw_good findings with
+         | Left _ => False
+         | Right second => let (MkCgWireResult retained resumed valid) := second in
+           andb (eq_nat resumed 1) (andb valid
+             (any QrFinding (fun (finding : QrFinding) =>
+               prim_string_eq(qr_find_level finding, "fatal")) retained))
+         end))
     end;
 
 def cw_laws : List (Pair String Bool) :=
@@ -148,15 +214,19 @@ def cw_laws : List (Pair String Bool) :=
     , MkPair String Bool "native-session-proof-range-advances"
         (cw_accept (cw_repeat 2) (cw_wire 2 (cw_text
           [cw_root 0 "a.ouro" cw_one_proof, cw_root 1 "a.ouro" (cw_snapshot "")]) 2 "ok") 2 True)
+    , MkPair String Bool "native-session-proof-positions-and-order" cw_proof_positions
+    , MkPair String Bool "native-session-indexed-byte-positions"
+        (all String cw_all_offsets ["", "\né\r\n\n", cw_text
+          ["é\r\n", prim_string_of_char_codes [0], "z\r\n\n"]])
+    , MkPair String Bool "native-session-malformed-proof-ordinal" cw_bad_proof_ordinal
     , MkPair String Bool "native-session-extra-output-rejected"
         (cw_reject(["a.ouro"], prim_string_concat cw_good "\n"))
     ];
 
 def main : IO Unit :=
     do let! _p := io_foreach (Pair String Bool) (fun (law : Pair String Bool) =>
-         match law with
-         | MkPair name passed => println (prim_string_concat
-             (match passed with | True => "PASS " | False => "FAIL " end) name)
-         end) cw_laws;
+         let (MkPair name passed) := law in
+         println (prim_string_concat
+           (match passed with | True => "PASS " | False => "FAIL " end) name)) cw_laws;
        exit (match all (Pair String Bool) (fun (law : Pair String Bool) =>
          snd String Bool law) cw_laws with | True => 0 | False => 1 end)

@@ -4,7 +4,7 @@ Declarations: 1.
 
 ## def executable_path_checked
 
-```
+```ouro
 def executable_path_checked : IO (Either ExecutablePathError String)
 ```
 

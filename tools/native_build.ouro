@@ -1,7 +1,10 @@
 -- Transitional positional producer; coil owns the public command grammar.
 -- Explicit units and the output path protocol remain available to bootstrap.
 -- `--coil-dispatch` keeps the public coil launcher off the compiler cone.
-import "native_build_core.ouro",
+-- Load diagnostics before managed lowering to preserve the build unit order.
+import "../compiler/native/diagnostics.ouro",
+  "../compiler/native/managed_stdio_compile.ouro",
+  "native_build_core.ouro",
   "native_cli_args.ouro",
   "../compiler/native/mir_model.ouro",
   "../compiler/pipeline_abi.ouro",
@@ -27,6 +30,49 @@ def native_build_finish (output : String) (result : Either NativeBuildFailure Un
     | Right _ => println output
     end;
 
+private def native_build_image (request : NativeBuildRequest) (root : String)
+    (files : NativeBuildFiles) : Either NativeBuildFailure NativeImage :=
+    match native_build_validate_request request with
+    | Left error => Left NativeBuildFailure NativeImage error
+    | Right _ => match native_compile_units_auto (native_build_request_fuel request) native_build_limits
+        (prim_string_to_char_codes (native_build_request_entry request))
+        (prim_string_to_char_codes (native_build_normalize root)) files with
+      | Left error => Left NativeBuildFailure NativeImage (NativeBuildSource error)
+      | Right image => Right NativeBuildFailure NativeImage image
+      end
+    end;
+
+def native_build_snapshot_image (request : NativeBuildRequest) (snapshot : CollectSnapshot)
+    : Either NativeBuildFailure NativeImage :=
+    native_build_image request (collect_snapshot_root snapshot) (native_build_snapshot_files snapshot);
+
+private def native_build_publish_result (request : NativeBuildRequest)
+    (result : Either NativeBuildFailure NativeImage) : IO (Either NativeBuildFailure Unit) :=
+    match result with
+    | Left error => io_pure (Either NativeBuildFailure Unit) (Left NativeBuildFailure Unit error)
+    | Right image => native_build_publish_image (native_build_request_out request) image
+    end;
+
+def native_build_compile_files (request : NativeBuildRequest) (root : String)
+    (files : NativeBuildFiles) : IO (Either NativeBuildFailure Unit) :=
+    native_build_publish_result request (native_build_image request root files);
+
+def native_build_compile_units_checked (request : NativeBuildRequest) (paths : List String)
+    : IO (Either NativeBuildFailure Unit) :=
+    match! native_build_read_files paths with
+    | Left error => io_pure (Either NativeBuildFailure Unit)
+        (Left NativeBuildFailure Unit (NativeBuildFilesystem error))
+    | Right files => native_build_compile_files request (native_build_request_source request) files
+    end
+
+def native_build_compile_checked (request : NativeBuildRequest)
+    : IO (Either NativeBuildFailure Unit) :=
+    match! native_build_capture_source collect_read_checked (native_build_request_source request) with
+    | Left error => io_pure(Either NativeBuildFailure Unit, Left NativeBuildFailure Unit error)
+    | Right snapshot => native_build_publish_result request
+        (native_build_snapshot_image request snapshot)
+    end
+
 def native_build_compile_units (root : String) (output : String) (paths : List String) : IO Unit :=
     do let! result := native_build_compile_units_checked(native_build_positional_request root output, paths);
        native_build_finish output result
@@ -47,41 +93,37 @@ def coil_run_finish (result : Either ProcessRunError Nat) : IO Unit :=
     end;
 
 def coil_run (request : NativeBuildRequest) (arguments : List String) : IO Unit :=
-    do let! built := native_build_compile_checked request;
-       match built with
-       | Left error => coil_build_fail error
-       | Right _ =>
-           do let! result := process_run_inherited(native_build_request_out request, arguments);
-              coil_run_finish result
-       end
+    match! native_build_compile_checked request with
+    | Left error => coil_build_fail error
+    | Right _ =>
+        do let! result := process_run_inherited(native_build_request_out request, arguments);
+           coil_run_finish result
+    end
 
 def coil_check_output (fuel : Nat) (artifact : Maybe String)
     (checked : CheckedProgram) : IO Unit :=
     match artifact with
     | Nothing => println "CHECK_OK"
     | Just output =>
-        do let! written := native_build_dump_checked fuel output checked;
-           match written with
-           | Left error => coil_build_fail error
-           | Right _ => println "CHECK_OK"
-           end
+        match! native_build_dump_checked fuel output checked with
+        | Left error => coil_build_fail error
+        | Right _ => println "CHECK_OK"
+        end
     end;
 
 def coil_execute (command : NativeCliCommand) : IO Unit :=
     match command with
     | NativeCliDoctor => native_build_doctor
     | NativeCliCheck source fuel artifact =>
-        do let! checked := native_build_check_source source fuel;
-           match checked with
-           | Left error => coil_build_fail error
-           | Right program => coil_check_output fuel artifact program
-           end
+        match! native_build_check_source source fuel with
+        | Left error => coil_build_fail error
+        | Right program => coil_check_output fuel artifact program
+        end
     | NativeCliBuild request =>
-        do let! built := native_build_compile_checked request;
-           match built with
-           | Left error => coil_build_fail error
-           | Right _ => println (native_build_request_out request)
-           end
+        match! native_build_compile_checked request with
+        | Left error => coil_build_fail error
+        | Right _ => println (native_build_request_out request)
+        end
     | NativeCliRun request arguments => coil_run request arguments
     end;
 
@@ -99,32 +141,26 @@ def coil_dispatch_words (words : List String) : IO Unit :=
 
 -- @entry main
 def main : IO Unit :=
-    do let! argv := prim_argv;
-       match argv with
-       | Cons _ rest =>
-           match rest with
-           | Cons source more =>
-               match native_build_str_eq source "--coil-dispatch" with
-               | True => coil_dispatch_words more
-               | False =>
-               match native_build_str_eq source "doctor" with
-               | True => native_build_doctor
-               | False =>
-                 match native_build_str_eq source "legacy-c" with
-                 | True => native_build_die 2 "legacy-c is rejected"
-                 | False =>
-                   match more with
-                   | Cons output leftover =>
-                       match leftover with
-                       | Nil => native_build_compile source output
-                       | Cons _ _ => native_build_compile_units source output leftover
-                       end
-                   | Nil => native_build_die 2 native_build_usage
-                   end
-                 end
-               end
-               end
-           | Nil => native_build_die 2 native_build_usage
-           end
-       | Nil => native_build_die 2 native_build_usage
-       end
+    match! prim_argv with
+    | Cons _ rest =>
+        match rest with
+        | Cons source more =>
+            if native_build_str_eq source "--coil-dispatch" then coil_dispatch_words more
+            else
+              if native_build_str_eq source "doctor" then native_build_doctor
+              else
+                if native_build_str_eq source "legacy-c" then
+                  native_build_die 2 "legacy-c is rejected"
+                else
+                  match more with
+                  | Cons output leftover =>
+                      match leftover with
+                      | Nil => native_build_compile source output
+                      | Cons _ _ => native_build_compile_units source output leftover
+                      end
+                  | Nil => native_build_die 2 native_build_usage
+                  end
+        | Nil => native_build_die 2 native_build_usage
+        end
+    | Nil => native_build_die 2 native_build_usage
+    end

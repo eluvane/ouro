@@ -1,6 +1,8 @@
 -- Construct exact Core declarations and recheck the complete wrapper before
 -- exercising internal managed lowering. The test does not authorize entries.
 import "../compiler/native/managed_terms.ouro",
+  "../compiler/native/managed_strings.ouro",
+  "../compiler/native/mir.ouro",
   "compiler_startup_test_support.ouro";
 
 def intrinsic_value_items (signature : CoreTerm) (operation : PrimitiveStringOp)
@@ -24,7 +26,7 @@ def intrinsic_value_result (result : Either NativeLowerError ManagedResult) : St
       | LowerEffectMismatch => "effect" | LowerInvalidEntry _ => "entry"
       | LowerMirFailure _ => "mir" | LowerBackendFailure _ => "backend" end
     | Right lowered => match lowered with | ManagedResultOf _ state => match state with
-      | ManagedStateOf _ functions _ _ _ _ => prim_string_of_nat (length MirFunction functions) end end end;
+      | ManagedStateOf _ functions _ _ _ _ _ => prim_string_of_nat (length MirFunction functions) end end end;
 
 def intrinsic_value_lower (items : List FileItem) : String :=
     match check_declarations CheckExactCore keep_checking (mul 16 250) items with
@@ -38,14 +40,63 @@ def intrinsic_value_lower (items : List FileItem) : String :=
           match managed_global_body compiler (mul 16 250) 6 with
           | Left _ => "body-rejected"
           | Right body => intrinsic_value_result (managed_expression compiler (mul 16 250) ([] : List (Maybe MirValue)) body
-              (ManagedStateOf(100, [] : List MirFunction, [] : List MirData, [] : List Nat, [] : List Nat, lower_empty_state 0))) end end end;
+              (ManagedStateOf(100, [] : List MirFunction, [] : List MirData, [] : List Nat, [] : List Nat, lower_empty_state 0, NativeOriginsDisabled))) end end end;
 
 def intrinsic_unary_signature : CoreTerm := CPi(CConst 4, CInd 1);
 def intrinsic_binary_signature : CoreTerm := CPi(CConst 4, CPi(CConst 4, CConst 4));
 def intrinsic_ternary_signature : CoreTerm := CPi(CConst 4, intrinsic_binary_signature);
 
+def intrinsic_equal_fixture (_ : Unit) : Either NativeLowerError MirFunction :=
+    let initial : ManagedState := ManagedStateOf(100, [], [], [], [], lower_empty_state 3, NativeOriginsDisabled) in
+    lower_map ManagedResult MirFunction (fun (result : ManagedResult) => match result with
+      | ManagedResultOf value state => match managed_flow state with
+        | LowerStateOf _ locals _ _ =>
+            MirFunctionDef 0 [101, 113, 117, 97, 108]
+              [MirLocalDef 0 MirManagedPtr, MirLocalDef 1 MirManagedPtr, MirLocalDef 2 MirUSize]
+              (reverse MirLocal locals) (Just MirType MirU8) 0
+              (lower_finish_blocks (MirReturn (Just MirValue value)) (managed_flow state)) end end)
+      (managed_bytes_equal (MirUse 0) (managed_bits MirUSize 43)
+        (MirUse 1) (managed_bits MirUSize 40) (MirUse 2) initial);
+
+def intrinsic_equal_load_widths (locals : List MirLocal) (instruction : MirInstruction) : List Nat :=
+    if let MirLoadAt id _ _ := instruction then
+      match mir_type_of_local locals id with
+        | Left _ => [0] | Right typ => [mir_type_bits typ] end
+    else [];
+
+def intrinsic_equal_readonly (locals : List MirLocal) (instruction : MirInstruction) : Bool :=
+    match instruction with
+    | MirLoadAt _ owner _ => match mir_type_of_value locals owner with
+        | Left _ => False | Right typ => mir_type_equal typ MirManagedPtr end
+    | MirMove _ _ => True | MirBinaryOp _ _ _ _ => True | MirCompare _ _ _ _ => True
+    | MirConvert _ _ _ => False | MirLoad _ _ _ => False | MirStore _ _ _ => False
+    | MirStoreAt _ _ _ => False | MirAddress _ _ => False | MirPointerAdd _ _ _ => False
+    | MirCall _ _ _ _ => False | MirManagedAlloc _ _ _ _ _ => False | MirManagedContext _ => False end;
+
+def intrinsic_equal_shape (function : MirFunction) : Bool :=
+    match function with | MirFunctionDef _ _ arguments remaining _ _ blocks =>
+      let locals : List MirLocal := append MirLocal arguments remaining in
+      let instructions : List MirInstruction := concat_map MirBlock MirInstruction
+        (fun (block : MirBlock) => match block with | MirBlockDef _ body _ => body end) blocks in
+      andb (pe_bytes_equal (concat_map MirInstruction Nat (intrinsic_equal_load_widths locals) instructions)
+        [64, 64, 8, 8]) (all MirInstruction (intrinsic_equal_readonly locals) instructions) end;
+
+def intrinsic_equal_valid (function : MirFunction) : Bool :=
+    let entry : MirFunction := MirFunctionDef 1 [109, 97, 105, 110] [] [] (Just MirType MirU8) 0
+      [MirBlockDef 0 [] (MirReturn (Just MirValue (managed_bits MirU8 0)))] in
+    match mir_validate mir_default_limits (MirProgramDef [function, entry] [] [] 1) with
+    | Left _ => False | Right _ => True end;
+
+def intrinsic_equal_tests (_ : Unit) : List StartupTest :=
+    match intrinsic_equal_fixture MkUnit with
+    | Left _ => [startup_test_assert "byte comparison emits owner-preserving word and byte loads" False,
+        startup_test_assert "byte comparison passes typed MIR and GC validation" False]
+    | Right function =>
+        [startup_test_assert "byte comparison emits owner-preserving word and byte loads" (intrinsic_equal_shape function),
+         startup_test_assert "byte comparison passes typed MIR and GC validation" (intrinsic_equal_valid function)] end;
+
 def main : IO Unit :=
-    startup_test_run [
+    startup_test_run (append StartupTest [
       startup_test_eq "unary intrinsic identity becomes one managed closure"
         (intrinsic_value_lower (intrinsic_value_items intrinsic_unary_signature PrimitiveStringLength
           intrinsic_unary_signature (CConst 5))) "1",
@@ -74,4 +125,5 @@ def main : IO Unit :=
           (CApp(CConst 5, CStrBytes [97] 4)))) "0",
       startup_test_eq "wrong intrinsic contract stays rejected"
         (intrinsic_value_lower (intrinsic_value_items intrinsic_binary_signature PrimitiveStringLength
-          intrinsic_binary_signature (CConst 5))) "declarations-rejected"];
+          intrinsic_binary_signature (CConst 5))) "declarations-rejected"]
+      (intrinsic_equal_tests MkUnit));

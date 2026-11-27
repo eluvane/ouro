@@ -1,0 +1,105 @@
+import "native_base_executor.ouro";
+
+inductive NativeAnalyzeDriveState : Type :=
+  | MkNativeAnalyzeDriveState : String -> String -> String -> String -> String -> Bool
+      -> NativeAnalyzeDriveState;
+
+def native_analyze_drive_empty : NativeAnalyzeDriveState :=
+    MkNativeAnalyzeDriveState "0" "0" "0" "" "" False;
+
+def native_analyze_drive_body (text : String) : Either BoundedNativeReportError String :=
+    let? (Left, Right) : Either BoundedNativeReportError String do
+      let lines : List String := (native_analyze_base_lines (str_len text) text Z [])?;
+      str_join "" (map String String (fun (line : String) => str_concat line "\n")
+        (filter String (fun (line : String) => notb(str_starts line "ANALYZE_DRIVE ")) lines))
+    end;
+
+def native_analyze_drive_record (families : String) (rel : String)
+    (result : ProcResult) (state : NativeAnalyzeDriveState)
+    : Either NativeAnalyzeExecutorError NativeAnalyzeDriveState :=
+    match bounded_native_report_verify
+        (MkBoundedDriveExpected (Just String "1") (Just String families) (Just String rel)) result with
+    | Left error => Left NativeAnalyzeExecutorError NativeAnalyzeDriveState
+        (NativeAnalyzeDrivePolicyFailure rel error result)
+    | Right banner =>
+        let (MkBoundedDriveBanner files findings rejected _) := banner in
+        let (MkNativeAnalyzeDriveState file_total finding_total reject_total output errors failed) := state in
+        match native_analyze_drive_body (proc_stdout result) with
+        | Left error => Left NativeAnalyzeExecutorError NativeAnalyzeDriveState
+            (NativeAnalyzeDrivePolicyFailure rel error result)
+        | Right body =>
+            let next_output : String := str_concat output body in
+            let next_errors : String := str_concat errors (proc_stderr result) in
+            if notb(bounded_native_report_size_valid (str_len next_output) (str_len next_errors)) then
+              Left NativeAnalyzeExecutorError NativeAnalyzeDriveState NativeAnalyzeAggregateLimit
+            else match native_analyze_decimal_add file_total files with
+              | Nothing => Left NativeAnalyzeExecutorError NativeAnalyzeDriveState NativeAnalyzeCountsFailure
+              | Just next_files => match native_analyze_decimal_add finding_total findings with
+                | Nothing => Left NativeAnalyzeExecutorError NativeAnalyzeDriveState NativeAnalyzeCountsFailure
+                | Just next_findings => match native_analyze_decimal_add reject_total rejected with
+                  | Nothing => Left NativeAnalyzeExecutorError NativeAnalyzeDriveState NativeAnalyzeCountsFailure
+                  | Just next_rejected => Right NativeAnalyzeExecutorError NativeAnalyzeDriveState
+                      (MkNativeAnalyzeDriveState next_files next_findings next_rejected next_output next_errors
+                        (orb failed (notb(eq_nat (proc_code result) Z))))
+                  end
+                end
+              end
+        end
+    end;
+
+def native_analyze_drive_finish (families : String) (state : NativeAnalyzeDriveState) : ProcResult :=
+    let (MkNativeAnalyzeDriveState files findings rejected output errors failed) := state in
+    let banner : String := str_cat4 "ANALYZE_DRIVE files=" files " findings=" findings in
+    let complete : String := str_cat4 banner " rejected=" rejected (str_cat3 " families=" families "\n") in
+    MkProcResult (if failed then 1 else Z) (str_concat output complete) errors;
+
+def native_analyze_drive_loop (capture : NativeAnalyzeCapture) (root : String)
+    (flags : List String) (families : String)
+    : List NativeAnalyzeSource -> NativeAnalyzeDriveState
+      -> IO (Either NativeAnalyzeExecutorError ProcResult) :=
+    fix run (remaining : List NativeAnalyzeSource) (state : NativeAnalyzeDriveState)
+        : IO (Either NativeAnalyzeExecutorError ProcResult) :=
+      match remaining with
+      | Nil => io_pure (Either NativeAnalyzeExecutorError ProcResult)
+          (native_analyze_result_bounded (native_analyze_drive_finish families state))
+      | Cons source rest =>
+          let rel : String := native_analyze_source_rel source in
+          match! native_analyze_source_guard source with
+          | Left error => io_pure (Either NativeAnalyzeExecutorError ProcResult)
+              (Left NativeAnalyzeExecutorError ProcResult error)
+          | Right _ => let action : IO (Either NativeAnalyzeProcessError ProcResult) :=
+                capture root NativeAnalyzeDriveWorker (append String flags ["--scope", rel]) in
+              match! action with
+              | Left error => io_pure (Either NativeAnalyzeExecutorError ProcResult)
+                  (Left NativeAnalyzeExecutorError ProcResult (NativeAnalyzeProcessFailure (str_concat "drive " rel) error))
+              | Right result => match! native_analyze_source_guard source with
+                | Left error => io_pure (Either NativeAnalyzeExecutorError ProcResult)
+                    (Left NativeAnalyzeExecutorError ProcResult error)
+                | Right _ => match native_analyze_drive_record families rel result state with
+                  | Left error => io_pure (Either NativeAnalyzeExecutorError ProcResult)
+                      (Left NativeAnalyzeExecutorError ProcResult error)
+                  | Right next => run rest next
+                  end
+                end
+              end
+          end
+      end;
+
+def native_analyze_drive_execute (capture : NativeAnalyzeCapture) (root : String)
+    (flags : List String) (sources : List NativeAnalyzeSource)
+    : IO (Either NativeAnalyzeExecutorError ProcResult) :=
+    let action : IO (Either NativeAnalyzeProcessError ProcResult) :=
+      capture root NativeAnalyzeDriveWorker (append String flags ["--print-families"]) in
+    match! action with
+    | Left error => io_pure (Either NativeAnalyzeExecutorError ProcResult)
+        (Left NativeAnalyzeExecutorError ProcResult (NativeAnalyzeProcessFailure "family query" error))
+    | Right query => match native_family_query_observe query with
+      | Left error => io_pure (Either NativeAnalyzeExecutorError ProcResult)
+          (Left NativeAnalyzeExecutorError ProcResult (NativeAnalyzeDriveQueryFailure error query))
+      | Right families => match sources with
+        | Nil => io_pure (Either NativeAnalyzeExecutorError ProcResult)
+            (Left NativeAnalyzeExecutorError ProcResult NativeAnalyzeCountsFailure)
+        | Cons _ _ => native_analyze_drive_loop capture root flags families sources native_analyze_drive_empty
+        end
+      end
+    end;

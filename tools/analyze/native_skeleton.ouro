@@ -1,0 +1,574 @@
+-- Pure source staging for the bounded analyzer. A plan is not a worker result.
+import "extract.ouro",
+  "../quality/order.ouro",
+  "../structural/lex.ouro",
+  "../../std/collections.ouro",
+  "../../std/stringx.ouro";
+
+inductive NativeSkeletonMode : Type :=
+  | SkeletonLocal : NativeSkeletonMode
+  | SkeletonFormat : NativeSkeletonMode
+  | SkeletonArchitecture : NativeSkeletonMode;
+
+inductive NativeSkeletonProblem : Type :=
+  | SkeletonInvalidPath : NativeSkeletonProblem
+  | SkeletonInvalidUtf8 : NativeSkeletonProblem
+  | SkeletonUnsupportedLineBreak : NativeSkeletonProblem
+  | SkeletonUnsupportedCommentPrefix : NativeSkeletonProblem
+  | SkeletonLexical : StLexError -> NativeSkeletonProblem
+  | SkeletonRowMismatch : NativeSkeletonProblem
+  | SkeletonStagedLexical : StLexError -> NativeSkeletonProblem;
+
+inductive NativeSkeletonRefusal : Type :=
+  | MkNativeSkeletonRefusal : NativeSkeletonMode -> String -> String
+      -> NativeSkeletonProblem -> NativeSkeletonRefusal;
+
+-- Inclusive source lines, derived from the original lexical/header owners.
+inductive NativeSkeletonRegion : Type :=
+  | MkNativeSkeletonRegion : String -> Nat -> Nat -> NativeSkeletonRegion;
+
+inductive NativeSkeletonPlan : Type :=
+  | MkNativeSkeletonPlan : NativeSkeletonMode -> String -> String -> String
+      -> List NativeSkeletonRegion -> Either ImportScanError (List ScannedImport)
+      -> NativeSkeletonPlan;
+
+def native_skeleton_contents (plan : NativeSkeletonPlan) : String :=
+    match plan with | MkNativeSkeletonPlan _ _ _ contents _ _ => contents end;
+
+def native_skeleton_original (plan : NativeSkeletonPlan) : String :=
+    match plan with | MkNativeSkeletonPlan _ _ source _ _ _ => source end;
+
+def native_skeleton_mode_eq (a : NativeSkeletonMode) (b : NativeSkeletonMode) : Bool :=
+    match a with
+    | SkeletonLocal => match b with | SkeletonLocal => True | SkeletonFormat => False | SkeletonArchitecture => False end
+    | SkeletonFormat => match b with | SkeletonLocal => False | SkeletonFormat => True | SkeletonArchitecture => False end
+    | SkeletonArchitecture => match b with | SkeletonLocal => False | SkeletonFormat => False | SkeletonArchitecture => True end
+    end;
+
+-- Rebinding checks labels and exact input bytes, not physical path authority.
+def native_skeleton_is_for (plan : NativeSkeletonPlan) (mode : NativeSkeletonMode)
+    (rel : String) (source : String) : Bool :=
+    let (MkNativeSkeletonPlan actual path original _ _ _) := plan in
+    andb(native_skeleton_mode_eq actual mode,
+      andb(str_eq path rel, str_eq original source));
+
+def native_skeleton_utf8_bytes : Nat -> List Nat -> Bool :=
+    fix valid (fuel : Nat) (bytes : List Nat) : Bool :=
+      match bytes with
+      | Nil => True
+      | Cons _ _ => match fuel with
+        | Z => False
+        | S left => match source_take_scalar bytes with
+          | Nothing => False
+          | Just decoded => let (MkPair _ rest) := decoded in
+            valid left rest
+          end
+        end
+      end;
+
+def native_skeleton_line_separator : Nat :=
+    add 40 (pow_nat 2 13);
+
+def native_skeleton_paragraph_separator : Nat :=
+    S native_skeleton_line_separator;
+
+private def native_skeleton_source_problem_bytes (allow_cr : Bool)
+    (initial_fuel : Nat) (source_codes : List Nat)
+    : Maybe NativeSkeletonProblem :=
+    (fix check (fuel : Nat) (bytes : List Nat) : Maybe NativeSkeletonProblem :=
+      match bytes with
+      | Nil => Nothing NativeSkeletonProblem
+      | Cons _ _ => match fuel with
+        | Z => Just NativeSkeletonProblem SkeletonInvalidUtf8
+        | S left => match source_take_scalar bytes with
+          | Nothing => Just NativeSkeletonProblem SkeletonInvalidUtf8
+          | Just decoded => let (MkPair scalar rest) := decoded in
+            let unsupported : Bool :=
+              if orb(elem Nat eq_nat scalar ([11, 12, 28, 29, 30, 133] : List Nat),
+                orb(eq_nat scalar native_skeleton_line_separator,
+                  eq_nat scalar native_skeleton_paragraph_separator)) then True
+              else if andb(eq_nat scalar 13, notb allow_cr) then
+                match rest with
+                | Nil => True
+                | Cons next _ => notb(eq_nat next 10)
+                end
+              else False in
+            if unsupported then
+              -- Invalid UTF-8 takes precedence over unsupported line breaks.
+              if native_skeleton_utf8_bytes left rest then
+                Just NativeSkeletonProblem SkeletonUnsupportedLineBreak
+              else Just NativeSkeletonProblem SkeletonInvalidUtf8
+            else check left rest
+          end
+        end
+      end) initial_fuel source_codes;
+
+-- LF token lines cannot represent Python's other line separators.
+def native_skeleton_source_problem (allow_cr : Bool) (source : String)
+    : Maybe NativeSkeletonProblem :=
+    native_skeleton_source_problem_bytes allow_cr (S (prim_string_length source)) (str_codes source);
+
+def native_skeleton_relative (rel : String) : Bool :=
+    let length : Nat := prim_string_length rel in
+    if eq_nat length 0 then False
+    else
+      let bytes : List Nat := str_codes rel in
+      if notb(native_skeleton_utf8_bytes (S length) bytes) then False
+      else if any Nat (fun (c : Nat) => elem Nat eq_nat c [0, 10, 13, 58, 92]) bytes then False
+      else all String
+        (fun (part : String) => andb(notb(str_null part),
+          andb(notb(str_eq part "."), notb(str_eq part ".."))))
+        (str_split rel 47);
+
+inductive NativeSkeletonRow : Type :=
+  | MkNativeSkeletonRow : String -> String -> NativeSkeletonRow;
+
+def native_skeleton_rows : List String -> List String
+    -> Maybe (List NativeSkeletonRow) :=
+    fix rows (raw : List String) (code : List String) : Maybe (List NativeSkeletonRow) :=
+      match raw with
+      | Nil => match code with
+        | Nil => Just (List NativeSkeletonRow) []
+        | Cons _ _ => Nothing (List NativeSkeletonRow)
+        end
+      | Cons text rest => match code with
+        | Nil => Nothing (List NativeSkeletonRow)
+        | Cons masked more => match rows rest more with
+          | Nothing => Nothing (List NativeSkeletonRow)
+          | Just tail => Just (List NativeSkeletonRow)
+              (Cons NativeSkeletonRow (MkNativeSkeletonRow text masked) tail)
+          end
+        end
+      end;
+
+private def native_skeleton_has_marker (local : Bool) (text : String) : Bool :=
+    if str_contains text "ouro-analyze:" then True
+    else if str_contains text "ouro-lint:" then True
+    else if local then
+      if str_contains text "@entry" then True else str_contains text "@export"
+    else False;
+
+def native_skeleton_marker (local : Bool) (raw : String) (code : String) : Bool :=
+    if native_skeleton_has_marker local raw then str_starts (qt_strip code) "--"
+    else False;
+
+def native_skeleton_dirty (raw : String) : Bool :=
+    if str_contains raw "\r" then True
+    else if str_contains raw "\t" then True
+    else str_ends raw " ";
+
+-- The existing line owners only classify ASCII indentation. Keep ambiguous
+-- Unicode policy prefixes in an original-preserving refusal.
+def native_skeleton_comment_prefix (row : NativeSkeletonRow) : Bool :=
+    let (MkNativeSkeletonRow _ code) := row in
+    if str_contains code "--" then
+      if native_skeleton_has_marker True code then
+        let trimmed : String := qt_strip code in
+        orb(str_null trimmed, ltb_nat (str_head trimmed) 128)
+      else True
+    else True;
+
+def native_skeleton_keep (mode : NativeSkeletonMode) (row : NativeSkeletonRow) : Bool :=
+    let (MkNativeSkeletonRow raw code) := row in
+    match mode with
+    | SkeletonArchitecture => native_skeleton_marker False raw code
+    | SkeletonFormat => native_skeleton_dirty raw
+    | SkeletonLocal =>
+        let trimmed : String := qt_strip code in
+        if str_starts trimmed "--" then native_skeleton_has_marker True raw
+        else
+          let kind : Nat := line_kind (str_codes trimmed) in
+          andb(leb_nat 2 kind, leb_nat kind 7)
+    end;
+
+def native_skeleton_form (value : String) : Bool :=
+    elem String str_eq value ["import", "def", "axiom", "inductive", "record", "effect", "open"];
+
+def native_skeleton_token_last (token : STTok) : Nat :=
+    let (MkSTTok value _ _ first) := token in
+    if str_contains value "\n" then
+      add first (count_if Nat (fun (c : Nat) => eq_nat c 10) (str_codes value))
+    else first;
+
+def native_skeleton_forms (tokens : List STTok) : List NativeSkeletonRegion :=
+    let finish : Maybe (Pair String Nat) -> STTok
+        -> List NativeSkeletonRegion -> List NativeSkeletonRegion :=
+      fun (current : Maybe (Pair String Nat)) (previous : STTok) (rev : List NativeSkeletonRegion) =>
+        match current with
+        | Nothing => rev
+        | Just form => let (MkPair kind first) := form in
+          Cons NativeSkeletonRegion
+            (MkNativeSkeletonRegion kind first (native_skeleton_token_last previous)) rev
+        end in
+    reverse_lin NativeSkeletonRegion
+      ((fix scan (remaining : List STTok) (previous : STTok)
+          (current : Maybe (Pair String Nat))
+          (rev : List NativeSkeletonRegion) : List NativeSkeletonRegion :=
+        match remaining with
+        | Nil => finish current previous rev
+        | Cons token rest =>
+            let value : String := st_tok_value token in
+            if andb(native_skeleton_form value, notb(str_eq (st_tok_value previous) ".")) then
+              scan rest token (Just (Pair String Nat)
+                (MkPair String Nat value (st_tok_line token))) (finish current previous rev)
+            else scan rest token current rev
+        end) tokens (MkSTTok "" Z Z Z) (Nothing (Pair String Nat)) []);
+
+def native_skeleton_contains (line : Nat) (region : NativeSkeletonRegion) : Bool :=
+    let (MkNativeSkeletonRegion _ first last) := region in
+    andb(leb_nat first line, leb_nat line last);
+
+def native_skeleton_overlap (a : NativeSkeletonRegion) (b : NativeSkeletonRegion) : Bool :=
+    let (MkNativeSkeletonRegion _ first last) := a in
+    let (MkNativeSkeletonRegion _ other_first other_last) := b in
+    andb(leb_nat first other_last, leb_nat other_first last);
+
+private def native_skeleton_any_kept_from (mode : NativeSkeletonMode)
+    (rows : List NativeSkeletonRow) (first : Nat) (last : Nat) : Bool :=
+    (fix any_kept (remaining : List NativeSkeletonRow) (line : Nat) : Bool :=
+      match remaining with
+      | Nil => False
+      | Cons row rest => if leb_nat line last then
+          if native_skeleton_keep mode row then True else any_kept rest (S line)
+        else False
+      end) rows first;
+
+def native_skeleton_any_kept (mode : NativeSkeletonMode)
+    (rows : List NativeSkeletonRow) (region : NativeSkeletonRegion) : Bool :=
+    let (MkNativeSkeletonRegion _ first last) := region in
+    let skip : Nat := sub first 1 in
+    native_skeleton_any_kept_from mode (drop NativeSkeletonRow skip rows) (S skip) last;
+
+-- Only the span is added here; the shared header state machine owns delimiters.
+private def native_skeleton_header_last_from (rows : List NativeSkeletonRow)
+    (first : Nat) : Maybe Nat :=
+    match rows with
+    | Nil => Nothing Nat
+    | Cons row rest => let (MkNativeSkeletonRow raw code) := row in
+      if notb(codes_start_word kw_def_cs (str_codes (qt_strip code))) then Nothing Nat else
+      (fix collect (remaining : List NativeSkeletonRow) (line : Nat)
+          (step : ApiHeaderStep) : Maybe Nat :=
+        match step with
+        | ApiHeaderBad => Nothing Nat
+        | ApiHeaderDone _ => Just Nat line
+        | ApiHeaderMore brackets rev => match remaining with
+          | Nil => Nothing Nat
+          | Cons next more => let (MkNativeSkeletonRow next_raw next_code) := next in
+            if api_header_declaration_start (str_codes (qt_strip next_code)) then Nothing Nat
+            else
+              collect more (S line)
+                (api_header_line (str_codes next_code) (str_codes next_raw) brackets rev)
+          end
+        end) rest first
+          (api_header_line (str_codes code) (str_codes raw) [] [])
+    end;
+
+def native_skeleton_nondef_last : Nat -> List NativeSkeletonRegion -> Nat :=
+    fun (current : Nat) (remaining : List NativeSkeletonRegion) =>
+      (fix last (pending_regions : List NativeSkeletonRegion) (last_line : Nat) : Nat :=
+        match pending_regions with
+        | Nil => last_line
+        | Cons region rest => let (MkNativeSkeletonRegion kind _ finish) := region in
+          if str_eq kind "open" then last rest finish else last_line
+        end) remaining current;
+
+private def native_skeleton_choose_region_from (mode : NativeSkeletonMode)
+    (rows : List NativeSkeletonRow) (rows_skipped : Nat) (previous_start : Maybe Nat)
+    (region : NativeSkeletonRegion) (after : List NativeSkeletonRegion)
+    : Maybe NativeSkeletonRegion :=
+    let (MkNativeSkeletonRegion kind first last) := region in
+    if str_eq kind "import" then
+      match mode with
+      | SkeletonFormat => Nothing NativeSkeletonRegion
+      | SkeletonLocal => Just NativeSkeletonRegion region
+      | SkeletonArchitecture => Just NativeSkeletonRegion region
+      end
+    else
+      if native_skeleton_mode_eq mode SkeletonArchitecture then
+        Nothing NativeSkeletonRegion
+      else
+        if str_eq kind "def" then
+          let previous_on_line : Bool := match previous_start with
+            | Nothing => False
+            | Just start => eq_nat start first
+            end in
+          let next_on_line : Bool := match after with
+            | Nil => False
+            | Cons next _ => let (MkNativeSkeletonRegion _ start _) := next in eq_nat start first
+            end in
+          if orb(previous_on_line, next_on_line) then Just NativeSkeletonRegion
+              (MkNativeSkeletonRegion "def-malformed" first last)
+          else
+            let skip : Nat := sub first 1 in
+            let from_first : List NativeSkeletonRow := drop NativeSkeletonRow (sub skip rows_skipped) rows in
+            match native_skeleton_header_last_from from_first first with
+            | Nothing => Just NativeSkeletonRegion
+                (MkNativeSkeletonRegion "def-malformed" first last)
+            | Just finish =>
+                if native_skeleton_any_kept_from mode from_first (S skip) finish then
+                  Just NativeSkeletonRegion (MkNativeSkeletonRegion kind first finish)
+                else Nothing NativeSkeletonRegion
+            end
+        else
+          if elem String str_eq kind ["axiom", "inductive", "record", "effect"] then
+            let finish : Nat := native_skeleton_nondef_last last after in
+            let skip : Nat := sub first 1 in
+            let from_first : List NativeSkeletonRow := drop NativeSkeletonRow (sub skip rows_skipped) rows in
+            if native_skeleton_any_kept_from mode from_first (S skip) finish then
+              Just NativeSkeletonRegion (MkNativeSkeletonRegion kind first finish)
+            else Nothing NativeSkeletonRegion
+          else Nothing NativeSkeletonRegion;
+
+-- Forms follow lexer order, so forms that start on the same line are adjacent.
+def native_skeleton_regions (mode : NativeSkeletonMode)
+    (forms : List NativeSkeletonRegion) (rows : List NativeSkeletonRow)
+    : List NativeSkeletonRegion :=
+    let needs_rows : Bool := notb(native_skeleton_mode_eq mode SkeletonArchitecture) in
+    (fix select (remaining : List NativeSkeletonRegion) (previous_start : Maybe Nat)
+        (pending_rows : List NativeSkeletonRow) (rows_skipped : Nat)
+        : List NativeSkeletonRegion :=
+      match remaining with
+      | Nil => []
+      | Cons region rest => let (MkNativeSkeletonRegion kind first _) := region in
+          let current_start : Maybe Nat := Just Nat first in
+          let skip : Nat := if needs_rows then
+              if orb(str_eq kind "import", str_eq kind "open") then rows_skipped
+              else sub first 1
+            else rows_skipped in
+          -- Lexer order advances the suffix. Explicit out-of-order forms use the full rows.
+          let from_first : List NativeSkeletonRow := if eq_nat rows_skipped skip then pending_rows
+            else if leb_nat rows_skipped skip then
+              drop NativeSkeletonRow (sub skip rows_skipped) pending_rows
+            else drop NativeSkeletonRow skip rows in
+          match native_skeleton_choose_region_from mode from_first skip previous_start region rest with
+          | Nothing => select rest current_start from_first skip
+          | Just chosen => Cons NativeSkeletonRegion chosen (select rest current_start from_first skip)
+          end
+      end) forms (Nothing Nat) rows 0;
+
+def native_skeleton_literal_regions (tokens : List STTok) : List NativeSkeletonRegion :=
+    filter_map STTok NativeSkeletonRegion
+      (fun (token : STTok) =>
+        let first : Nat := st_tok_line token in
+        let last : Nat := native_skeleton_token_last token in
+        if ltb_nat first last then
+          Just NativeSkeletonRegion (MkNativeSkeletonRegion "literal" first last)
+        else Nothing NativeSkeletonRegion) tokens;
+
+
+-- Source-ordered literal occurrences form components at shared inclusive lines.
+-- Components decide retention; the returned regions keep each original span.
+private def native_skeleton_selected_literals (mode : NativeSkeletonMode)
+    (rows : List NativeSkeletonRow) (literals : List NativeSkeletonRegion)
+    (regions : List NativeSkeletonRegion) : List NativeSkeletonRegion :=
+    let components : List NativeSkeletonRegion :=
+      reverse_lin NativeSkeletonRegion
+        ((fix group (remaining : List NativeSkeletonRegion)
+            (current : Maybe NativeSkeletonRegion) (rev : List NativeSkeletonRegion)
+            : List NativeSkeletonRegion :=
+          match remaining with
+          | Nil => match current with
+            | Nothing => rev
+            | Just span => Cons NativeSkeletonRegion span rev
+            end
+          | Cons literal rest => match current with
+            | Nothing => group rest (Just NativeSkeletonRegion literal) rev
+            | Just span => if native_skeleton_overlap span literal then
+                let (MkNativeSkeletonRegion _ first last) := span in
+                let (MkNativeSkeletonRegion _ _ finish) :=
+                  literal in
+                let limit : Nat := if leb_nat last finish then finish else last in
+                group rest (Just NativeSkeletonRegion
+                  (MkNativeSkeletonRegion "literal" first limit)) rev
+              else
+                group rest (Just NativeSkeletonRegion literal)
+                  (Cons NativeSkeletonRegion span rev)
+            end
+          end) literals (Nothing NativeSkeletonRegion) []) in
+    let selected : List NativeSkeletonRegion :=
+      filter NativeSkeletonRegion (fun (component : NativeSkeletonRegion) =>
+        if native_skeleton_any_kept mode rows component then True
+        else any NativeSkeletonRegion (native_skeleton_overlap component) regions) components in
+    filter NativeSkeletonRegion (fun (literal : NativeSkeletonRegion) =>
+      any NativeSkeletonRegion (native_skeleton_overlap literal) selected) literals;
+
+private def native_skeleton_region_le (left : NativeSkeletonRegion)
+    (right : NativeSkeletonRegion) : Bool :=
+    let (MkNativeSkeletonRegion _ first _) := left in
+    let (MkNativeSkeletonRegion _ other_first _) := right in
+    leb_nat first other_first;
+
+private def native_skeleton_render_ordered (mode : NativeSkeletonMode)
+    (rows : List NativeSkeletonRow) (sorted : List NativeSkeletonRegion) : String :=
+    let unexpired : Nat -> List NativeSkeletonRegion -> List NativeSkeletonRegion :=
+      fun (line : Nat) => fix skip (pending : List NativeSkeletonRegion) : List NativeSkeletonRegion :=
+        match pending with
+        | Nil => pending
+        | Cons region rest => let (MkNativeSkeletonRegion _ _ last) := region in
+          if ltb_nat last line then skip rest else pending
+        end in
+    str_join "\n"
+      ((fix render (remaining : List NativeSkeletonRow) (line : Nat)
+          (pending : List NativeSkeletonRegion) : List String :=
+        match remaining with
+        | Nil => []
+        | Cons row rest => let (MkNativeSkeletonRow raw _) := row in
+          let candidates : List NativeSkeletonRegion := unexpired line pending in
+          let retained : Bool := if native_skeleton_keep mode row then True else
+            match candidates with
+            | Nil => False
+            | Cons region _ => native_skeleton_contains line region
+            end in
+          let contents : String := if retained then raw
+            else match str_ends raw "\r" with | True => "\r" | False => "" end in
+          Cons String contents (render rest (S line) candidates)
+        end) rows 1 sorted);
+
+def native_skeleton_render (mode : NativeSkeletonMode) (rows : List NativeSkeletonRow)
+    (regions : List NativeSkeletonRegion) : String :=
+    native_skeleton_render_ordered mode rows
+      (quality_sort NativeSkeletonRegion native_skeleton_region_le regions);
+
+def native_skeleton_project (mode : NativeSkeletonMode) (rel : String) (source : String)
+    : Either NativeSkeletonRefusal (Pair String (List NativeSkeletonRegion)) :=
+    let refusal : NativeSkeletonProblem
+        -> Either NativeSkeletonRefusal (Pair String (List NativeSkeletonRegion)) :=
+      fun (problem : NativeSkeletonProblem) =>
+        Left NativeSkeletonRefusal (Pair String (List NativeSkeletonRegion))
+          (MkNativeSkeletonRefusal mode rel source problem) in
+    if native_skeleton_relative rel then
+      let source_codes : List Nat := str_codes source in
+      match native_skeleton_source_problem_bytes False (S (prim_string_length source)) source_codes with
+      | Just problem => refusal problem
+      | Nothing =>
+          match st_lex_byte_offsets source "ouro" with
+          | Left problem => refusal (SkeletonLexical problem)
+          | Right lexed => let (MkPair tokens _) := lexed in
+            match native_skeleton_rows (str_lines source)
+              (str_lines (str_of_codes (source_mask_literals source_codes))) with
+            | Nothing => refusal SkeletonRowMismatch
+            | Just rows => if all NativeSkeletonRow native_skeleton_comment_prefix rows then
+                let forms : List NativeSkeletonRegion :=
+                  native_skeleton_regions mode (native_skeleton_forms tokens) rows in
+                let literals : List NativeSkeletonRegion :=
+                  native_skeleton_selected_literals mode rows (native_skeleton_literal_regions tokens) forms in
+                -- Both streams follow lexer line order. The plan keeps their original grouping.
+                let ordered : List NativeSkeletonRegion :=
+                  quality_merge_sorted NativeSkeletonRegion native_skeleton_region_le forms literals in
+                let contents : String := native_skeleton_render_ordered mode rows ordered in
+                match st_lex_byte_offsets contents "ouro" with
+                | Left problem => refusal (SkeletonStagedLexical problem)
+                | Right _ =>
+                    let regions : List NativeSkeletonRegion := match literals with
+                      | Nil => forms
+                      | Cons _ _ => append NativeSkeletonRegion forms literals
+                      end in
+                    Right NativeSkeletonRefusal (Pair String (List NativeSkeletonRegion))
+                      (MkPair String (List NativeSkeletonRegion) contents regions)
+                end
+              else refusal SkeletonUnsupportedCommentPrefix
+            end
+          end
+      end
+    else refusal SkeletonInvalidPath;
+
+def native_skeleton_plan (mode : NativeSkeletonMode) (rel : String) (source : String)
+    : Either NativeSkeletonRefusal NativeSkeletonPlan :=
+    match native_skeleton_project mode rel source with
+    | Left error => Left NativeSkeletonRefusal NativeSkeletonPlan error
+    | Right projected => let (MkPair contents regions) := projected in
+      Right NativeSkeletonRefusal NativeSkeletonPlan
+        (MkNativeSkeletonPlan mode rel source contents regions (scan_source_imports source))
+    end;
+
+inductive NativeBaselinePlan : Type :=
+  | NativeBaselineUnchanged : String -> NativeBaselinePlan
+  | MkNativeBaselineShard : String -> String -> String -> Bool -> NativeBaselinePlan;
+
+inductive NativeBaselineRefusal : Type :=
+  | MkNativeBaselineRefusal : String -> Maybe String -> NativeSkeletonProblem
+      -> NativeBaselineRefusal;
+
+private def native_skeleton_baseline_refuse (rel : String) (source : Maybe String) (problem : NativeSkeletonProblem)
+    : Either NativeBaselineRefusal NativeBaselinePlan :=
+    Left NativeBaselineRefusal NativeBaselinePlan (MkNativeBaselineRefusal rel source problem);
+
+private def native_skeleton_baseline_filter (rows : List String) (rel : String) : List String :=
+    let prefix : String := str_concat rel "\t" in
+    filter String (fun (line : String) => str_starts line prefix) rows;
+
+private def native_skeleton_baseline_runs (rows : List String) : List (Pair String (List String)) :=
+    foldr String (List (Pair String (List String)))
+      (fun (line : String) (runs : List (Pair String (List String))) =>
+        match str_index line "\t" with
+        | Nothing => runs
+        | Just tab =>
+            let path : String := str_slice line Z tab in
+            if let Cons first more := runs then
+              let (MkPair first_path first_rows) := first in
+              if str_eq path first_path then
+                Cons (Pair String (List String))
+                  (MkPair String (List String) path (Cons String line first_rows)) more
+              else Cons (Pair String (List String)) (MkPair String (List String) path [line]) runs
+            else [MkPair String (List String) path [line]]
+        end) [] rows;
+
+private def native_skeleton_baseline_grouped (rows : List String) : String -> List String :=
+    let runs : List (Pair String (List String)) := native_skeleton_baseline_runs rows in
+    fun (rel : String) =>
+      if str_contains rel "\t" then native_skeleton_baseline_filter rows rel
+      else concat_map (Pair String (List String)) String
+        (fun (run : Pair String (List String)) => let (MkPair path lines) := run in
+          if str_eq path rel then lines else []) runs;
+
+private def native_skeleton_baseline_valid_path (rows_for : List String -> String -> List String)
+    (source : Maybe String)
+    : String -> Either NativeBaselineRefusal NativeBaselinePlan :=
+    match source with
+    | Nothing => fun (rel : String) => Right NativeBaselineRefusal NativeBaselinePlan (NativeBaselineUnchanged rel)
+    | Just original => match native_skeleton_source_problem True original with
+      | Just problem => fun (rel : String) => native_skeleton_baseline_refuse rel source problem
+      | Nothing =>
+          let lines : List String := qt_split_lines original in
+          let comments : List String := filter String (fun (line : String) => str_starts line "#") lines in
+          let data : List String := filter String (fun (line : String) =>
+            andb(notb(str_null line), notb(str_starts line "#"))) lines in
+          let select_rows : String -> List String := rows_for data in
+          fun (rel : String) =>
+            let matching : List String := select_rows rel in
+            let sentinel : Bool := andb(notb(nullb String data), nullb String matching) in
+            let selected : List String := if sentinel then
+                ["__ouro__/baseline.ouro\t__sentinel\t0\tinternal\tinternal"]
+              else matching in
+            Right NativeBaselineRefusal NativeBaselinePlan
+              (MkNativeBaselineShard rel original
+                (str_join "\n" (append String comments (append String selected [""]))) sentinel)
+      end
+    end;
+
+def native_skeleton_baseline (rel : String) (source : Maybe String)
+    : Either NativeBaselineRefusal NativeBaselinePlan :=
+    if native_skeleton_relative rel then native_skeleton_baseline_valid_path native_skeleton_baseline_filter source rel
+    else native_skeleton_baseline_refuse rel source SkeletonInvalidPath;
+
+-- Each shard keeps the original bytes for the separate workspace check.
+def native_skeleton_baseline_planner (source : Maybe String)
+    : String -> Either NativeBaselineRefusal NativeBaselinePlan :=
+    let select : String -> Either NativeBaselineRefusal NativeBaselinePlan :=
+      native_skeleton_baseline_valid_path native_skeleton_baseline_grouped source in
+    fun (rel : String) =>
+      if native_skeleton_relative rel then select rel
+      else native_skeleton_baseline_refuse rel source SkeletonInvalidPath;
+
+-- These are scratch scope spellings only; source discovery still owns containment.
+def native_skeleton_compact_scopes (paths : List String)
+    : Either String (List String) :=
+    if all String native_skeleton_relative paths then
+      Right String (List String)
+        (dedup_adjacent String str_eq
+          (sort_insert String prim_string_le
+            (map String String (fun (rel : String) => match str_split rel 47 with
+              | Nil => rel
+              | Cons root _ => root
+              end) paths)))
+    else Left String (List String) "invalid compact source path";

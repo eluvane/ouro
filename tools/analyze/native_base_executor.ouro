@@ -1,0 +1,467 @@
+import "native_request.ouro",
+  "native_base_report.ouro",
+  "native_workspace.ouro",
+  "native_policy.ouro",
+  "../../std/process.ouro";
+
+inductive NativeAnalyzeExecutorError : Type :=
+  | NativeAnalyzeProcessFailure : String -> NativeAnalyzeProcessError -> NativeAnalyzeExecutorError
+  | NativeAnalyzeStagingFailure : String -> NativeSkeletonRefusal -> NativeAnalyzeExecutorError
+  | NativeAnalyzeBaselineFailure : String -> NativeBaselineRefusal -> NativeAnalyzeExecutorError
+  | NativeAnalyzeWorkspaceFailure : NativeAnalyzeWorkspaceError -> NativeAnalyzeExecutorError
+  | NativeAnalyzeCleanupFailure : NativeAnalyzeWorkspaceError -> Maybe NativeAnalyzeExecutorError
+      -> Maybe ProcResult -> NativeAnalyzeExecutorError
+  | NativeAnalyzeAggregateLimit : NativeAnalyzeExecutorError
+  | NativeAnalyzeCountsFailure : NativeAnalyzeExecutorError
+  | NativeAnalyzeArchitectureScopes : String -> NativeAnalyzeExecutorError
+  | NativeAnalyzeDriveQueryFailure : NativeFamilyQueryError -> ProcResult -> NativeAnalyzeExecutorError
+  | NativeAnalyzeDrivePolicyFailure : String -> BoundedNativeReportError -> ProcResult -> NativeAnalyzeExecutorError
+  | NativeAnalyzeDirectReportFailure : NativeAnalyzeCompositionError -> ProcResult -> NativeAnalyzeExecutorError
+  | NativeAnalyzeSourceUnreadable : String -> FsBoundedReadError -> NativeAnalyzeExecutorError
+  | NativeAnalyzeSourceMutated : String -> NativeAnalyzeExecutorError;
+
+def native_analyze_skeleton_message (problem : NativeSkeletonProblem) : String :=
+    match problem with
+    | SkeletonInvalidPath => "invalid relative path"
+    | SkeletonInvalidUtf8 => "invalid UTF-8"
+    | SkeletonUnsupportedLineBreak => "unsupported line break"
+    | SkeletonUnsupportedCommentPrefix => "unsupported comment prefix"
+    | SkeletonLexical cause => st_lex_error_message cause
+    | SkeletonRowMismatch => "source and masked line counts differ"
+    | SkeletonStagedLexical cause => str_concat "staged source: " (st_lex_error_message cause)
+    end;
+
+def native_analyze_executor_message : NativeAnalyzeExecutorError -> String :=
+  fix message (error : NativeAnalyzeExecutorError) : String :=
+    match error with
+    | NativeAnalyzeProcessFailure phase cause => str_cat3 phase ": "
+        (match cause with
+        | NativeAnalyzeSiblingFailure inner => native_sibling_error_message inner
+        | NativeAnalyzeDirectoryFailure inner => process_directory_error_message inner
+        end)
+    | NativeAnalyzeStagingFailure path cause => let (MkNativeSkeletonRefusal _ _ _ problem) := cause in
+      str_cat4 "source skeleton refused: " path ": " (native_analyze_skeleton_message problem)
+    | NativeAnalyzeBaselineFailure path cause => let (MkNativeBaselineRefusal _ _ problem) := cause in
+      str_cat4 "baseline shard refused: " path ": " (native_analyze_skeleton_message problem)
+    | NativeAnalyzeWorkspaceFailure cause => native_analyze_workspace_error_message cause
+    | NativeAnalyzeCleanupFailure cause earlier _ => str_concat
+        (native_analyze_workspace_error_message cause)
+        (match earlier with
+        | Nothing => ""
+        | Just original => str_concat "; earlier failure: " (message original)
+        end)
+    | NativeAnalyzeAggregateLimit => "aggregate analyzer output exceeds the bounded report limit"
+    | NativeAnalyzeCountsFailure => "analyzer count aggregation failed"
+    | NativeAnalyzeArchitectureScopes cause => str_concat "architecture scopes refused: " cause
+    | NativeAnalyzeDriveQueryFailure cause _ => native_analyze_family_message cause
+    | NativeAnalyzeDrivePolicyFailure path cause _ => str_cat4 "structured completion policy failed: " path
+        ": " (native_analyze_wire_message cause)
+    | NativeAnalyzeDirectReportFailure cause _ => native_analyze_report_message cause
+    | NativeAnalyzeSourceUnreadable path cause => str_cat3 path ": " (fs_bounded_read_error_message cause)
+    | NativeAnalyzeSourceMutated path => str_concat "source changed before or during a worker call: " path
+    end;
+
+def native_analyze_source_guard (source : NativeAnalyzeSource)
+    : IO (Either NativeAnalyzeExecutorError Unit) :=
+    do let! current := fs_read_bounded_checked (str_len (native_analyze_source_text source))
+         (native_analyze_source_path source);
+       io_pure (Either NativeAnalyzeExecutorError Unit) (match current with
+         | Left error => Left NativeAnalyzeExecutorError Unit
+             (NativeAnalyzeSourceUnreadable (native_analyze_source_rel source) error)
+         | Right text => if str_eq text (native_analyze_source_text source) then
+             Right NativeAnalyzeExecutorError Unit MkUnit
+           else Left NativeAnalyzeExecutorError Unit (NativeAnalyzeSourceMutated (native_analyze_source_rel source))
+         end);
+
+def NativeAnalyzeCapture : Type :=
+    String -> NativeAnalyzeWorker -> List String -> IO (Either NativeAnalyzeProcessError ProcResult);
+
+def native_analyze_capture_bound (located : Either ExecutablePathError String)
+    (policy : NativeAnalyzePolicy) : NativeAnalyzeCapture :=
+    fun (directory : String) (worker : NativeAnalyzeWorker) (words : List String) =>
+      native_analyze_capture_at located (native_analyze_policy_limits policy worker) directory worker words;
+
+def native_analyze_base_profile (flags : List String) : String :=
+    if native_analyze_flag_present "--strict" flags then "strict" else "standard";
+
+def native_analyze_result_bounded (result : ProcResult) : Either NativeAnalyzeExecutorError ProcResult :=
+    if bounded_native_report_size_valid (str_len (proc_stdout result)) (str_len (proc_stderr result))
+    then Right NativeAnalyzeExecutorError ProcResult result
+    else Left NativeAnalyzeExecutorError ProcResult NativeAnalyzeAggregateLimit;
+
+def native_analyze_without_baseline : List String -> List String :=
+    fix strip (flags : List String) : List String :=
+      match flags with
+      | Nil => []
+      | Cons word rest => if str_eq word "--api-baseline" then
+          match rest with | Nil => [] | Cons _ more => strip more end
+        else Cons String word (strip rest)
+      end;
+
+def native_analyze_shard_flags (flags : List String) (path : Maybe String) : List String :=
+    match path with
+    | Nothing => flags
+    | Just file => append String (native_analyze_without_baseline flags) ["--api-baseline", file]
+    end;
+
+private def native_analyze_stage_baseline (workspace : NativeAnalyzeWorkspace)
+    (mode : NativeSkeletonMode) (rel : String)
+    (planned : Either NativeBaselineRefusal NativeBaselinePlan) (flags : List String)
+    : IO (Either NativeAnalyzeExecutorError (List String)) :=
+    match planned with
+    | Left error => io_pure (Either NativeAnalyzeExecutorError (List String))
+        (Left NativeAnalyzeExecutorError (List String) (NativeAnalyzeBaselineFailure rel error))
+    | Right plan => do let! staged := native_analyze_workspace_baseline workspace mode rel plan;
+        io_pure (Either NativeAnalyzeExecutorError (List String))
+          (match staged with
+          | Left error => Left NativeAnalyzeExecutorError (List String) (NativeAnalyzeWorkspaceFailure error)
+          | Right path => Right NativeAnalyzeExecutorError (List String) (native_analyze_shard_flags flags path)
+          end)
+    end;
+
+def native_analyze_stage (workspace : NativeAnalyzeWorkspace) (mode : NativeSkeletonMode)
+    (source : NativeAnalyzeSource) : IO (Either NativeAnalyzeExecutorError String) :=
+    let rel : String := native_analyze_source_rel source in
+    let original : String := native_analyze_source_text source in
+    match native_skeleton_project mode rel original with
+    | Left error => io_pure (Either NativeAnalyzeExecutorError String)
+        (Left NativeAnalyzeExecutorError String (NativeAnalyzeStagingFailure rel error))
+    | Right projected => let (MkPair contents _) := projected in
+      do let! staged := native_analyze_workspace_stage_contents workspace mode rel original contents;
+        io_pure (Either NativeAnalyzeExecutorError String) (match staged with
+          | Left error => Left NativeAnalyzeExecutorError String (NativeAnalyzeWorkspaceFailure error)
+          | Right path => Right NativeAnalyzeExecutorError String path
+          end)
+    end;
+
+inductive NativeAnalyzeBatchState : Type :=
+  | MkNativeAnalyzeBatchState : List String -> Maybe String -> String -> String -> Bool
+      -> NativeAnalyzeBatchState;
+
+def native_analyze_batch_empty : NativeAnalyzeBatchState :=
+    MkNativeAnalyzeBatchState native_analyze_counts_zero (Nothing String) "" "" False;
+
+def native_analyze_batch_record (phase : String) (profile : String) (files : String)
+    (counted : Bool) (result : ProcResult) (state : NativeAnalyzeBatchState)
+    : Either NativeAnalyzeExecutorError NativeAnalyzeBatchState :=
+    let (MkNativeAnalyzeBatchState totals facts output errors failed) := state in
+    match native_analyze_base_read profile files result with
+    | Left error =>
+        let diagnostic : String := if eq_nat (proc_code result) Z then
+          str_cat3 (str_cat3 "ANALYZE_FAIL: " phase ": ") (native_analyze_report_message error) "\n"
+        else "" in
+        let next_output : String := str_concat output (proc_stdout result) in
+        let next_errors : String := str_concat errors (str_concat (proc_stderr result) diagnostic) in
+        if bounded_native_report_size_valid (str_len next_output) (str_len next_errors) then
+          Right NativeAnalyzeExecutorError NativeAnalyzeBatchState
+            (MkNativeAnalyzeBatchState totals facts next_output next_errors True)
+        else Left NativeAnalyzeExecutorError NativeAnalyzeBatchState NativeAnalyzeAggregateLimit
+    | Right report =>
+        let next_errors : String := str_concat errors (proc_stderr result) in
+        let (MkNativeAnalyzeBaseReport counts latest) := report in
+        if notb(bounded_native_report_size_valid (str_len output) (str_len next_errors)) then
+          Left NativeAnalyzeExecutorError NativeAnalyzeBatchState NativeAnalyzeAggregateLimit
+        else
+        match (if counted then native_analyze_counts_add totals counts
+            else Just (List String) totals) with
+        | Nothing => Left NativeAnalyzeExecutorError NativeAnalyzeBatchState NativeAnalyzeCountsFailure
+        | Just sum => Right NativeAnalyzeExecutorError NativeAnalyzeBatchState
+            (MkNativeAnalyzeBatchState sum
+              (if counted then native_analyze_facts_choose facts latest else facts)
+              output next_errors failed)
+        end
+    end;
+
+-- The raw base Args owner requires equal form for dashed option values.
+def native_analyze_base_words : List String -> List String :=
+  fix render (words : List String) : List String :=
+    match words with
+    | Nil => []
+    | Cons word rest => if orb(str_eq word "--scope", str_eq word "--api-baseline") then
+        match rest with
+        | Nil => [word]
+        | Cons value more => Cons String (str_cat3 word "=" value) (render more)
+        end
+      else Cons String word (render rest)
+    end;
+
+def native_analyze_base_call (capture : NativeAnalyzeCapture) (phase : String)
+    (directory : String) (flags : List String)
+    : IO (Either NativeAnalyzeExecutorError ProcResult) :=
+    let action : IO (Either NativeAnalyzeProcessError ProcResult) :=
+      capture directory NativeAnalyzeBaseWorker (native_analyze_base_words flags) in
+    do let! result := action;
+       io_pure (Either NativeAnalyzeExecutorError ProcResult) (match result with
+         | Left error => Left NativeAnalyzeExecutorError ProcResult (NativeAnalyzeProcessFailure phase error)
+         | Right process => Right NativeAnalyzeExecutorError ProcResult process
+         end);
+
+def native_analyze_without_flag (wanted : String) : List String -> List String :=
+  fix strip (flags : List String) : List String :=
+    match flags with
+    | Nil => []
+    | Cons word rest => if str_eq word "--api-baseline" then
+        match rest with
+        | Nil => [word]
+        | Cons value more => [word, value, ..strip more]
+        end
+      else if str_eq word wanted then strip rest else Cons String word (strip rest)
+    end;
+
+def native_analyze_full_text (flags : List String) : Bool :=
+    any String (fun (word : String) => native_analyze_flag_present word flags)
+      ["--enable-format", "--enable-light", "--enable-all"];
+
+def native_analyze_format_flags (flags : List String) : List String :=
+    if native_analyze_flag_present "--include-fixtures" flags then ["--strict", "--include-fixtures"] else ["--strict"];
+
+inductive NativeAnalyzePrepared : Type :=
+  | MkNativeAnalyzePrepared : NativeAnalyzeSource -> List String -> Maybe (List String) -> NativeAnalyzePrepared;
+
+inductive NativeAnalyzePrepareOptions : Type :=
+  | NativeAnalyzePrepareOptionsOf : List String -> Bool -> Maybe (List String) -> NativeAnalyzePrepareOptions;
+
+def native_analyze_prepare_options (flags : List String) : NativeAnalyzePrepareOptions :=
+    let local_flags : List String := native_analyze_without_flag "--strict" flags in
+    let format_flags : Maybe (List String) := if native_analyze_flag_present "--strict" flags then
+      Just (List String) (native_analyze_format_flags flags) else Nothing (List String) in
+    NativeAnalyzePrepareOptionsOf local_flags (native_analyze_full_text local_flags) format_flags;
+
+private def native_analyze_prepare_with_options (workspace : NativeAnalyzeWorkspace) (options : NativeAnalyzePrepareOptions)
+    (baseline : String -> Either NativeBaselineRefusal NativeBaselinePlan)
+    (format_baseline : String -> Either NativeBaselineRefusal NativeBaselinePlan) (source : NativeAnalyzeSource)
+    : IO (Either NativeAnalyzeExecutorError NativeAnalyzePrepared) :=
+    let (NativeAnalyzePrepareOptionsOf local_flags local_full_text format_options) := options in
+    let rel : String := native_analyze_source_rel source in
+    match! native_analyze_stage_baseline workspace SkeletonLocal rel (baseline rel) local_flags with
+    | Left error => io_pure (Either NativeAnalyzeExecutorError NativeAnalyzePrepared)
+        (Left NativeAnalyzeExecutorError NativeAnalyzePrepared error)
+    | Right file_flags => do let! staged := if local_full_text then
+         io_pure (Either NativeAnalyzeExecutorError String) (Right NativeAnalyzeExecutorError String rel)
+         else native_analyze_stage workspace SkeletonLocal source;
+       match staged with
+       | Left error => io_pure (Either NativeAnalyzeExecutorError NativeAnalyzePrepared)
+           (Left NativeAnalyzeExecutorError NativeAnalyzePrepared error)
+       | Right _ => match format_options with
+         | Nothing => io_pure (Either NativeAnalyzeExecutorError NativeAnalyzePrepared)
+             (Right NativeAnalyzeExecutorError NativeAnalyzePrepared
+               (MkNativeAnalyzePrepared source file_flags (Nothing (List String))))
+         | Just words => match! native_analyze_stage_baseline workspace SkeletonFormat rel (format_baseline rel) words with
+             | Left error => io_pure (Either NativeAnalyzeExecutorError NativeAnalyzePrepared)
+                 (Left NativeAnalyzeExecutorError NativeAnalyzePrepared error)
+             | Right format_flags => do let! ready := native_analyze_stage workspace SkeletonFormat source;
+                 io_pure (Either NativeAnalyzeExecutorError NativeAnalyzePrepared) (match ready with
+                   | Left error => Left NativeAnalyzeExecutorError NativeAnalyzePrepared error
+                   | Right _ => Right NativeAnalyzeExecutorError NativeAnalyzePrepared
+                       (MkNativeAnalyzePrepared source file_flags (Just (List String) format_flags))
+                   end)
+             end
+           end
+       end
+    end;
+
+private def native_analyze_same_baseline (left : Maybe String) (right : Maybe String) : Bool :=
+    match left with
+    | Nothing => match right with | Nothing => True | Just _ => False end
+    | Just bytes => match right with | Nothing => False | Just other => str_eq bytes other end
+    end;
+
+def native_analyze_prepare_sources (workspace : NativeAnalyzeWorkspace) (flags : List String)
+    (baseline : Maybe String) (format_baseline : Maybe String)
+    : List NativeAnalyzeSource -> List NativeAnalyzePrepared
+      -> IO (Either NativeAnalyzeExecutorError (List NativeAnalyzePrepared)) :=
+  let options : NativeAnalyzePrepareOptions := native_analyze_prepare_options flags in
+  let (NativeAnalyzePrepareOptionsOf _ _ format_flags) := options in
+  let local_baseline : String -> Either NativeBaselineRefusal NativeBaselinePlan :=
+    native_skeleton_baseline_planner baseline in
+  let strict_baseline : String -> Either NativeBaselineRefusal NativeBaselinePlan := match format_flags with
+    | Nothing => local_baseline
+    | Just _ => if native_analyze_same_baseline baseline format_baseline then local_baseline
+      else native_skeleton_baseline_planner format_baseline
+    end in
+  fix prepare (remaining : List NativeAnalyzeSource) (rev : List NativeAnalyzePrepared)
+      : IO (Either NativeAnalyzeExecutorError (List NativeAnalyzePrepared)) :=
+    match remaining with
+    | Nil => io_pure (Either NativeAnalyzeExecutorError (List NativeAnalyzePrepared))
+        (Right NativeAnalyzeExecutorError (List NativeAnalyzePrepared) (reverse_lin NativeAnalyzePrepared rev))
+    | Cons source rest => match!
+        native_analyze_prepare_with_options workspace options local_baseline strict_baseline source with
+      | Left error => io_pure (Either NativeAnalyzeExecutorError (List NativeAnalyzePrepared))
+          (Left NativeAnalyzeExecutorError (List NativeAnalyzePrepared) error)
+      | Right ready => prepare rest (Cons NativeAnalyzePrepared ready rev)
+      end
+    end;
+
+def native_analyze_guarded_base_call (capture : NativeAnalyzeCapture) (phase : String)
+    (directory : String) (flags : List String) (source : NativeAnalyzeSource)
+    : IO (Either NativeAnalyzeExecutorError ProcResult) :=
+    match! native_analyze_source_guard source with
+    | Left error => io_pure (Either NativeAnalyzeExecutorError ProcResult)
+        (Left NativeAnalyzeExecutorError ProcResult error)
+    | Right _ => match! native_analyze_base_call capture phase directory flags with
+      | Left error => io_pure (Either NativeAnalyzeExecutorError ProcResult)
+          (Left NativeAnalyzeExecutorError ProcResult error)
+      | Right process => do let! after := native_analyze_source_guard source;
+          io_pure (Either NativeAnalyzeExecutorError ProcResult) (match after with
+            | Left error => Left NativeAnalyzeExecutorError ProcResult error
+            | Right _ => Right NativeAnalyzeExecutorError ProcResult process
+            end)
+      end
+    end;
+
+def native_analyze_local_pass (capture : NativeAnalyzeCapture) (workspace : NativeAnalyzeWorkspace)
+    (root : String) (flags : List String) (source : NativeAnalyzeSource)
+    : IO (Either NativeAnalyzeExecutorError ProcResult) :=
+    let rel : String := native_analyze_source_rel source in
+    native_analyze_guarded_base_call capture (str_concat "local " rel)
+      (if native_analyze_full_text flags then root else native_analyze_workspace_mode_root workspace SkeletonLocal)
+      (append String flags ["--local-only", "--scope", rel]) source;
+
+def native_analyze_format_pass (capture : NativeAnalyzeCapture) (workspace : NativeAnalyzeWorkspace)
+    (flags : List String) (source : NativeAnalyzeSource)
+    : IO (Either NativeAnalyzeExecutorError ProcResult) :=
+    let rel : String := native_analyze_source_rel source in
+    native_analyze_guarded_base_call capture (str_concat "strict-format " rel)
+      (native_analyze_workspace_mode_root workspace SkeletonFormat)
+      (append String flags ["--local-only", "--scope", rel]) source;
+
+def native_analyze_batch_local (capture : NativeAnalyzeCapture) (workspace : NativeAnalyzeWorkspace)
+    (root : String) : List NativeAnalyzePrepared -> NativeAnalyzeBatchState
+      -> IO (Either NativeAnalyzeExecutorError NativeAnalyzeBatchState) :=
+  fix run (remaining : List NativeAnalyzePrepared) (state : NativeAnalyzeBatchState)
+      : IO (Either NativeAnalyzeExecutorError NativeAnalyzeBatchState) :=
+    match remaining with
+    | Nil => io_pure (Either NativeAnalyzeExecutorError NativeAnalyzeBatchState)
+        (Right NativeAnalyzeExecutorError NativeAnalyzeBatchState state)
+    | Cons prepared rest => let (MkNativeAnalyzePrepared source flags format_flags) := prepared in
+      match! native_analyze_local_pass capture workspace root flags source with
+      | Left error => io_pure (Either NativeAnalyzeExecutorError NativeAnalyzeBatchState)
+          (Left NativeAnalyzeExecutorError NativeAnalyzeBatchState error)
+      | Right process => match native_analyze_batch_record (native_analyze_source_rel source)
+          "standard" "1" True process state with
+        | Left error => io_pure (Either NativeAnalyzeExecutorError NativeAnalyzeBatchState)
+            (Left NativeAnalyzeExecutorError NativeAnalyzeBatchState error)
+        | Right next => match format_flags with
+          | Nothing => run rest next
+          | Just words => match! native_analyze_format_pass capture workspace words source with
+            | Left error => io_pure (Either NativeAnalyzeExecutorError NativeAnalyzeBatchState)
+                (Left NativeAnalyzeExecutorError NativeAnalyzeBatchState error)
+            | Right formatted => match native_analyze_batch_record
+                (str_concat "format " (native_analyze_source_rel source)) "strict" "1" False formatted next with
+              | Left error => io_pure (Either NativeAnalyzeExecutorError NativeAnalyzeBatchState)
+                  (Left NativeAnalyzeExecutorError NativeAnalyzeBatchState error)
+              | Right after => run rest after
+              end
+            end
+          end
+        end
+      end
+    end;
+
+def native_analyze_architecture_stage (workspace : NativeAnalyzeWorkspace)
+    : List NativeAnalyzeSource -> IO (Either NativeAnalyzeExecutorError Unit) :=
+    fix stage (remaining : List NativeAnalyzeSource) : IO (Either NativeAnalyzeExecutorError Unit) :=
+      match remaining with
+      | Nil => io_pure (Either NativeAnalyzeExecutorError Unit) (Right NativeAnalyzeExecutorError Unit MkUnit)
+      | Cons source rest => match! native_analyze_stage workspace SkeletonArchitecture source with
+        | Left error => io_pure (Either NativeAnalyzeExecutorError Unit) (Left NativeAnalyzeExecutorError Unit error)
+        | Right _ => stage rest
+        end
+      end;
+
+def native_analyze_architecture_pass (capture : NativeAnalyzeCapture) (workspace : NativeAnalyzeWorkspace)
+    (flags : List String) (sources : List NativeAnalyzeSource)
+    : IO (Either NativeAnalyzeExecutorError ProcResult) :=
+    match! native_analyze_architecture_stage workspace sources with
+    | Left error => io_pure (Either NativeAnalyzeExecutorError ProcResult)
+        (Left NativeAnalyzeExecutorError ProcResult error)
+    | Right _ => match native_skeleton_compact_scopes
+        (map NativeAnalyzeSource String native_analyze_source_rel sources) with
+      | Left cause => io_pure (Either NativeAnalyzeExecutorError ProcResult)
+          (Left NativeAnalyzeExecutorError ProcResult (NativeAnalyzeArchitectureScopes cause))
+      | Right scopes => native_analyze_base_call capture "architecture"
+          (native_analyze_workspace_mode_root workspace SkeletonArchitecture)
+          (append String (append String
+              (if native_analyze_flag_present "--strict" flags then ["--architecture-only", "--strict"]
+               else ["--architecture-only"])
+              (if native_analyze_flag_present "--include-fixtures" flags then ["--include-fixtures"] else []))
+            (concat_map String String (fun (scope : String) => ["--scope", scope]) scopes))
+      end
+    end;
+
+def native_analyze_batch_finish (flags : List String) (state : NativeAnalyzeBatchState) : ProcResult :=
+    let (MkNativeAnalyzeBatchState counts facts output errors failed) := state in
+    if failed then MkProcResult 1 output errors else
+      let strict : Bool := native_analyze_flag_present "--strict" flags in
+      let fact_text : String := match facts with
+        | Nothing => ""
+        | Just line => str_concat (if strict then
+            str_replace (str_replace line " format=facts-only" " format=strict-subset")
+              " format=opt-in" " format=strict-subset" else line) "\n"
+        end in
+      MkProcResult Z (str_concat (native_analyze_base_banner (if strict then "strict" else "baseline") counts) fact_text) errors;
+
+def native_analyze_base_batch (capture : NativeAnalyzeCapture) (workspace : NativeAnalyzeWorkspace)
+    (root : String) (flags : List String) (baseline : Maybe String) (format_baseline : Maybe String)
+    (sources : List NativeAnalyzeSource)
+    : IO (Either NativeAnalyzeExecutorError ProcResult) :=
+    match! native_analyze_prepare_sources workspace flags baseline format_baseline sources [] with
+    | Left error => io_pure (Either NativeAnalyzeExecutorError ProcResult)
+        (Left NativeAnalyzeExecutorError ProcResult error)
+    | Right staged => match!
+        native_analyze_batch_local capture workspace root staged native_analyze_batch_empty with
+      | Left error => io_pure (Either NativeAnalyzeExecutorError ProcResult)
+          (Left NativeAnalyzeExecutorError ProcResult error)
+      | Right state => match! native_analyze_architecture_pass capture workspace flags sources with
+        | Left error => io_pure (Either NativeAnalyzeExecutorError ProcResult)
+            (Left NativeAnalyzeExecutorError ProcResult error)
+        | Right process => io_pure (Either NativeAnalyzeExecutorError ProcResult)
+            (match native_analyze_batch_record "architecture" (native_analyze_base_profile flags)
+                (str_of_nat (length NativeAnalyzeSource sources)) False process state with
+            | Left error => Left NativeAnalyzeExecutorError ProcResult error
+            | Right final => native_analyze_result_bounded (native_analyze_batch_finish flags final)
+            end)
+        end
+      end
+    end;
+
+def native_analyze_process_error_streams (error : NativeAnalyzeProcessError) : Pair String String :=
+    match error with
+    | NativeAnalyzeSiblingFailure _ => MkPair String String "" ""
+    | NativeAnalyzeDirectoryFailure cause => match cause with
+      | ProcessInvalidDirectory _ => MkPair String String "" ""
+      | ProcessDirectoryCapture process => match process with
+        | ProcessCaptureTimedOut _ output errors => MkPair String String output errors
+        | ProcessCaptureResourceLimit _ _ output errors => MkPair String String output errors
+        | ProcessCaptureInvalidLimits _ => MkPair String String "" ""
+        | ProcessCaptureOsError _ => MkPair String String "" ""
+        | ProcessCaptureCleanupFailed _ => MkPair String String "" ""
+        | ProcessCaptureOutputLimit _ _ _ => MkPair String String "" ""
+        | ProcessCaptureProtocolError _ => MkPair String String "" ""
+        end
+      end
+    end;
+
+def native_analyze_executor_streams : NativeAnalyzeExecutorError -> Pair String String :=
+    fix streams (error : NativeAnalyzeExecutorError) : Pair String String :=
+      match error with
+      | NativeAnalyzeProcessFailure _ cause => native_analyze_process_error_streams cause
+      | NativeAnalyzeDriveQueryFailure _ process => MkPair String String (proc_stdout process) (proc_stderr process)
+      | NativeAnalyzeDrivePolicyFailure _ _ process => MkPair String String (proc_stdout process) (proc_stderr process)
+      | NativeAnalyzeDirectReportFailure _ process => MkPair String String (proc_stdout process) (proc_stderr process)
+      | NativeAnalyzeCleanupFailure _ earlier process => match earlier with
+        | Nothing => match process with
+          | Nothing => MkPair String String "" ""
+          | Just result => MkPair String String (proc_stdout result) (proc_stderr result)
+          end
+        | Just original => streams original
+        end
+      | NativeAnalyzeStagingFailure _ _ => MkPair String String "" ""
+      | NativeAnalyzeBaselineFailure _ _ => MkPair String String "" ""
+      | NativeAnalyzeWorkspaceFailure _ => MkPair String String "" ""
+      | NativeAnalyzeAggregateLimit => MkPair String String "" ""
+      | NativeAnalyzeCountsFailure => MkPair String String "" ""
+      | NativeAnalyzeArchitectureScopes _ => MkPair String String "" ""
+      | NativeAnalyzeSourceUnreadable _ _ => MkPair String String "" ""
+      | NativeAnalyzeSourceMutated _ => MkPair String String "" ""
+      end;

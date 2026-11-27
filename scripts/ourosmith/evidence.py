@@ -21,25 +21,27 @@ def read(path):
         return {}
 
 
-def required_binaries(surface, native_drivers=None, surface_toolchain=None):
+def required_binaries(surface, native_drivers=None, surface_toolchain=None, *, root=None):
     from ourosmith.native import RETAINED_ENTRY, SMITH_ENTRY
 
     if native_drivers is None:
         raise ValueError("source-bound native driver evidence is missing")
     if set(native_drivers) != {SMITH_ENTRY, RETAINED_ENTRY}:
         raise ValueError("required native driver set is incomplete")
+    root = ROOT if root is None else root
     paths = []
-    compilers = {(ROOT / row["compiler"]).resolve() for row in native_drivers.values()}
+    compilers = {(root / row["compiler"]).resolve() for row in native_drivers.values()}
     if len(compilers) != 1:
         raise ValueError("native drivers use different compilers")
     for row in native_drivers.values():
-        paths.extend(ROOT / row[key] for key in ("compiler", "binary"))
+        paths.extend(root / row[key] for key in ("compiler", "binary"))
     if surface:
-        paths.extend(toolchain_paths(surface_toolchain, compiler=next(iter(compilers))).values())
-    return {path.relative_to(ROOT).as_posix() for path in paths}
+        paths.extend(toolchain_paths(surface_toolchain, compiler=next(iter(compilers)), root=root).values())
+    return {path.relative_to(root).as_posix() for path in paths}
 
 
-def provenance_problems(provenance, current, *, surface, native_drivers=None, surface_toolchain=None, required=None):
+def provenance_problems(provenance, current, *, surface, native_drivers=None, surface_toolchain=None, required=None, root=None):
+    root = ROOT if root is None else root
     problems = []
     if provenance.get("source") != current:
         problems.append("source provenance is missing or stale")
@@ -47,24 +49,25 @@ def provenance_problems(provenance, current, *, surface, native_drivers=None, su
     if not isinstance(binaries, dict):
         return problems + ["tested binary hashes are malformed"]
     try:
-        if set(binaries) != (required_binaries(surface, native_drivers, surface_toolchain) if required is None else required):
+        if set(binaries) != (required_binaries(surface, native_drivers, surface_toolchain, root=root) if required is None else required):
             problems.append("required tested binary set is incomplete")
     except (OSError, ValueError, KeyError, TypeError):
         problems.append("required tested binary set is incomplete or unavailable")
     if not binaries or "missing" in binaries.values():
         problems.append("tested binary hashes are missing")
     else:
-        paths = [ROOT / path for path in binaries]
-        if any(not path.resolve().is_relative_to(ROOT) for path in paths) or binaries != binary_state(paths):
+        paths = [root / path for path in binaries]
+        if any(not path.resolve().is_relative_to(root) for path in paths) or binaries != binary_state(paths, root=root):
             problems.append("tested binaries differ from current binaries")
     return problems
 
 
-def profile_problems(report, profile, current):
+def profile_problems(report, profile, current, *, root=None):
     from ourosmith.core.run import CONTROLS, FORMS, NEGATIVES, OPERATIONS, RELATIONS, definition_count
     from ourosmith.corpus import CORPUS_DIR, RETAINED_LAWS, RETAINED_REJECTIONS, check_case, load_cases
     from ourosmith.native import RETAINED_ENTRY, SMITH_ENTRY, evidence_problems
 
+    root = ROOT if root is None else root
     problems = []
     if not isinstance(report, dict) or report.get("kind") != REPORT_KIND or report.get("pass") is not True:
         return ["successful Smith report is missing"]
@@ -92,23 +95,23 @@ def profile_problems(report, profile, current):
     if set(drivers) != {SMITH_ENTRY, RETAINED_ENTRY}:
         problems.append("required native source-bound drivers are missing")
     for entry, row in drivers.items():
-        problems.extend(entry + ": " + problem for problem in evidence_problems(row, entry=entry))
+        problems.extend(entry + ": " + problem for problem in evidence_problems(row, entry=entry, root=root))
     problems.extend(provenance_problems(sections.get("provenance", {}), current,
                                         surface=profile != "kernel", native_drivers=drivers,
-                                        surface_toolchain=sections.get("surface_toolchain")))
+                                        surface_toolchain=sections.get("surface_toolchain"), root=root))
     if profile != "kernel":
         stage = sections.get("stage_parity", {})
-        proof = read(ROOT / "_build/stage_loop/result.json")
+        proof = read(root / "_build/stage_loop/result.json")
         if stage.get("status") == "unavailable" and profile == "pr" and not proof:
             pass
         elif stage.get("status") != "exercised" or not all(proof.get(key) is True for key in ("pass", "frontend_eq", "backend_eq")):
             problems.append("stage parity or fixpoint proof is missing")
         else:
-            path = ROOT / stage.get("binary", "")
+            path = root / stage.get("binary", "")
             digest = stage.get("sha256")
-            if not path.resolve().is_relative_to(ROOT / "_build/stage_loop") or not path.is_file() or not digest:
+            if not path.resolve().is_relative_to(root / "_build/stage_loop") or not path.is_file() or not digest:
                 problems.append("stage parity binary is invalid")
-            elif binary_state([path]) != {stage["binary"]: digest} or digest != proof.get("artifacts", {}).get("binary_sha256"):
+            elif binary_state([path], root=root) != {stage["binary"]: digest} or digest != proof.get("artifacts", {}).get("binary_sha256"):
                 problems.append("stage parity binary differs from the recorded fixpoint")
     required = {"kernel"} if profile == "kernel" else {"kernel", "surface"}
     if set(layers) != required | {"kernel-corpus"}:
@@ -289,18 +292,31 @@ def ci_pr_receipt(out, current):
     if len(matches) != 1:
         return None, ["CI Smith gate is missing or duplicated"]
     gate = matches[0]
-    if gate.get("status") != "pass" or gate.get("returncode") != 0 or gate.get("command") != expected.cmd:
+    if (gate.get("status") != "pass" or type(gate.get("returncode")) is not int
+            or gate["returncode"] != 0 or gate.get("command") != expected.cmd):
         return None, ["CI Smith gate did not execute the required command successfully"]
     log = out / "ci" / expected.name / "gate.log"
     try:
         if (ROOT / gate.get("log", "")).resolve() != log:
             return None, ["CI Smith gate log path differs"]
-        report_path = (ROOT / expected.cmd[expected.cmd.index("--out") + 1] / "report.json").resolve()
+        workspace = ROOT
+        allocation = {}
+        if gate.get("workspace", ".") != ".":
+            workspace = ROOT / gate["workspace"]
+            if (workspace.resolve() != workspace or not workspace.is_dir() or workspace.name != "smith"
+                    or workspace.parent.parent != ROOT / "_build" or not workspace.parent.name.startswith("ci-")):
+                return None, ["CI Smith workspace differs from its isolated group"]
+            allocation = {key: gate.get(key) for key in ("jobs", "memory_mib")}
+            if any(type(value) is not int or value <= 0 for value in allocation.values()):
+                return None, ["CI Smith resource allocation is malformed"]
+        report_path = (workspace / expected.cmd[expected.cmd.index("--out") + 1] / "report.json").resolve()
+        if workspace != ROOT and not report_path.is_relative_to(workspace / "_build"):
+            return None, ["CI Smith report escapes its isolated build directory"]
         report_bytes = report_path.read_bytes()
         report = json.loads(report_bytes)
         if not isinstance(report, dict):
             return None, ["CI Smith report is malformed"]
-        problems = profile_problems(report, "pr", current)
+        problems = profile_problems(report, "pr", current, **({"root": workspace} if allocation else {}))
         if problems:
             return None, problems
         receipt = {"kind": "ouro.smith-ci-pr-receipt.v1", "gate": expected.name,
@@ -309,6 +325,8 @@ def ci_pr_receipt(out, current):
                    "gate_log": str(log), "gate_log_sha256": hashlib.sha256(log.read_bytes()).hexdigest(),
                    "report": str(report_path), "report_sha256": hashlib.sha256(report_bytes).hexdigest(),
                    "fingerprint": report["fingerprint"]}
+        if allocation:
+            receipt.update(workspace=workspace.relative_to(ROOT).as_posix(), **allocation)
     except (OSError, ValueError, KeyError, TypeError, AttributeError) as exc:
         return None, [f"CI Smith evidence is unavailable or malformed: {exc}"]
     return receipt, []
@@ -317,7 +335,7 @@ def ci_pr_receipt(out, current):
 def validation_problems(out):
     from ci_gate import gates
     from ourosmith.compiler_evidence import ci_compiler_receipt
-    from ourosmith.validation import KIND, commands
+    from ourosmith.validation import KIND, ci_pr_repeat, commands
 
     out = Path(out).resolve()
     current = source_state()
@@ -333,6 +351,8 @@ def validation_problems(out):
     if journal.get("provenance", {}).get("source") != current:
         problems.append("validation journal source is stale")
     expected = commands(out)
+    reused_workspace = None
+    repeat = None
     if [row.get("name") for row in rows] != [name for name, _ in expected]:
         problems.append("required validation commands were not all executed")
     for row, (name, argv) in zip(rows, expected, strict=False):
@@ -342,6 +362,9 @@ def validation_problems(out):
             if receipt is None or row.get("receipt") != receipt or row.get("command") != receipt["command"]:
                 problems.append("pr CI receipt does not match the executed gate")
             else:
+                if "workspace" in receipt:
+                    repeat = ci_pr_repeat(receipt)
+                    reused_workspace = repeat[0]
                 try:
                     copied = (out / "pr/report.json").read_bytes()
                     if hashlib.sha256(copied).hexdigest() != receipt["report_sha256"]:
@@ -350,6 +373,16 @@ def validation_problems(out):
                         problems.append("pr CI receipt log differs")
                 except OSError:
                     problems.append("pr CI report copy or receipt log is missing")
+        elif name == "pr2" and repeat is not None:
+            workspace, repeat_out, repeat_argv, _allocation = repeat
+            if (row.get("execution") != "ci-workspace" or row.get("command") != repeat_argv
+                    or row.get("workspace") != workspace.relative_to(ROOT).as_posix()):
+                problems.append("second PR run did not use the first run's checkout")
+            try:
+                if (repeat_out / "report.json").read_bytes() != (out / "pr2/report.json").read_bytes():
+                    problems.append("pr2 report differs from the isolated repeat")
+            except OSError:
+                problems.append("pr2 isolated report or copy is missing")
         elif row.get("command") != argv or row.get("execution", "direct") != "direct" or "receipt" in row:
             problems.append("required validation commands were not all executed")
     if any(row.get("status") != "PASS" or row.get("exit_code") != 0 for row in rows):
@@ -359,7 +392,8 @@ def validation_problems(out):
     reports = {}
     for name, profile in (("pr", "pr"), ("pr2", "pr"), ("kernel", "kernel"), ("nightly", "nightly")):
         report = reports[name] = read(out / name / "report.json")
-        problems.extend(name + ": " + problem for problem in profile_problems(report, profile, current))
+        report_root = reused_workspace if name in {"pr", "pr2"} else None
+        problems.extend(name + ": " + problem for problem in profile_problems(report, profile, current, root=report_root))
     if not reports["pr"].get("fingerprint") or reports["pr"].get("fingerprint") != reports["pr2"].get("fingerprint"):
         problems.append("two complete PR reports are not identical modulo timing")
     faults = read(out / "faults/faults.json")

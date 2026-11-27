@@ -1,7 +1,7 @@
 const MOBILE_NAVIGATION_QUERY = '(max-width: 768px)';
 
-// Keep the existing off-canvas navigation operable without exposing the page
-// underneath it to keyboard focus or leaving scroll locked after a route change.
+// Keep keyboard focus on navigation controls while the drawer is open.
+// Release the page scroll lock when the drawer closes or the route changes.
 class DocumentationNavigation {
   constructor(root, toggle) {
     this.root = root;

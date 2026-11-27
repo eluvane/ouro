@@ -1,6 +1,8 @@
 -- Error classes survive inference, reduction and the declaration boundary.
 
 import "../compiler/file_elab.ouro",
+  "../compiler/compiler.ouro",
+  "compiler_test_phase.ouro",
   "../std/io.ouro";
 
 inductive ResultLaw : Type := | MkResultLaw : String -> Bool -> ResultLaw;
@@ -31,28 +33,9 @@ def result_unknown_global : Bool :=
     match infer_checked(100, Nil Entry, Nil CoreTerm, IGTerm (CConst 77)) with
     | CheckOk _ => False
     | CheckErr failure =>
-        match failure with
-        | CheckMalformedCore fault =>
-            match fault with
-            | CheckUnboundGlobal name => eqNat name 77
-            | CheckUnboundVariable _ => False
-            | CheckUnknownInductive _ => False
-            | CheckUnknownConstructor _ _ => False
-            | CheckConstructorParameters => False
-            | CheckCaseMetadata => False
-            | CheckFixMetadata => False
-            | CheckLiteralType _ => False
-            | CheckUnresolvedLiteral _ => False
-            | CheckDuplicateName _ => False
-            end
-        | CheckTypeFailure _ => False
-        | CheckReductionFailure _ => False
-        | CheckResourceLimit => False
-        | CheckUnsupported _ => False
-        | CheckCancelled => False
-        | CheckInternalFailure _ => False
-        | CheckPrimitiveFailure _ => False
-        end
+        if let CheckMalformedCore fault := (failure : CheckFailure) then
+          if let CheckUnboundGlobal name := (fault : CheckCoreFault) then eqNat name 77 else False
+        else False
     end;
 
 -- The cyclic environment is deliberately unchecked input to the reduction
@@ -64,28 +47,198 @@ def result_cycle : List Entry :=
 def result_zero_fix_arity : Bool :=
     match infer_checked 100 [] [] (IGTerm (CFix 90 0 0 (CSort 0) (CRel 0))) with
     | CheckOk _ => False
-    | CheckErr failure => match failure with
-        | CheckMalformedCore fault => match fault with
-            | CheckFixMetadata => True
-            | CheckUnboundGlobal _ => False
-            | CheckUnboundVariable _ => False
-            | CheckUnknownInductive _ => False
-            | CheckUnknownConstructor _ _ => False
-            | CheckConstructorParameters => False
-            | CheckCaseMetadata => False
-            | CheckLiteralType _ => False
-            | CheckUnresolvedLiteral _ => False
-            | CheckDuplicateName _ => False
-            end
-        | CheckTypeFailure _ => False
-        | CheckReductionFailure _ => False
-        | CheckResourceLimit => False
-        | CheckUnsupported _ => False
-        | CheckCancelled => False
-        | CheckInternalFailure _ => False
-        | CheckPrimitiveFailure _ => False
+    | CheckErr failure => if let CheckMalformedCore fault := (failure : CheckFailure) then
+        if let CheckFixMetadata := (fault : CheckCoreFault) then True else False
+      else False
+    end;
+
+def result_comp_error_is (A : Type) (result : CompResult A)
+    (code : Nat) (detail : Nat) : Bool :=
+    match result with
+    | COk _ => False
+    | CErr error => match error with
+        | ErrCode actual_code actual_detail =>
+            andb(eqNat actual_code code, eqNat actual_detail detail)
         end
     end;
+
+def result_core_pairs_equal : List (Pair Nat CoreTerm) -> List (Pair Nat CoreTerm) -> Bool :=
+  fix compare (actual : List (Pair Nat CoreTerm)) (expected : List (Pair Nat CoreTerm)) : Bool :=
+    match actual with
+    | Nil => match expected with | Nil => True | Cons _ _ => False end
+    | Cons found rest => match expected with
+        | Nil => False
+        | Cons wanted tail => match found with | MkPair name core =>
+            match wanted with | MkPair expected_name expected_core =>
+                andb(eqNat name expected_name,
+                  andb(eqTerm 200 core expected_core, compare rest tail))
+            end end
+        end
+    end;
+
+def result_comp_success_is (result : CompResult (List (Pair Nat CoreTerm)))
+    (expected : List (Pair Nat CoreTerm)) : Bool :=
+    match result with
+    | CErr _ => False
+    | COk cores => result_core_pairs_equal cores expected
+    end;
+
+def result_owned_success (surfaces : List (Pair Nat Surface))
+    (expected : List (Pair Nat CoreTerm)) : Bool :=
+    let reported : CompileProgramResult := compile_program_with_owner surfaces in
+    andb (match reported with
+      | CompileProgramErr _ _ => False
+      | CompileProgramOk cores => result_core_pairs_equal cores expected
+      end)
+      (andb(result_comp_success_is (compile_program_result reported) expected,
+        result_comp_success_is (compile_program surfaces) expected));
+
+def result_owned_rejection (surfaces : List (Pair Nat Surface)) (expected_owner : Nat)
+    (expected_phase : CompileProgramPhase) (code : Nat) (detail : Nat) : Bool :=
+    let reported : CompileProgramResult := compile_program_with_owner surfaces in
+    andb (match reported with
+      | CompileProgramOk _ => False
+      | CompileProgramErr owned error => match owned with | MkPair owner phase =>
+          match error with | ErrCode actual_code actual_detail =>
+            andb(eqNat owner expected_owner,
+              andb(eqNat (compiler_test_compile_phase_nat phase) (compiler_test_compile_phase_nat expected_phase),
+                andb(eqNat actual_code code, eqNat actual_detail detail)))
+          end end
+      end)
+      (andb(result_comp_error_is (List (Pair Nat CoreTerm)) (compile_program_result reported) code detail,
+        result_comp_error_is (List (Pair Nat CoreTerm)) (compile_program surfaces) code detail));
+
+def result_wrap_surface (inner : Surface) : Nat -> Surface :=
+  fix layers (count : Nat) : Surface :=
+    match count with | Z => inner | S previous => SEffectRow (layers previous) end;
+
+def result_surface_layers : Nat -> Surface := result_wrap_surface (SSort 0);
+
+def result_perform_args : Nat -> List Surface :=
+  fix args (count : Nat) : List Surface :=
+    match count with
+    | Z => Nil Surface
+    | S previous => Cons Surface (SSort 0) (args previous)
+    end;
+
+def result_location_rejection (surfaces : List (Pair Nat Surface)) (owner : Nat)
+    (phase : CompileProgramPhase) (ordinal : Nat) (code : Nat) (detail : Nat) : Bool :=
+  let result : CompileProgramLocatedResult := compile_program_with_location surfaces in
+  andb (match result with
+    | CompileProgramLocatedOk _ => False
+    | CompileProgramLocatedErr location error => match location with
+      | CompileProgramLocationOf declaration actual_ordinal => match declaration with
+        | MkPair actual_owner actual_phase => match error with
+          | ErrCode actual_code actual_detail =>
+              andb(eqNat owner actual_owner,
+                andb(eqNat (compiler_test_compile_phase_nat phase) (compiler_test_compile_phase_nat actual_phase),
+                  andb(eqNat ordinal actual_ordinal,
+                    andb(eqNat code actual_code, eqNat detail actual_detail))))
+          end end end
+    end)
+    (result_comp_error_is (List (Pair Nat CoreTerm)) (compile_program_located_result result) code detail);
+
+def result_located_cores_equal : List (Pair Nat CoreTerm) -> List (Pair Nat CoreTerm) -> Bool :=
+  fix compare (actual : List (Pair Nat CoreTerm)) (expected : List (Pair Nat CoreTerm)) : Bool :=
+    match actual, expected with
+    | Nil, Nil => True
+    | Nil, Cons _ _ => False
+    | Cons _ _, Nil => False
+    | Cons found rest, Cons wanted tail => match found, wanted with
+      | MkPair name core, MkPair expected_name expected_core =>
+          andb(eqNat name expected_name,
+            andb(eqList (encode 200 core) (encode 200 expected_core), compare rest tail))
+      end
+    end;
+
+def result_located_equal (actual : CompileProgramLocatedResult)
+    (expected : CompileProgramLocatedResult) : Bool :=
+  match actual, expected with
+  | CompileProgramLocatedOk cores, CompileProgramLocatedOk expected_cores =>
+      result_located_cores_equal cores expected_cores
+  | CompileProgramLocatedOk _, CompileProgramLocatedErr _ _ => False
+  | CompileProgramLocatedErr _ _, CompileProgramLocatedOk _ => False
+  | CompileProgramLocatedErr location error, CompileProgramLocatedErr expected_location expected_error =>
+      match location, expected_location with
+      | CompileProgramLocationOf owned ordinal, CompileProgramLocationOf expected_owned expected_ordinal =>
+          match owned, expected_owned with
+          | MkPair name phase, MkPair expected_name expected_phase =>
+              match error, expected_error with
+              | ErrCode code detail, ErrCode expected_code expected_detail =>
+                  andb(eqNat name expected_name,
+                    andb(eqNat (compiler_test_compile_phase_nat phase) (compiler_test_compile_phase_nat expected_phase),
+                      andb(eqNat ordinal expected_ordinal,
+                        andb(eqNat code expected_code, eqNat detail expected_detail))))
+              end
+          end
+      end
+  end;
+
+def result_located_failure (name : Nat) (phase : CompileProgramPhase)
+    (ordinal : Nat) (code : Nat) (detail : Nat) : CompileProgramLocatedResult :=
+  CompileProgramLocatedErr
+    (CompileProgramLocationOf (MkPair Nat CompileProgramPhase name phase) ordinal) (ErrCode code detail);
+
+def result_item_program_is (surfaces : List (Pair Nat Surface))
+    (expected : CompileProgramLocatedResult) : Bool :=
+  andb (result_located_equal (compile_program_with_location surfaces) expected)
+    (result_located_equal
+      (compile_program_with_location_with compile_program_item_pure surfaces) expected);
+
+def result_item_rejection (name : Nat) (surface : Surface) (future : List Nat)
+    (ctx : List Nat) (seen : List Nat) (phase : CompileProgramPhase)
+    (code : Nat) (detail : Nat) : Bool :=
+  match compile_program_item_pure name surface future ctx seen with
+  | Right _ => False
+  | Left failed => match failed with | MkPair actual_phase error =>
+      match error with | ErrCode actual_code actual_detail =>
+          andb(eqNat (compiler_test_compile_phase_nat actual_phase) (compiler_test_compile_phase_nat phase),
+            andb(eqNat actual_code code, eqNat actual_detail detail))
+      end end
+  end;
+
+def result_item_success (name : Nat) (surface : Surface) (future : List Nat)
+    (ctx : List Nat) (seen : List Nat) (expected_future : List Nat) (expected_core : CoreTerm) : Bool :=
+  match compile_program_item_pure name surface future ctx seen with
+  | Left _ => False
+  | Right compiled => match compiled with | MkPair future_rest core =>
+      andb(eqList future_rest expected_future, eqList (encode 200 core) (encode 200 expected_core))
+      end
+  end;
+
+def result_item_probe (name : Nat) (surface : Surface) (future : List Nat)
+    (ctx : List Nat) (seen : List Nat)
+    : Either (Pair CompileProgramPhase CompError) (Pair (List Nat) CoreTerm) :=
+  let shape : Bool :=
+    match eqNat name 12 with
+    | True => andb(eqList future [12, 13, 14, 15], andb(eqList ctx [], eqList seen []))
+    | False => match eqNat name 13 with
+      | True => andb(eqList future [13, 14, 15], andb(eqList ctx [12], eqList seen [12]))
+      | False => match eqNat name 14 with
+        | True => andb(eqList future [14, 15], andb(eqList ctx [13, 12], eqList seen [13, 12]))
+        | False => False
+        end
+      end
+    end in
+  match shape with
+  | False => Left (Pair CompileProgramPhase CompError) (Pair (List Nat) CoreTerm)
+      (MkPair CompileProgramPhase CompError CompileFutureSlotPhase (ErrCode 49 124))
+  | True => match eqNat name 14 with
+      | True => Left (Pair CompileProgramPhase CompError) (Pair (List Nat) CoreTerm)
+          (MkPair CompileProgramPhase CompError CompileCorePhase (ErrCode 49 123))
+      | False => compile_program_item_pure name surface future ctx seen
+      end
+  end;
+
+def result_source_original_error : Bool :=
+  result_comp_error_is Nat
+    (source_result_comp Nat (SourceErr Nat
+      (SourceFailureOf (ErrCode 49 123)
+        (MkPair (Maybe SourceFailureOwner) (Maybe LowerRootCause)
+          (Just SourceFailureOwner
+            (SourceFailureOwnerOf (MkPair Nat CompileProgramPhase 999 CompileCorePhase)
+              (MkPair (Maybe Nat) (Maybe (Pair Nat Nat)) (Just Nat 77) (Nothing (Pair Nat Nat)))))
+          (Nothing LowerRootCause))))) 49 123;
 
 def result_laws : List ResultLaw :=
     [ MkResultLaw "inference reports resource at zero budget"
@@ -128,6 +281,175 @@ def result_laws : List ResultLaw :=
     , MkResultLaw "constructor closure conversion propagates zero budget"
         (eqNat(result_kind(CoreTerm, close_constructors_checked(0, Nil Entry, CSort 0)), 4))
     , MkResultLaw "zero fix arity has the exact malformed metadata fault" result_zero_fix_arity
+    , MkResultLaw "owned empty program preserves successful empty payload"
+        (result_owned_success [] [])
+    , MkResultLaw "owned program preserves core payload order and preceding context"
+        (result_owned_success
+          [MkPair Nat Surface 12 (SSort 3),
+           MkPair Nat Surface 13 (SLam 9 (SSort 0) (SVar 9)),
+           MkPair Nat Surface 14 (SVar 12)]
+          [MkPair Nat CoreTerm 12 (CSort 3),
+           MkPair Nat CoreTerm 13 (CLam (CSort 0) (CRel 0)),
+           MkPair Nat CoreTerm 14 (CRel 1)])
+    , MkResultLaw "owned unsupported declaration keeps middle resolved owner"
+        (result_owned_rejection
+          [MkPair Nat Surface 7 (SSort 0), MkPair Nat Surface 8 (SSort 0),
+           MkPair Nat Surface 9 (SVar 99), MkPair Nat Surface 10 (SHole 0)]
+          9 CompileSurfacePhase 2 0)
+    , MkResultLaw "owned anonymous hole preserves generic surface refusal"
+        (result_owned_rejection [MkPair Nat Surface 9 (SHole 0)] 9 CompileSurfacePhase 2 0)
+    , MkResultLaw "owned named hole reports declaration rather than hole identifier"
+        (result_owned_rejection [MkPair Nat Surface 9 (SHole 77)] 9 CompileSurfacePhase 2 0)
+    , MkResultLaw "duplicate guard precedes future global and surface refusal"
+        (result_owned_rejection
+          [MkPair Nat Surface 7 (SSort 0),
+           MkPair Nat Surface 7 (SApp (SConst 9) (SHole 0)), MkPair Nat Surface 9 (SSort 0)]
+          7 CompileDuplicatePhase 3 7)
+    , MkResultLaw "future global guard precedes surface refusal"
+        (result_owned_rejection
+          [MkPair Nat Surface 7 (SApp (SConst 9) (SHole 0)), MkPair Nat Surface 9 (SSort 0)]
+          7 CompileFutureGlobalPhase 3 7)
+    , MkResultLaw "earlier surface refusal precedes later duplicate"
+        (result_owned_rejection
+          [MkPair Nat Surface 7 (SSort 0), MkPair Nat Surface 8 (SVar 99),
+           MkPair Nat Surface 7 (SSort 0)] 8 CompileSurfacePhase 2 0)
+    , MkResultLaw "owned surface traversal retains last accepted fuel depth"
+        (result_owned_success [MkPair Nat Surface 7 (result_surface_layers (sub fuel32 1))]
+          [MkPair Nat CoreTerm 7 (CSort 0)])
+    , MkResultLaw "owned surface traversal retains exhausted fuel refusal"
+        (result_owned_rejection [MkPair Nat Surface 7 (result_surface_layers fuel32)]
+          7 CompileSurfacePhase 2 0)
+    , MkResultLaw "owned core traversal preserves accepted perform application"
+        (result_owned_success [MkPair Nat Surface 7 (SPerform 77 [SSort 0])]
+          [MkPair Nat CoreTerm 7 (CApp (CConst 77) (CSort 0))])
+    , MkResultLaw "owned core traversal keeps its own phase and original detail"
+        (result_owned_rejection [MkPair Nat Surface 7 (SPerform 77 (result_perform_args fuel32))]
+          7 CompileCorePhase 2 1)
+    , MkResultLaw "legacy core pipeline preserves core traversal refusal"
+        (result_comp_error_is CoreTerm
+          (compile_pipeline (SPerform 77 (result_perform_args fuel32)) []) 2 1)
+    , MkResultLaw "legacy single surface check preserves unsupported refusal"
+        (result_comp_error_is CoreTerm (compile_and_check (SHole 77) []) 2 0)
+    , MkResultLaw "owned projection preserves raw error rather than substituting owner"
+        (result_comp_error_is (List (Pair Nat CoreTerm))
+          (compile_program_result (CompileProgramErr
+            (MkPair Nat CompileProgramPhase 999 CompileCorePhase) (ErrCode 49 123))) 49 123)
+    , MkResultLaw "located middle refusal retains exact failing ordinal"
+        (result_location_rejection
+          [MkPair Nat Surface 7 (SSort 0), MkPair Nat Surface 8 (SVar 99), MkPair Nat Surface 9 (SHole 0)]
+          8 CompileSurfacePhase 1 2 0)
+    , MkResultLaw "located duplicate name retains second occurrence"
+        (result_location_rejection [MkPair Nat Surface 7 (SSort 0), MkPair Nat Surface 7 (SHole 0)]
+          7 CompileDuplicatePhase 1 3 7)
+    , MkResultLaw "item callback preserves successful empty result"
+        (result_located_equal (compile_program_with_location_with result_item_probe [])
+          (CompileProgramLocatedOk []))
+    , MkResultLaw "item callback preserves complete core order and preceding context"
+        (result_item_program_is
+          [MkPair Nat Surface 12 (SSort 3), MkPair Nat Surface 13 (SLam 9 (SSort 0) (SVar 9)),
+           MkPair Nat Surface 14 (SVar 12)]
+          (CompileProgramLocatedOk
+            [MkPair Nat CoreTerm 12 (CSort 3), MkPair Nat CoreTerm 13 (CLam (CSort 0) (CRel 0)),
+             MkPair Nat CoreTerm 14 (CRel 1)]))
+    , MkResultLaw "item success retains exact future suffix and core"
+        (result_item_success 12 (SVar 8) [12, 13, 14] [9, 8] [9, 8] [13, 14] (CRel 1))
+    , MkResultLaw "item missing future slot precedes duplicate and surface refusal"
+        (result_item_rejection 7 (SHole 0) [] [] [7] CompileFutureSlotPhase 3 7)
+    , MkResultLaw "item duplicate precedes future global and surface refusal"
+        (result_item_rejection 7 (SApp (SConst 9) (SHole 0)) [7, 9] [] [7] CompileDuplicatePhase 3 7)
+    , MkResultLaw "item future global precedes surface refusal"
+        (result_item_rejection 7 (SApp (SConst 9) (SHole 0)) [7, 9] [] [] CompileFutureGlobalPhase 3 7)
+    , MkResultLaw "item named hole retains complete surface error"
+        (result_item_rejection 7 (SHole 77) [7] [] [] CompileSurfacePhase 2 0)
+    , MkResultLaw "item preserves last accepted surface fuel depth"
+        (result_item_program_is [MkPair Nat Surface 7 (result_surface_layers (sub fuel32 1))]
+          (CompileProgramLocatedOk [MkPair Nat CoreTerm 7 (CSort 0)]))
+    , MkResultLaw "item preserves exhausted surface fuel refusal"
+        (result_item_program_is [MkPair Nat Surface 7 (result_surface_layers fuel32)]
+          (result_located_failure 7 CompileSurfacePhase 0 2 0))
+    , MkResultLaw "item core fuel refusal retains phase and original detail"
+        (result_item_rejection 7 (SPerform 77 (result_perform_args fuel32)) [7] [] [] CompileCorePhase 2 1)
+    , MkResultLaw "item traversal duplicate retains second occurrence and priority"
+        (result_item_program_is
+          [MkPair Nat Surface 7 (SSort 0), MkPair Nat Surface 7 (SApp (SConst 9) (SHole 0)),
+           MkPair Nat Surface 9 (SSort 0)] (result_located_failure 7 CompileDuplicatePhase 1 3 7))
+    , MkResultLaw "item traversal future global retains first location and priority"
+        (result_item_program_is
+          [MkPair Nat Surface 7 (SApp (SConst 9) (SHole 0)), MkPair Nat Surface 9 (SSort 0)]
+          (result_located_failure 7 CompileFutureGlobalPhase 0 3 7))
+    , MkResultLaw "indexed preflight sees a later occurrence of the current name"
+        (result_item_program_is
+          [MkPair Nat Surface 7 (SConst 7), MkPair Nat Surface 8 (SSort 0),
+           MkPair Nat Surface 7 (SSort 0)]
+          (result_located_failure 7 CompileFutureGlobalPhase 0 3 7))
+    , MkResultLaw "indexed preflight compares whole wide names across Nat representations"
+        (let wide_base : Nat := pow_nat 2 64 in
+         andb (result_item_program_is
+           [MkPair Nat Surface 7 (SConst (add wide_base 1)),
+            MkPair Nat Surface (S wide_base) (SSort 0)]
+           (result_located_failure 7 CompileFutureGlobalPhase 0 3 7))
+           (result_item_program_is
+             [MkPair Nat Surface 7 (SConst 1), MkPair Nat Surface (S wide_base) (SSort 0)]
+             (CompileProgramLocatedOk
+               [MkPair Nat CoreTerm 7 (CConst 1), MkPair Nat CoreTerm (S wide_base) (CSort 0)])))
+    , MkResultLaw "indexed preflight ignores references outside the future suffix"
+        (result_item_program_is
+          [MkPair Nat Surface 7 (SSort 0), MkPair Nat Surface 8 (SConst 7),
+           MkPair Nat Surface 9 (SConst 99)]
+          (CompileProgramLocatedOk
+            [MkPair Nat CoreTerm 7 (CSort 0), MkPair Nat CoreTerm 8 (CConst 7),
+             MkPair Nat CoreTerm 9 (CConst 99)]))
+    , MkResultLaw "indexed preflight keeps the future reference at the final fuel layer"
+        (result_item_program_is
+          [MkPair Nat Surface 7 (result_wrap_surface (SConst 9) (sub fuel32 1)),
+           MkPair Nat Surface 9 (SSort 0)]
+          (result_located_failure 7 CompileFutureGlobalPhase 0 3 7))
+    , MkResultLaw "indexed preflight leaves a deeper future reference to the surface check"
+        (result_item_program_is
+          [MkPair Nat Surface 7 (result_wrap_surface (SConst 9) fuel32),
+           MkPair Nat Surface 9 (SSort 0)]
+          (result_located_failure 7 CompileSurfacePhase 0 2 0))
+    , MkResultLaw "item traversal middle surface refusal precedes later duplicate"
+        (result_item_program_is
+          [MkPair Nat Surface 7 (SSort 0), MkPair Nat Surface 8 (SVar 99), MkPair Nat Surface 7 (SSort 0)]
+          (result_located_failure 8 CompileSurfacePhase 1 2 0))
+    , MkResultLaw "item traversal late core refusal keeps complete location and detail"
+        (result_item_program_is
+          [MkPair Nat Surface 7 (SSort 0), MkPair Nat Surface 8 (SVar 7),
+           MkPair Nat Surface 9 (SPerform 77 (result_perform_args fuel32)), MkPair Nat Surface 7 (SHole 0)]
+          (result_located_failure 9 CompileCorePhase 2 2 1))
+    , MkResultLaw "item traversal late surface refusal keeps complete location and first error"
+        (result_item_program_is
+          [MkPair Nat Surface 7 (SSort 0), MkPair Nat Surface 8 (SSort 0), MkPair Nat Surface 9 (SVar 7),
+           MkPair Nat Surface 10 (SHole 77), MkPair Nat Surface 7 (SSort 0)]
+          (result_located_failure 10 CompileSurfacePhase 3 2 0))
+    , MkResultLaw "item callback receives exact future context and seen progression"
+        (result_located_equal
+          (compile_program_with_location_with result_item_probe
+            [MkPair Nat Surface 12 (SSort 0), MkPair Nat Surface 13 (SVar 12),
+             MkPair Nat Surface 14 (SSort 0), MkPair Nat Surface 15 (SHole 0)])
+          (result_located_failure 14 CompileCorePhase 2 49 123))
+    , MkResultLaw "item result comparison distinguishes location and original error fields"
+        (andb (notb (result_located_equal (result_located_failure 7 CompileSurfacePhase 1 2 0)
+          (result_located_failure 8 CompileSurfacePhase 1 2 0)))
+          (andb (notb (result_located_equal (result_located_failure 7 CompileSurfacePhase 1 2 0)
+            (result_located_failure 7 CompileCorePhase 1 2 0)))
+            (andb (notb (result_located_equal (result_located_failure 7 CompileSurfacePhase 1 2 0)
+              (result_located_failure 7 CompileSurfacePhase 2 2 0)))
+              (andb (notb (result_located_equal (result_located_failure 7 CompileSurfacePhase 1 2 0)
+                (result_located_failure 7 CompileSurfacePhase 1 3 0)))
+                (notb (result_located_equal (result_located_failure 7 CompileSurfacePhase 1 2 0)
+                  (result_located_failure 7 CompileSurfacePhase 1 2 1)))))))
+    , MkResultLaw "item result comparison distinguishes core order and empty payload"
+        (andb (notb (result_located_equal
+          (CompileProgramLocatedOk [MkPair Nat CoreTerm 7 (CSort 0), MkPair Nat CoreTerm 8 (CRel 0)])
+          (CompileProgramLocatedOk [MkPair Nat CoreTerm 8 (CRel 0), MkPair Nat CoreTerm 7 (CSort 0)])))
+          (andb (notb (result_located_equal (CompileProgramLocatedOk [])
+            (CompileProgramLocatedOk [MkPair Nat CoreTerm 7 (CSort 0)])))
+            (notb (result_located_equal (CompileProgramLocatedOk [MkPair Nat CoreTerm 7 (CSort 0)])
+              (CompileProgramLocatedOk [MkPair Nat CoreTerm 7 (CSort 1)])))))
+    , MkResultLaw "source diagnostic projection preserves arbitrary original error"
+        result_source_original_error
     ];
 
 -- @entry main

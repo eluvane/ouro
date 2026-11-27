@@ -1,0 +1,145 @@
+import "../../tools/native_release.ouro", "../analyze/precision/assertions.ouro";
+
+-- The .exe member contains test bytes, not an accepted native tool image.
+def release_stage_fixture_bytes : String := str_of_codes [65, 0, 255, 13, 10, 66];
+def release_stage_fixture_digest : String := "0fd7251c4cef8f3091479a66757366ae8722015005780a565eb1db530be0a7b8";
+def release_stage_fixture_empty_digest : String := "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+
+def release_stage_fixture_fail : IO Unit :=
+    do eprintln "PRECISION_FAIL native-release-stage setup"; exit 93;
+
+def release_stage_fixture_setup (result : Either FsError Unit) : IO Unit :=
+    match result with | Left _ => release_stage_fixture_fail | Right _ => io_unit end;
+
+def release_stage_fixture_created (result : Either FsCreateDirError Unit) : IO Unit :=
+    match result with | Left _ => release_stage_fixture_fail | Right _ => io_unit end;
+
+def release_stage_fixture_result (expected : String) (created : Bool)
+    (result : Either NativeReleaseStageFailure Unit) : Bool :=
+    match result with
+    | Right _ => str_null expected
+    | Left failure => match failure with | NativeReleaseStageFailureOf actual error =>
+        andb (str_eq (native_release_stage_error_code error) expected)
+          (match created, actual with
+           | True, True => True | False, False => True | True, False => False | False, True => False end)
+      end
+    end;
+
+def release_stage_fixture_loaded (expected : String) (result : Either FsBoundedReadError String) : Bool :=
+    match result with | Left _ => False | Right content => prim_string_eq expected content end;
+
+def release_stage_fixture_corrupt (path : String) (_content : String) : IO (Either FsError Unit) :=
+    fs_write_checked path "broken";
+
+def release_stage_fixture_mutate (source : String) (path : String) (content : String)
+    : IO (Either FsError Unit) :=
+    do let! wrote := fs_write_checked path content;
+       match wrote with
+       | Left error => io_pure(Either FsError Unit, Left FsError Unit error)
+       | Right _ => fs_write_checked source "broken"
+       end;
+
+def release_stage_fixture_add_extra (output : String) (path : String) (content : String)
+    : IO (Either FsError Unit) :=
+    do let! wrote := fs_write_checked path content;
+       match wrote with
+       | Left error => io_pure(Either FsError Unit, Left FsError Unit error)
+       | Right _ => fs_write_checked (fs_child output "unexpected.bin") "extra"
+       end;
+
+def release_stage_fixture_run (requested : String) : IO Unit :=
+    do let! claimed := fs_create_dir_exclusive_checked requested;
+       release_stage_fixture_created claimed;
+       let! work := prim_fs_realpath requested;
+       match process_directory_valid work with
+       | False => release_stage_fixture_fail
+       | True =>
+           let source : String := fs_child work "source 雪.bin" in
+           let empty : String := fs_child work "empty.bin" in
+           let output : String := fs_child work "bundle 雪" in
+           let wrong_hash : String := fs_child work "wrong-hash" in
+           let cap_output : String := fs_child work "cap" in
+           let alias_output : String := fs_child work "alias" in
+           let corrupt_output : String := fs_child work "corrupt" in
+           let changed_output : String := fs_child work "changed-source" in
+           let extra_output : String := fs_child work "extra-output" in
+           let names : List String := ["bin/coil.exe", "src/empty"] in
+           let files : List NativeReleaseInput :=
+             [NativeReleaseInputOf "bin/coil.exe" source 6 release_stage_fixture_digest,
+              NativeReleaseInputOf "src/empty" empty 0 release_stage_fixture_empty_digest] in
+           do let! wrote_source := fs_write_checked source release_stage_fixture_bytes;
+              release_stage_fixture_setup wrote_source;
+              let! wrote_empty := fs_write_checked empty "";
+              release_stage_fixture_setup wrote_empty;
+              let! prepared := native_release_prepare 6 names files output;
+              let! binary := fs_read_bounded_checked 6 (fs_child output "bin/coil.exe");
+              let! zero := fs_read_bounded_checked 0 (fs_child output "src/empty");
+              let! original := fs_read_bounded_checked 6 source;
+              let! existing := native_release_prepare 6 names files output;
+              let! preserved := fs_read_bounded_checked 6 (fs_child output "bin/coil.exe");
+              let! hash_failed := native_release_prepare 6 names
+                [NativeReleaseInputOf "bin/coil.exe" source 6 release_stage_fixture_empty_digest,
+                 NativeReleaseInputOf "src/empty" empty 0 release_stage_fixture_empty_digest] wrong_hash;
+              let! hash_exists := fs_exists wrong_hash;
+              let! capped := native_release_prepare 5 names files cap_output;
+              let! cap_exists := fs_exists cap_output;
+              let! aliased := native_release_prepare 12 ["A", "a"]
+                [NativeReleaseInputOf "A" source 6 release_stage_fixture_digest,
+                 NativeReleaseInputOf "a" source 6 release_stage_fixture_digest] alias_output;
+              let! alias_exists := fs_exists alias_output;
+              let! corrupted := native_release_prepare_with fs_read_bounded_checked release_stage_fixture_corrupt
+                fs_create_dir_exclusive_checked prim_fs_realpath fs_walk_checked 6 names files corrupt_output;
+              let! corrupt_bytes := fs_read_bounded_checked 6 (fs_child corrupt_output "bin/coil.exe");
+              let! changed := native_release_prepare_with fs_read_bounded_checked (release_stage_fixture_mutate source)
+                fs_create_dir_exclusive_checked prim_fs_realpath fs_walk_checked 6 names files changed_output;
+              let! changed_bytes := fs_read_bounded_checked 6 source;
+              let! restored := fs_write_checked source release_stage_fixture_bytes;
+              release_stage_fixture_setup restored;
+              let! extra := native_release_prepare_with fs_read_bounded_checked (release_stage_fixture_add_extra extra_output)
+                fs_create_dir_exclusive_checked prim_fs_realpath fs_walk_checked 6 names files extra_output;
+              let! extra_bytes := fs_read_bounded_checked 5 (fs_child extra_output "unexpected.bin");
+              let! final_source := fs_read_bounded_checked 6 source;
+              let! final_empty := fs_read_bounded_checked 0 empty;
+              precision_run "native-release-stage"
+                [ MkPair String Bool "native-release-stage/fresh-exclusive-copy"
+                    (release_stage_fixture_result "" True prepared)
+                , MkPair String Bool "native-release-stage/hand-expected-binary-bytes"
+                    (release_stage_fixture_loaded release_stage_fixture_bytes binary)
+                , MkPair String Bool "native-release-stage/empty-file-at-zero-cap"
+                    (release_stage_fixture_loaded "" zero)
+                , MkPair String Bool "native-release-stage/original-source-unchanged"
+                    (release_stage_fixture_loaded release_stage_fixture_bytes original)
+                , MkPair String Bool "native-release-stage/existing-root-refused-and-preserved"
+                    (andb (release_stage_fixture_result "release_create" False existing)
+                      (release_stage_fixture_loaded release_stage_fixture_bytes preserved))
+                , MkPair String Bool "native-release-stage/hash-refused-before-creation"
+                    (andb (release_stage_fixture_result "release_digest_mismatch" False hash_failed) (notb hash_exists))
+                , MkPair String Bool "native-release-stage/cap-refused-before-creation"
+                    (andb (release_stage_fixture_result "release_budget_exceeded" False capped) (notb cap_exists))
+                , MkPair String Bool "native-release-stage/alias-refused-before-creation"
+                    (andb (release_stage_fixture_result "release_path_conflict" False aliased) (notb alias_exists))
+                , MkPair String Bool "native-release-stage/output-corruption-retains-root-claim"
+                    (andb (release_stage_fixture_result "release_output_changed" True corrupted)
+                      (release_stage_fixture_loaded "broken" corrupt_bytes))
+                , MkPair String Bool "native-release-stage/source-rewrite-refused"
+                    (andb (release_stage_fixture_result "release_source_changed" True changed)
+                      (release_stage_fixture_loaded "broken" changed_bytes))
+                , MkPair String Bool "native-release-stage/unexpected-output-refused"
+                    (andb (release_stage_fixture_result "release_output_inventory_changed" True extra)
+                      (release_stage_fixture_loaded "extra" extra_bytes))
+                , MkPair String Bool "native-release-stage/private-input-fixtures-restored"
+                    (andb (release_stage_fixture_loaded release_stage_fixture_bytes final_source)
+                      (release_stage_fixture_loaded "" final_empty))
+                ]
+       end;
+
+-- @entry main
+def main : IO Unit :=
+    do let! arguments := argv;
+       match tail String arguments with
+       | Cons directory rest => match rest with
+         | Nil => release_stage_fixture_run directory
+         | Cons _ _ => release_stage_fixture_fail
+         end
+       | Nil => release_stage_fixture_fail
+       end;

@@ -156,37 +156,48 @@ def native_syntax_lex_bad (name : String) (source : String) : Pair String Bool :
       (native_syntax_render(source, fun (decls : List Decl) => decls)) "lex-malformed");
 
 def native_syntax_byte_payload (source : String) (expected : List Nat) : Bool :=
-    match next_token (add(prim_string_length source, 8))
-        (prim_string_to_char_codes source) empty_intern with
-    | StepEof _ => False
-    | LexStepErr _ => False
-    | StepTok token tail _ =>
-        match tokenIsByteString token with
-        | Nothing => False
-        | Just bytes => andb(source_bytes_equal bytes expected, nullb Nat tail)
-        end
-    end;
+    if let StepTok token tail _ := (next_token (add(prim_string_length source, 8))
+        (prim_string_to_char_codes source) empty_intern : Step) then
+      match tokenIsByteString token with
+      | Nothing => False
+      | Just bytes => andb(source_bytes_equal bytes expected, nullb Nat tail)
+      end
+    else False;
 
 def native_syntax_raw_budget_ok (fuel : Nat) (source : String)
     (expected_tail : String) : Bool :=
-  match next_token fuel (prim_string_to_char_codes source) empty_intern with
-  | StepEof _ => False
-  | LexStepErr _ => False
-  | StepTok token tail st =>
-      match tokenIsString token with
-      | Nothing => False
-      | Just id =>
-          andb (prim_string_eq (native_syntax_string st id) "")
-            (prim_string_eq (prim_string_of_char_codes tail) expected_tail)
-      end
-  end;
+  if let StepTok token tail st :=
+    (next_token fuel (prim_string_to_char_codes source) empty_intern : Step) then
+    match tokenIsString token with
+    | Nothing => False
+    | Just id =>
+        andb (prim_string_eq (native_syntax_string st id) "")
+          (prim_string_eq (prim_string_of_char_codes tail) expected_tail)
+    end
+  else False;
 
 def native_syntax_raw_budget_bad (fuel : Nat) (source : String) : Bool :=
-  match next_token fuel (prim_string_to_char_codes source) empty_intern with
-  | StepEof _ => False
-  | StepTok _ _ _ => False
-  | LexStepErr _ => True
-  end;
+  if let LexStepErr _ := (next_token fuel (prim_string_to_char_codes source) empty_intern : Step) then
+    True
+  else False;
+
+def native_syntax_string_long_budget : Bool :=
+  let prefix_length : Nat := 512 in
+  let prefix : List Nat := replicate Nat 120 prefix_length in
+  let source : List Nat := append Nat prefix (prim_string_to_char_codes "\\u{e9}z\";Z") in
+  let expected : List Nat := append Nat prefix [195, 169, 122] in
+  -- The escape and the final byte take one scan step each.
+  let body_fuel : Nat := add prefix_length 2 in
+  andb
+    (match source_take_string (S body_fuel) source [] with
+     | Nothing => False
+     | Just parsed => match parsed with
+       | MkPair bytes tail =>
+           andb (source_bytes_equal bytes expected) (source_bytes_equal tail [59, 90])
+       end
+     end)
+    (match source_take_string body_fuel source [] with
+     | Nothing => True | Just _ => False end);
 
 def native_syntax_multiline_bytes (source : String) (expected : String)
     (expected_tail : String) : Bool :=
@@ -251,15 +262,9 @@ def native_syntax_refs : List Fact -> List Nat :=
     | Cons fact rest =>
         match fact with
         | MkFact kind _ target _ _ =>
-            match kind with
-            | FReference => Cons Nat target (native_syntax_refs rest)
-            | FDeclaration => native_syntax_refs rest
-            | FExport => native_syntax_refs rest
-            | FConstructor => native_syntax_refs rest
-            | FModule => native_syntax_refs rest
-            | FBranch => native_syntax_refs rest
-            | FEffect => native_syntax_refs rest
-            end
+            if let FReference := (kind : FactKind) then
+              Cons Nat target (native_syntax_refs rest)
+            else native_syntax_refs rest
         end
     end;
 
@@ -318,20 +323,73 @@ def native_syntax_representation_facts : Bool :=
                  andb (nullb Fact rest)
                    (match fact with
                     | MkFact kind source target flags span =>
-                        match kind with
-                        | FReference => andb (eqNat source 10)
+                        if let FReference := (kind : FactKind) then
+                          andb (eqNat source 10)
                             (andb (eqNat target 10)
                               (andb(eqNat flags flagNone, eqNat span 7)))
-                        | FDeclaration => False
-                        | FExport => False
-                        | FConstructor => False
-                        | FModule => False
-                        | FBranch => False
-                        | FEffect => False
-                        end
+                        else False
                     end)
              end))
     end;
+
+def native_syntax_ident_slice (fuel : Nat) (source : List Nat) (acc : List Nat)
+    (expected : List Nat) (remaining : List Nat) : Bool :=
+    match take_ident fuel source acc with
+    | MkPair spelling tail => andb(source_bytes_equal spelling expected,
+        source_bytes_equal tail remaining)
+    end;
+
+def native_syntax_import_ident_bounds : Bool :=
+    let name : List Nat := prim_string_to_char_codes "alias@member" in
+    let exact_fuel : Nat := length Nat name in
+    let matches (fuel : Nat) (remaining : List Nat) : Bool :=
+      match take_import_ident fuel (append Nat name remaining) [] with
+      | MkPair spelling tail => andb(source_bytes_equal spelling name,
+          source_bytes_equal tail remaining)
+      end in
+    andb (matches exact_fuel [59, 90])
+      (andb (matches (S exact_fuel) [59, 90]) (matches (S exact_fuel) []));
+
+def native_syntax_long_ident : List Nat :=
+    append Nat [97, 98, 95] (append Nat (replicate Nat 120 512) [121, 39]);
+
+def native_syntax_ident_token_ids : List Token -> List Nat -> Bool :=
+  fix go (tokens : List Token) (ids : List Nat) : Bool :=
+    match tokens with
+    | Nil => False
+    | Cons token rest => match ids with
+      | Nil => andb(is_eof token, nullb Token rest)
+      | Cons expected tail => match tokenIsIdent token with
+        | Nothing => False
+        | Just id => andb(eqNat id expected, go rest tail)
+        end
+      end
+    end;
+
+def native_syntax_long_ident_ids : Bool :=
+    let name : List Nat := native_syntax_long_ident in
+    let source : List Nat := append Nat name (Cons Nat 32
+        (append Nat name [32, 102, 114, 101, 115, 104])) in
+    if let LexOk tokens state := (lex_all 2048 source : LexResult) then
+      andb (native_syntax_ident_token_ids tokens [1, 1, 2])
+        (match state with | MkIntern names next_id strings next_string =>
+          andb(eqNat next_id 3, andb(eqNat next_string 0,
+            andb(nullb (Pair (List Nat) Nat) strings,
+              match names with
+              | Nil => False
+              | Cons first rest => match rest with
+                | Nil => False
+                | Cons second tail => match first with | MkPair fresh fresh_id =>
+                  match second with | MkPair original original_id =>
+                    andb(nullb (Pair (List Nat) Nat) tail,
+                      andb(source_bytes_equal fresh [102, 114, 101, 115, 104],
+                        andb(eqNat fresh_id 2, andb(eqNat original_id 1,
+                          source_bytes_equal original name))))
+                  end end
+                end
+              end)))
+        end)
+    else False;
 
 def native_syntax_laws : List (Pair String Bool) :=
     [ MkPair String Bool "native-keyword/intrinsic-id-17" (native_syntax_keyword "intrinsic" 17)
@@ -340,6 +398,24 @@ def native_syntax_laws : List (Pair String Bool) :=
     , MkPair String Bool "native-keyword/if" (native_syntax_keyword "if" kwIf)
     , MkPair String Bool "native-keyword/then" (native_syntax_keyword "then" kwThen)
     , MkPair String Bool "native-keyword/else" (native_syntax_keyword "else" kwElse)
+    , MkPair String Bool "identifier/zero-fuel-keeps-input-and-accumulator"
+        (native_syntax_ident_slice 0 [97, 98] [120, 121] [121, 120] [97, 98])
+    , MkPair String Bool "identifier/fuel-stops-before-next-character"
+        (native_syntax_ident_slice 2 [97, 98, 99, 59] [] [97, 98] [99, 59])
+    , MkPair String Bool "identifier/end-of-input-retains-accumulator-prefix"
+        (native_syntax_ident_slice 3 [97, 98] [122] [122, 97, 98] [])
+    , MkPair String Bool "identifier/nonidentifier-keeps-exact-tail"
+        (native_syntax_ident_slice 8 [97, 95, 98, 39, 59, 90] [121, 120]
+          [120, 121, 97, 95, 98, 39] [59, 90])
+    , MkPair String Bool "identifier/first-nonidentifier-consumes-nothing"
+        (native_syntax_ident_slice 8 [32, 97] [] [] [32, 97])
+    , MkPair String Bool "identifier/qualified-spelling-preserves-byte-tail"
+        native_syntax_import_ident_bounds
+    , MkPair String Bool "identifier/long-spelling-at-exact-fuel"
+        (native_syntax_ident_slice 517 (append Nat native_syntax_long_ident [59, 90]) []
+          native_syntax_long_ident [59, 90])
+    , MkPair String Bool "identifier/long-spelling-reuses-id-and-retains-intern-order"
+        native_syntax_long_ident_ids
     , native_syntax_expect "native-parse/if-shape"
         "def chosen : Nat := if flag then left else right;"
         "def:chosen:Nat=if;"
@@ -553,6 +629,8 @@ def native_syntax_laws : List (Pair String Bool) :=
     , native_syntax_expect "string/unicode-utf8"
         "def sample : String := \"\\u{e9}\\u{1F600}\";"
         "def:sample:String=\"é😀\";"
+    , MkPair String Bool "string/long-escaped-literal-budget-and-tail"
+        native_syntax_string_long_budget
     , native_syntax_lex_bad "string/unicode-empty"
         "def bad : String := \"\\u{}\";"
     , native_syntax_lex_bad "string/unicode-nonhex"

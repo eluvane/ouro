@@ -1,0 +1,117 @@
+-- Multiplication specialization checks exact Core and its addition dependency.
+-- A candidate must pass both checks before specialization.
+import "managed_nat_shapes.ouro",
+  "managed_model.ouro",
+  "../file_elab_lookup.ouro",
+  "../core.ouro",
+  "lower_model.ouro",
+  "../primitive_model.ouro",
+  "../file_check_model.ouro",
+  "lower_types.ouro",
+  "lower_boundary.ouro",
+  "../file_elab_infer.ouro",
+  "../constructor_closures.ouro";
+
+def managed_small_nat_mul_template (natural : Nat) (addition : Nat) : CoreTerm :=
+    let number : CoreTerm := CInd natural in
+    CFix 0 0 2 (managed_nat_binary_type natural natural)
+      (CLam number (CLam number (CCase (MkCaseInfo natural 0 [0,1])
+        (CLam number number) (CRel 1)
+        [CConstruct natural 0 0, CLam number
+          (CApp (CApp(CConst addition, CRel 1))
+            (CApp(CApp(CRel 3, CRel 0), CRel 1)))])));
+
+-- Peel only source binders/fixpoints; exact templates reject extra structure.
+def managed_small_nat_peel : Nat -> CoreTerm -> Either NativeLowerError CoreTerm :=
+  fix peel (fuel : Nat) (term : CoreTerm) : Either NativeLowerError CoreTerm :=
+    match fuel with | Z => Left NativeLowerError CoreTerm LowerResourceExhausted
+    | S next => match term with
+      | CLam _ body => peel next body | CFix _ _ _ _ body => peel next body
+      | CRel _ => Right NativeLowerError CoreTerm term | CConst _ => Right NativeLowerError CoreTerm term
+      | CInd _ => Right NativeLowerError CoreTerm term | CConstruct _ _ _ => Right NativeLowerError CoreTerm term
+      | CSort _ => Right NativeLowerError CoreTerm term | CPi _ _ => Right NativeLowerError CoreTerm term
+      | CApp _ _ => Right NativeLowerError CoreTerm term | CLetIn _ _ _ => Right NativeLowerError CoreTerm term
+      | CCase _ _ _ _ => Right NativeLowerError CoreTerm term
+      | CStrLit _ _ => Right NativeLowerError CoreTerm term | CStrBytes _ _ => Right NativeLowerError CoreTerm term end end;
+
+def managed_small_nat_case (term : CoreTerm) : Maybe (Pair CoreTerm (List CoreTerm)) :=
+    match lower_term_view term with
+    | LowerCaseTerm _ _ condition branches => Just(Pair(CoreTerm, List CoreTerm), MkPair CoreTerm (List CoreTerm) condition branches)
+    | LowerLocalTerm _ => Nothing (Pair(CoreTerm, List CoreTerm))
+    | LowerLambdaTerm _ _ => Nothing (Pair(CoreTerm, List CoreTerm))
+    | LowerApplyTerm _ _ => Nothing (Pair(CoreTerm, List CoreTerm))
+    | LowerLetTerm _ _ _ => Nothing (Pair(CoreTerm, List CoreTerm))
+    | LowerGlobalTerm _ => Nothing (Pair(CoreTerm, List CoreTerm))
+    | LowerConstructorTerm _ _ _ => Nothing (Pair(CoreTerm, List CoreTerm))
+    | LowerOtherTerm _ => Nothing (Pair(CoreTerm, List CoreTerm)) end;
+
+def managed_small_nat_global (fuel : Nat) (term : CoreTerm) : Either NativeLowerError (Maybe Nat) :=
+    lower_map (Pair(CoreTerm, List CoreTerm)) (Maybe Nat) (fun (spine : Pair CoreTerm (List CoreTerm)) =>
+      match spine with | MkPair head _ => match lower_term_view head with
+        | LowerGlobalTerm id => Just Nat id | LowerLocalTerm _ => Nothing Nat
+        | LowerLambdaTerm _ _ => Nothing Nat | LowerApplyTerm _ _ => Nothing Nat
+        | LowerLetTerm _ _ _ => Nothing Nat | LowerConstructorTerm _ _ _ => Nothing Nat
+        | LowerCaseTerm _ _ _ _ => Nothing Nat | LowerOtherTerm _ => Nothing Nat end end)
+      (lower_spine fuel term ([] : List CoreTerm));
+
+def managed_small_nat_second (fuel : Nat) (term : CoreTerm) : Either NativeLowerError (Maybe CoreTerm) :=
+    lower_map CoreTerm (Maybe CoreTerm) (fun (plain : CoreTerm) =>
+      match managed_small_nat_case plain with | Nothing => Nothing CoreTerm
+      | Just parts => match parts with | MkPair _ branches => compiler_nth CoreTerm branches 1 end end)
+      (managed_small_nat_peel fuel term);
+
+-- Authenticated dependencies use the same checked environment/index as their
+-- caller. A missing ordinary body is a mismatch, not inferred arithmetic.
+def managed_small_nat_body (compiler : ManagedCompiler) (fuel : Nat) (id : Nat)
+    : Either NativeLowerError (Maybe (Pair CoreTerm CoreTerm)) :=
+    let entries : List Entry := managed_compiler_entries compiler in
+    match lookup_type id entries, lookup_const id entries with
+    | Just annotation, Just body => lower_bind CoreTerm (Maybe (Pair CoreTerm CoreTerm))
+        (lower_check CoreTerm id (close_constructors_checked_indexed fuel (managed_compiler_environment compiler) body))
+        (fun (closed : CoreTerm) => lower_map Unit (Maybe (Pair CoreTerm CoreTerm))
+          (fun (_ : Unit) => Just(Pair CoreTerm CoreTerm, MkPair CoreTerm CoreTerm annotation closed))
+          (lower_check Unit id (check_term_checked_indexed fuel (managed_compiler_environment compiler)
+            ([] : List CoreTerm) closed annotation)))
+    | Nothing, Just _ => Right(NativeLowerError, Maybe (Pair CoreTerm CoreTerm), Nothing (Pair CoreTerm CoreTerm))
+    | Just _, Nothing => Right(NativeLowerError, Maybe (Pair CoreTerm CoreTerm), Nothing (Pair CoreTerm CoreTerm))
+    | Nothing, Nothing => Right(NativeLowerError, Maybe (Pair CoreTerm CoreTerm), Nothing (Pair CoreTerm CoreTerm)) end;
+
+def managed_small_nat_known (compiler : ManagedCompiler) (fuel : Nat) (id : Nat)
+    : Either NativeLowerError (Maybe ManagedNatOperation) :=
+    lower_bind (Maybe (Pair CoreTerm CoreTerm)) (Maybe ManagedNatOperation) (managed_small_nat_body compiler fuel id)
+      (fun (found : Maybe (Pair CoreTerm CoreTerm)) => match found with
+        | Nothing => Right(NativeLowerError, Maybe ManagedNatOperation, Nothing ManagedNatOperation)
+        | Just parts => match parts with | MkPair annotation body =>
+            managed_nat_recognize (managed_compiler_entries compiler) fuel id annotation body end end);
+
+def managed_small_nat_arithmetic_dependency (compiler : ManagedCompiler) (fuel : Nat) (id : Nat) (subtracting : Bool)
+    : Either NativeLowerError Bool :=
+    lower_map (Maybe ManagedNatOperation) Bool (fun (found : Maybe ManagedNatOperation) => match found with
+      | Nothing => False | Just operation => match operation with
+        | ManagedNatAdd => notb subtracting | ManagedNatSubtract => subtracting
+        | ManagedNatEqual _ => False | ManagedNatCompare _ => False end end)
+      (managed_small_nat_known compiler fuel id);
+
+def managed_small_nat_mul_candidate (compiler : ManagedCompiler) (fuel : Nat) (id : Nat)
+    (natural : Nat) (annotation : CoreTerm) (body : CoreTerm) : Either NativeLowerError Bool :=
+    lower_bind (Maybe CoreTerm) Bool (managed_small_nat_second fuel body) (fun (branch : Maybe CoreTerm) =>
+      match branch with | Nothing => Right NativeLowerError Bool False
+      | Just value => lower_bind CoreTerm Bool (managed_small_nat_peel fuel value) (fun (plain : CoreTerm) =>
+          lower_bind (Maybe Nat) Bool (managed_small_nat_global fuel plain) (fun (addition : Maybe Nat) =>
+            match addition with | Nothing => Right NativeLowerError Bool False
+            | Just target => lower_bind Bool Bool (managed_nat_exact fuel id annotation body
+                (managed_nat_binary_type natural natural) (managed_small_nat_mul_template natural target))
+                (fun (exact : Bool) => match exact with | False => Right NativeLowerError Bool False
+                  | True => managed_small_nat_arithmetic_dependency compiler fuel target False end) end)) end);
+
+def managed_nat_mul_recognize (compiler : ManagedCompiler) (fuel : Nat) (id : Nat)
+    (annotation : CoreTerm) (body : CoreTerm) : Either NativeLowerError Bool :=
+    match managed_nat_type_parts annotation with
+    | Nothing => Right NativeLowerError Bool False
+    | Just parts => match parts with | MkPair natural result =>
+        match managed_nat_registered(managed_compiler_entries compiler, PrimitiveNatRole) with
+        | Nothing => Right NativeLowerError Bool False
+        | Just registered => match andb(eqNat registered natural, eqNat natural result) with
+            | False => Right NativeLowerError Bool False
+            | True => managed_small_nat_mul_candidate compiler fuel id natural annotation body
+            end end end end;

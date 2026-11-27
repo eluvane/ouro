@@ -1,6 +1,5 @@
 #!/usr/bin/env sh
-# check/collect use Ouro ouro-collect, not C collect_post.
-# User-facing multiplexer; hot paths use a tiny shell config reader and leave full cache policy to ouro_build.py.
+# The hosted dispatcher uses the Ouro collector for check and collect.
 
 set -eu
 ulimit -s unlimited 2>/dev/null || true
@@ -8,8 +7,8 @@ ROOT="${OURO_ROOT:-}"
 if [ -z "$ROOT" ]; then
 	ROOT=$(CDPATH='' cd "$(dirname "$0")/.." && pwd)
 fi
-# Python/ci_gate on Windows export I:\... ; compile_units match-fails if
-# that string is compared to a cygpath-unix file prefix.
+# Use the same MSYS path form for the root and its prefixes when comparing
+# source paths passed to compile_units.
 if command -v cygpath >/dev/null 2>&1; then
 	case "$ROOT" in
 	[A-Za-z]:*) ROOT=$(cygpath -u "$ROOT") ;;
@@ -65,11 +64,8 @@ case "$cmd" in
 		;;
 esac
 
-# Hot check/eval/analyze invocations should not pay Python startup just to find
-# the C tool directory.  Keep this shell parser intentionally tiny: it only
-# reads the simple scalar c_out / c_build_dir shape used by Ouro.seal. Full
-# validation, CLI overrides, ccache, and cache policy remain owned by
-# ouro_build.py.
+# Read only the scalar C output setting to avoid Python startup on hosted
+# commands. ouro_build.py owns full validation, overrides, and cache policy.
 cfg_c_build_dir() {
 	[ -f "$ROOT/Ouro.seal" ] || return 0
 	awk '
@@ -99,8 +95,7 @@ make_abs() {
 	case "$1" in
 		/*) printf '%s\n' "$1" ;;
 		[A-Za-z]:*)
-			# Python on Windows exports OURO_C_BUILD_DIR as I:\path.
-			# A leading drive letter is already absolute; do not prefix ROOT.
+			# Treat drive-qualified Windows output paths as absolute.
 			printf '%s\n' "$1" | tr "\\\\" '/'
 			;;
 		*) printf '%s/%s\n' "$ROOT" "$1" ;;
@@ -118,22 +113,47 @@ C_BUILD_DIR=$(make_abs "$C_BUILD_DIR")
 export OURO_C_BUILD_DIR="$C_BUILD_DIR"
 
 COMPILER="${OURO1_COMPILER:-$C_BUILD_DIR/ouro1}"
-[ -x "$COMPILER" ] || COMPILER="$ROOT/_build/ouro1"
-if [ ! -x "$COMPILER" ]; then
-	sh "$ROOT/scripts/bootstrap.sh"
-	C_BUILD_DIR="${OURO_C_BUILD_DIR:-$C_BUILD_DIR}"
-	COMPILER="${OURO1_COMPILER:-$C_BUILD_DIR/ouro1}"
+prepared_lint=0
+prepared_check=0
+if [ "$cmd" = check ] && [ "${OURO_PREPARED_COLLECTOR+x}" = x ]; then
+	prepared_check=1
+	# A missing prepared tool is an infrastructure failure, including in negative tests.
+	if [ -z "${OURO1_COMPILER:-}" ] || [ ! -f "$COMPILER" ] || [ ! -x "$COMPILER" ]; then
+		echo "CHECK_FAIL: prepared compiler unavailable: $COMPILER" >&2
+		exit 125
+	fi
+elif [ "$cmd" = lint ] && [ "${OURO_CI_PREPARED_LINT:-}" = 1 ]; then
+	prepared_lint=1
+else
 	[ -x "$COMPILER" ] || COMPILER="$ROOT/_build/ouro1"
+	if [ ! -x "$COMPILER" ]; then
+		sh "$ROOT/scripts/bootstrap.sh"
+		C_BUILD_DIR="${OURO_C_BUILD_DIR:-$C_BUILD_DIR}"
+		COMPILER="${OURO1_COMPILER:-$C_BUILD_DIR/ouro1}"
+		[ -x "$COMPILER" ] || COMPILER="$ROOT/_build/ouro1"
+	fi
 fi
-# gcc -o ouro1 writes ouro1.exe. Prefer that PE so Git Bash does not exec an
-# unsuffixed image (exit 127 after a long check).
+# Git Bash can match a suffixless path in file tests. Use the actual .exe
+# filename when invoking the Windows compiler.
 if [ -z "${OURO1_COMPILER:-}" ] && [ -x "${COMPILER}.exe" ]; then
 	COMPILER="${COMPILER}.exe"
 elif [ -z "${OURO1_COMPILER:-}" ] && [ -x "$C_BUILD_DIR/ouro1.exe" ]; then
 	COMPILER="$C_BUILD_DIR/ouro1.exe"
 fi
+if [ "$prepared_lint" -eq 1 ] && [ ! -x "$COMPILER" ]; then
+	echo "LINT_FAIL: prepared compiler unavailable: $COMPILER" >&2
+	exit 1
+fi
 
 ensure_collect() {
+	if [ "$prepared_check" -eq 1 ]; then
+		COLLECT=$OURO_PREPARED_COLLECTOR
+		if [ ! -f "$COLLECT" ] || [ ! -x "$COLLECT" ]; then
+			echo "CHECK_FAIL: prepared collector unavailable: $COLLECT" >&2
+			return 125
+		fi
+		return 0
+	fi
 	COLLECT="$C_BUILD_DIR/ouro-collect"
 	# Windows gcc -o ouro-collect writes ouro-collect.exe and can leave a
 	# host-shim script in the un-suffixed name. ouro1 check/collect must
@@ -290,8 +310,14 @@ case "$cmd" in
 		fi
 		body=${print:-$expr}
 		dir=$(dirname "$file")
-		wrap="$dir/.ouro_eval_wrap_$$.ouro"
-		trap 'rm -f "$wrap"' EXIT
+		mkdir -p "$ROOT/_build/eval"
+		eval_dir=$(mktemp -d "$ROOT/_build/eval/eval.XXXXXX")
+		wrap="$dir/.ouro_eval_wrap_${eval_dir##*.}.ouro"
+		emitted="$eval_dir/wrapped.c"
+		exe="$eval_dir/wrapped.exe"
+		frontend_err="$eval_dir/frontend.err"
+		cc_log="$eval_dir/cc.log"
+		trap 'rm -f "$wrap" "$emitted" "$exe" "$frontend_err" "$cc_log"; rmdir "$eval_dir"' EXIT
 		{
 			cat "$file"
 			printf '\n\ndef __ouro_eval : %s := %s;\n' "$eval_type" "$body"
@@ -309,16 +335,13 @@ case "$cmd" in
 		done <<EOF
 $units
 EOF
-		mkdir -p "$ROOT/_build/eval"
-		emitted="$ROOT/_build/eval/wrapped.c"
-		exe="$ROOT/_build/eval/wrapped.exe"
 		set +e
-		OURO_EMIT_IO_SHIMS=1 "$COMPILER" "$wrap" "$fuel" "$@" >"$emitted" 2>"$ROOT/_build/eval/frontend.err"
+		OURO_EMIT_IO_SHIMS=1 "$COMPILER" "$wrap" "$fuel" "$@" >"$emitted" 2>"$frontend_err"
 		st=$?
 		set -e
 		if [ "$st" -ne 0 ]; then
 			echo "EVAL_FAIL $file: front end rejected the input" >&2
-			cat "$ROOT/_build/eval/frontend.err" >&2 || true
+			cat "$frontend_err" >&2 || true
 			echo "EVAL_BACKEND: lexer=ouro parser=ouro elab=ouro normalize=kernel-not-invoked runtime=c" >&2
 			exit 1
 		fi
@@ -328,12 +351,12 @@ EOF
 		"$CC_BIN" -O1 -std=c99 -Werror=implicit-function-declaration \
 			-I "$ROOT/runtime" -o "$exe" "$emitted" \
 			"$ROOT/runtime/ouro_rt.c" "$ROOT/runtime/ouro_io.c" "$ROOT/runtime/ouro_eval_main.c" \
-			>"$ROOT/_build/eval/cc.log" 2>&1
+			>"$cc_log" 2>&1
 		st=$?
 		set -e
 		if [ "$st" -ne 0 ]; then
 			echo "EVAL_FAIL $file: emitted C rejected by $CC_BIN" >&2
-			cat "$ROOT/_build/eval/cc.log" >&2 || true
+			cat "$cc_log" >&2 || true
 			exit 1
 		fi
 		set +e
@@ -466,8 +489,8 @@ EOF
 			esac
 		done
 		[ -n "$fuel" ] || fuel="${OURO1_CHECK_FUEL:-16000}"
-		# The wrapper already cd'd to ROOT. Relative FILE belongs to the
-		# caller (pkg verify typechecks `_ouro_pkgs/...` in a temp project).
+		# Resolve relative input paths from the caller's directory. For example,
+		# pkg verify passes files from its project outside the toolchain root.
 		case "$file" in
 			/*) ;;
 			[A-Za-z]:*) ;;
@@ -477,11 +500,9 @@ EOF
 			printf '%s\n' "CHECK_FAIL: missing $file" >&2
 			exit 1
 		fi
-		# collect emits repo-relative --unit paths. compile_units
-		# match-fails (ouro_rt tag=-1) if the root file is still an
-		# absolute path under ROOT while those units are relative.
-		# Windows PE tools pass I:/... (Git Bash converts PWD); map that
-		# to the MSYS path so the ROOT prefix strip can fire.
+		# compile_units matches the input against the collector's repository-
+		# relative unit paths. Convert Windows drive paths to MSYS form before
+		# stripping the repository root.
 		if command -v cygpath >/dev/null 2>&1; then
 			case "$file" in
 				[A-Za-z]:*) file=$(cygpath -u "$file") ;;
@@ -679,7 +700,7 @@ EOF
 		shift
 		BIN="$C_BUILD_DIR/ouro-lint"
 		lint_stub=0
-		if [ -f "$BIN" ] && [ "$(wc -c <"$BIN")" -lt 4096 ]; then
+		if [ "$prepared_lint" -eq 0 ] && [ -f "$BIN" ] && [ "$(wc -c <"$BIN")" -lt 4096 ]; then
 			case "$(head -n 1 "$BIN" 2>/dev/null)" in
 			'#!'*) lint_stub=1 ;;
 			esac
@@ -704,7 +725,10 @@ EOF
 			fi
 			# Check the complete content receipt, including every companion.
 			# Successful preparation must preserve lint's quiet-success protocol.
-			if ! "$PYTHON" "$ROOT/scripts/native_tool_build.py" tools/lint.ouro "$BIN" \
+			if [ "$prepared_lint" -eq 1 ]; then
+				"$PYTHON" "$ROOT/scripts/native_tool_build.py" tools/lint.ouro "$BIN" \
+					--compiler "$COMPILER" --verify-published >/dev/null
+			elif ! "$PYTHON" "$ROOT/scripts/native_tool_build.py" tools/lint.ouro "$BIN" \
 				--compiler "$COMPILER" --check >/dev/null 2>&1; then
 				mkdir -p "$C_BUILD_DIR"
 				if ! OURO_BUILD_TOOL_MODE=native \
@@ -789,8 +813,6 @@ EOF
 		exit "$st"
 		;;
 	fmt)
-		# The formatter is an Ouro program, so it has to be built once; rebuild
-		# when its own sources moved ahead of the binary.
 		shift
 		BIN="$C_BUILD_DIR/ouro-fmt"
 		if [ ! -x "$BIN" ] || [ -n "$(find "$ROOT/tools/fmt.ouro" "$ROOT/tools/fmt_pipeline.ouro" \
@@ -804,27 +826,23 @@ EOF
 		exec "$BIN" "$@"
 		;;
 	fix)
-		# Autofixer, same build-on-demand rule as fmt.
 		shift
 		BIN="$C_BUILD_DIR/ouro-fix"
 		sh "$ROOT/scripts/build_tool.sh" tools/fix/main.ouro "$BIN" >&2
 		exec "$BIN" "$@"
 		;;
 	doc)
-		# Reference generator, same build-on-demand rule as fmt.
 		shift
 		BIN="$C_BUILD_DIR/ouro-doc"
-		if [ ! -x "$BIN" ] || [ -n "$(find "$ROOT/tools/doc.ouro" "$ROOT/tools/doc_model.ouro" -newer "$BIN" \
+		if [ ! -x "$BIN" ] || [ -n "$(find "$ROOT/tools/doc.ouro" "$ROOT/tools/doc" -newer "$BIN" \
 			-print -quit 2>/dev/null)" ]; then
 			sh "$ROOT/scripts/build_tool.sh" tools/doc.ouro "$BIN" >&2
 		fi
 		exec "$BIN" "$@"
 		;;
 	pkg)
-		# Package manager, same build-on-demand rule as fmt. It runs in the
-		# caller's directory, not the checkout: a manifest is a project's
-		# file. OURO_ROOT (exported above) is how `pkg verify` finds this
-		# script again for its typechecks.
+		# Resolve package manifests from the caller's directory. When no checker
+		# is configured, pkg verify uses this wrapper to check installed modules.
 		shift
 		if [ -z "${OURO_PKG_CHECK:-}" ] && [ -z "${OURO_TEST_CHECK:-}" ]; then
 			OURO_PKG_CHECK="$ROOT/scripts/ouro1.sh"
@@ -839,8 +857,8 @@ EOF
 		exec "$BIN" "$@"
 		;;
 	test)
-		# User-level test runner. Its discovery still stays in shell;
-		# the Ouro program checks and runs explicit files.
+		# The hosted wrapper expands ordinary path arguments. The Ouro runner
+		# handles test execution, manifests, and native suite selection.
 		shift
 		if [ -z "${OURO_TEST_CHECK:-}" ]; then
 			OURO_TEST_CHECK="$ROOT/scripts/ouro1.sh"
@@ -889,12 +907,10 @@ EOF
 		exec "$BIN" "$@"
 		;;
 	lsp)
-		# Language server on stdio, for editors. Same build-on-demand rule as
-		# fmt. It stays in the caller's directory so relative paths a client
-		# sends resolve the way the client meant them.
+		# Resolve the language client's relative paths from the caller's directory.
 		shift
 		BIN="$C_BUILD_DIR/ouro-lsp"
-		if [ ! -x "$BIN" ] || [ -n "$(find "$ROOT/tools/lsp.ouro" "$ROOT/tools/lsp_model.ouro" "$ROOT/tools/lsp_text_encoding.ouro" "$ROOT/tools/doc.ouro" "$ROOT/tools/doc_model.ouro" \
+		if [ ! -x "$BIN" ] || [ -n "$(find "$ROOT/tools/lsp.ouro" "$ROOT/tools/lsp_model.ouro" "$ROOT/tools/lsp_text_encoding.ouro" "$ROOT/tools/doc.ouro" "$ROOT/tools/doc/model.ouro" \
 			-newer "$BIN" -print -quit 2>/dev/null)" ]; then
 			sh "$ROOT/scripts/build_tool.sh" tools/lsp.ouro "$BIN" >&2
 		fi

@@ -66,7 +66,9 @@ def build_frontend(scratch, compiler):
         args.extend(["--unit", unit])
     with (work / "fc.c").open("w", encoding="utf-8", newline="\n") as output:
         subprocess.run(args, cwd=ROOT, stdout=output, check=True)
-    fe.run_pack([(tag, work / filename) for tag, _suffix, _entry, filename in fe.FRONTEND_TUS], driver)
+    pipeline_units = fe.collect_units("compiler/pipeline.ouro")
+    fe.run_pack([(tag, work / filename) for tag, _suffix, _entry, filename in fe.FRONTEND_TUS], driver,
+                parser_min_ordinal=pipeline_units.index(fe.packer.PARSER_UNIT_OWNER))
     build_cfg = sl.OB.load_config(argparse.Namespace(build_dir=str(scratch / "build"),
         c_build_dir=str(scratch / "c"), cache_dir=str(scratch / "cache"),
         cache_enabled=False, ccache="disabled", jobs=1))

@@ -1,0 +1,124 @@
+import "analyze/precision/assertions.ouro", "../tools/analyze/native_request.ouro";
+
+def native_request_fixture (words : List String) (scopes : List String) (flags : List String)
+    (canonical : List String) : Bool :=
+    match native_analyze_parse words with
+    | Left _ => False
+    | Right request => andb(precision_strings (native_analyze_request_scopes request) scopes,
+        andb(precision_strings (native_analyze_request_flags request) flags,
+          precision_strings (native_analyze_request_words request) canonical))
+    end;
+
+def native_request_fixture_refused (words : List String) : Bool :=
+    match native_analyze_parse words with | Left _ => True | Right _ => False end;
+
+def native_request_fixture_scope_limits : Bool :=
+    let global_text : String :=
+      (fix grow (steps : Nat) (text : String) : String :=
+        match steps with
+        | Z => text
+        | S left => grow left (str_concat text text)
+        end) 16 "a" in
+    let within_drive : String := str_slice global_text 0 (mul 40 (mul 32 32)) in
+    let oversized : NativeAnalyzeSource :=
+      MkNativeAnalyzeSource "std/oversized.ouro" "oversized" (str_concat global_text "b") in
+    match native_analyze_scope_guard ["--enable-heavy", "--enable-dataflow"] [oversized] with
+    | Right _ => False
+    | Left global_error => andb(str_eq (native_analyze_input_message global_error)
+        "global analyzer flags require a bounded scope (limit-files=8 limit-bytes=65536 files=1 bytes=65537)",
+        match native_analyze_scope_guard ["--enable-dataflow"]
+          [MkNativeAnalyzeSource "std/within.ouro" "within" within_drive, oversized] with
+        | Right _ => False
+        | Left drive_error => str_eq (native_analyze_input_message drive_error)
+            "structured analyzer file exceeds the local safety limit (limit-bytes=40960 file=std/oversized.ouro bytes=65537)"
+        end)
+    end;
+
+def native_request_fixture_batch_sources : Bool :=
+    let standard : NativeAnalyzeSource := MkNativeAnalyzeSource "std/a.ouro" "a" "def a : Nat := 1;\n" in
+    let ordinary : NativeAnalyzeSource := MkNativeAnalyzeSource "tools/b.ouro" "b" "def b : Nat := 1;\n" in
+    let annotated : NativeAnalyzeSource :=
+      MkNativeAnalyzeSource "tools/c.ouro" "c" "-- \r\n  ouro-lint:disable=OURO-FMT001\n" in
+    all Bool (fun (check : Bool) => check)
+      [ native_analyze_should_batch_sources [] [standard]
+      , notb(native_analyze_should_batch_sources [] [ordinary, annotated])
+      , notb(native_analyze_should_batch_sources [] [standard, annotated])
+      , notb(native_analyze_should_batch_sources ["--local-only"] [standard])
+      , notb(native_analyze_should_batch_sources ["--enable-heavy"] [standard])
+      , native_analyze_should_batch_sources [] (replicate NativeAnalyzeSource ordinary 9)
+      ];
+
+def native_analyze_request_laws : List (Pair String Bool) :=
+  [ MkPair String Bool "native-request/scope/equal-form-and-repetition"
+      (native_request_fixture ["--scope=tools/a.ouro", "--scope", "samples/雪.ouro"]
+        ["tools/a.ouro", "samples/雪.ouro"] [] ["--scope", "tools/a.ouro", "--scope", "samples/雪.ouro"])
+  , MkPair String Bool "native-request/scope/positional-form"
+      (native_request_fixture ["--strict", "tools/a.ouro"] ["tools/a.ouro"] ["--strict"]
+        ["--strict", "tools/a.ouro"])
+  , MkPair String Bool "native-request/scope/end-of-options-is-literal"
+      (native_request_fixture ["--", "--enable-style", "--scope=x.ouro"]
+        ["--enable-style", "--scope=x.ouro"] [] ["--scope", "--enable-style", "--scope", "--scope=x.ouro"])
+  , MkPair String Bool "native-request/scope/empty-equal-refused"
+      (native_request_fixture_refused ["--scope="])
+  , MkPair String Bool "native-request/scope/missing-value-refused"
+      (native_request_fixture_refused ["--scope"])
+  , MkPair String Bool "native-request/options/unknown-refused"
+      (native_request_fixture_refused ["--enable-unknown"])
+  , MkPair String Bool "native-request/baseline/equal-form"
+      (native_request_fixture ["--api-baseline=space 雪.tsv", "--scope=a.ouro"] ["a.ouro"]
+        ["--api-baseline", "space 雪.tsv"] ["--api-baseline", "space 雪.tsv", "--scope", "a.ouro"])
+  , MkPair String Bool "native-request/baseline/last-value-matches-raw-owner"
+      (match native_analyze_parse ["--api-baseline", "first.tsv", "--api-baseline=last.tsv"] with
+       | Left _ => False
+       | Right request => match native_analyze_request_baseline request with
+         | Nothing => False
+         | Just path => str_eq path "last.tsv"
+         end
+       end)
+  , MkPair String Bool "native-request/baseline/value-does-not-request-structured-work"
+      (notb(native_analyze_needs_drive ["--api-baseline", "--enable-dataflow"]))
+  , MkPair String Bool "native-request/baseline/value-does-not-request-global-work"
+      (notb(native_analyze_global_requested ["--api-baseline", "--enable-heavy"]))
+  , MkPair String Bool "native-request/baseline/value-does-not-select-strict-profile"
+      (notb(native_analyze_flag_present "--strict" ["--api-baseline", "--strict"]))
+  , MkPair String Bool "native-request/local-only/accepted"
+      (native_request_fixture ["--local-only", "--scope=a.ouro"] ["a.ouro"] ["--local-only"]
+        ["--local-only", "--scope", "a.ouro"])
+  , MkPair String Bool "native-request/local-only/keeps-direct-mode"
+      (notb(native_analyze_should_batch ["--local-only"] [NativeAnalyzeSourceFactsOf "std/io.ouro" 1 False]))
+  , MkPair String Bool "native-request/sources/path-order-and-stable-ties"
+      (let ordered : List NativeAnalyzeSource := native_analyze_order_sources
+          [ MkNativeAnalyzeSource "tools/z.ouro" "z" "last"
+          , MkNativeAnalyzeSource "std/雪.ouro" "snow" "unicode"
+          , MkNativeAnalyzeSource "std/a.ouro" "a-new" "first tie"
+          , MkNativeAnalyzeSource "std/a.ouro" "a-old" "second tie"
+          ] in
+        andb(precision_strings (map NativeAnalyzeSource String native_analyze_source_rel ordered)
+          ["std/a.ouro", "std/a.ouro", "std/雪.ouro", "tools/z.ouro"],
+          precision_strings (map NativeAnalyzeSource String native_analyze_source_text ordered)
+            ["first tie", "second tie", "unicode", "last"]))
+  , MkPair String Bool "native-request/style/equal-scope-value-is-literal"
+      (native_request_fixture ["--scope=--enable-style"] ["--enable-style"] [] ["--scope", "--enable-style"])
+  , MkPair String Bool "native-request/style/equal-baseline-value-is-literal"
+      (native_request_fixture ["--api-baseline=--enable-style"] [] ["--api-baseline", "--enable-style"]
+        ["--api-baseline", "--enable-style"])
+  , MkPair String Bool "native-request/suppression/comment-marker-disables-batch"
+      (native_analyze_has_suppression "\n  -- ouro-lint:disable=OURO-FMT001\n")
+  , MkPair String Bool "native-request/suppression/quoted-marker-is-data"
+      (notb(native_analyze_has_suppression "def text : String := \"-- ouro-lint:disable=OURO-FMT001\";\n"))
+  , MkPair String Bool "native-request/suppression/unicode-space-matches-host-regex"
+      (native_analyze_has_suppression "　-- ouro-lint:allow=OURO-FMT001\n")
+  , MkPair String Bool "native-request/suppression/whitespace-crosses-line-break-as-host-regex"
+      (native_analyze_has_suppression "\n \t-- \r\n  ouro-lint:disable=OURO-FMT001\n")
+  , MkPair String Bool "native-request/suppression/inline-marker-does-not-hide-later-comment"
+      (native_analyze_has_suppression "def x : Nat := 0; -- ouro-lint:ignore\n-- prose\n-- ouro-lint:disable=OURO-FMT001\n")
+  , MkPair String Bool "native-request/suppression/inline-marker-alone-is-ignored"
+      (notb(native_analyze_has_suppression "def x : Nat := 0; -- ouro-lint:ignore\n-- prose\n"))
+  , MkPair String Bool "native-request/scope/byte-limits-and-global-error-precedence"
+      native_request_fixture_scope_limits
+  , MkPair String Bool "native-request/scope/batch-selection-preserves-direct-mode-and-suppressions"
+      native_request_fixture_batch_sources
+  ];
+
+-- @entry main
+def main : IO Unit := precision_run "native-analyze-request" native_analyze_request_laws;

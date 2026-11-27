@@ -1,7 +1,5 @@
 #!/usr/bin/env sh
-# coil is the project-facing toolchain name. It maps verbs onto the existing
-# ouro1 multiplexer and package tool. It does not replace bootstrap or kernel
-# replay.
+# The project CLI uses ouro1.sh for compiler, tool, and package commands.
 
 set -eu
 ROOT="${OURO_ROOT:-}"

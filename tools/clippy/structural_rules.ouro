@@ -3,6 +3,8 @@
 
 import "structural_frontend.ouro",
   "../../compiler/source_spans.ouro",
+  "../../std/listx.ouro",
+  "../../std/natx.ouro",
   "../../std/string_prims.ouro",
   "../../compiler/pipeline_abi.ouro";
 
@@ -11,41 +13,120 @@ import "structural_frontend.ouro",
 inductive CgSProof : Type :=
   | MkCgSProof : String -> String -> Nat -> Maybe (Pair Nat Nat) -> String -> CgSProof;
 
-def cg_s_node_range (spans : Maybe TokenSpans) (table : List (Pair Nat (Pair Nat Nat))) (node : Nat)
-    : Maybe (Pair Nat Nat) :=
+private def CgSTokenMark : Type := Pair (List Nat) (List Nat);
+
+-- A node's ordinal within its subtree is the number of marks in its left subtree.
+private inductive CgSTokenIndex : Type :=
+  | CgSTokensEmpty : CgSTokenIndex
+  | CgSTokenNode : Nat -> CgSTokenMark -> CgSTokenIndex -> CgSTokenIndex -> CgSTokenIndex;
+
+private inductive CgSSourceSpansData : Type :=
+  | CgSSourceSpansOf : Nat -> CgSTokenIndex -> CgSSourceSpansData;
+
+def CgSSourceSpans : Type := CgSSourceSpansData;
+
+-- Carry the unconsumed suffix so building the index reads each mark once.
+private def cg_s_take_token_index : Nat -> Nat -> List CgSTokenMark
+    -> Pair CgSTokenIndex (List CgSTokenMark) :=
+  fix go (fuel : Nat) (count : Nat) (marks : List CgSTokenMark)
+      : Pair CgSTokenIndex (List CgSTokenMark) :=
+    match fuel with
+    | Z => MkPair CgSTokenIndex (List CgSTokenMark) CgSTokensEmpty marks
+    | S remaining => match count with
+      | Z => MkPair CgSTokenIndex (List CgSTokenMark) CgSTokensEmpty marks
+      | S children =>
+          let left_count : Nat := div_nat children 2 in
+          let (MkPair left rest) := go remaining left_count marks in
+          match rest with
+          | Nil => MkPair CgSTokenIndex (List CgSTokenMark) left rest
+          | Cons mark more =>
+              let (MkPair right tail) := go remaining (sub children left_count) more in
+              MkPair CgSTokenIndex (List CgSTokenMark)
+                (CgSTokenNode left_count mark left right) tail
+          end
+      end
+    end;
+
+def cg_s_index_spans (spans : Maybe TokenSpans) : Maybe CgSSourceSpans :=
     match spans with
+    | Nothing => Nothing CgSSourceSpans
+    | Just value => let (MkTokenSpans total marks) := value in
+      let count : Nat := length CgSTokenMark marks in
+      let (MkPair index _) := cg_s_take_token_index (S count) count marks in
+      Just CgSSourceSpans (CgSSourceSpansOf total index)
+    end;
+
+private def cg_s_token_mark : CgSTokenIndex -> Nat -> Maybe CgSTokenMark :=
+  fix go (tokens : CgSTokenIndex) (ordinal : Nat) : Maybe CgSTokenMark :=
+    match tokens with
+    | CgSTokensEmpty => Nothing CgSTokenMark
+    | CgSTokenNode left_count mark left right => match compareNat(ordinal, left_count) with
+      | LT => go left ordinal
+      | EQ => Just CgSTokenMark mark
+      | GT => go right (sub ordinal (S left_count))
+      end
+    end;
+
+private def cg_s_token_range (spans : CgSSourceSpans) (first : Nat) (past : Nat)
+    : Maybe (Pair Nat Nat) :=
+    let (CgSSourceSpansOf total index) := spans in
+    if ltb_nat first past then
+      match cg_s_token_mark index first with
+      | Nothing => Nothing (Pair Nat Nat)
+      | Just opening =>
+          match cg_s_token_mark index (sub past 1) with
+          | Nothing => Nothing (Pair Nat Nat)
+          | Just closing => let (MkPair start _) := opening in
+            let (MkPair _ stop) := closing in
+            Just (Pair Nat Nat) (MkPair Nat Nat
+              (sub total (length Nat start)) (sub total (length Nat stop)))
+          end
+      end
+    else Nothing (Pair Nat Nat);
+
+-- Rewritten source has no exact token map. Cache that result within the root.
+inductive CgSSpanCache : Type :=
+  | CgSSpansPending : CgSSpanCache
+  | CgSSpansReady : Maybe CgSSourceSpans -> CgSSpanCache;
+
+def cg_s_root_span_map (source : String) (cache : CgSSpanCache) : Maybe CgSSourceSpans :=
+    match cache with
+    | CgSSpansPending => cg_s_index_spans (cg_s_source_spans source)
+    | CgSSpansReady spans => spans
+    end;
+
+private def cg_s_node_range (spans : CgSSourceSpans) (table : List (Pair Nat (Pair Nat Nat))) (node : Nat)
+    : Maybe (Pair Nat Nat) :=
+    match lookup Nat (Pair Nat Nat) eq_nat node table with
     | Nothing => Nothing (Pair Nat Nat)
-    | Just tokens =>
-        match lookup Nat (Pair Nat Nat) eq_nat node table with
-        | Nothing => Nothing (Pair Nat Nat)
-        | Just range => match range with | MkPair first past => token_span_bytes tokens first past end
-        end
+    | Just range => let (MkPair first past) := range in cg_s_token_range spans first past
     end;
 
 -- Fill each proof's byte range from the innermost token span recorded for its
 -- node during the traversal that produced it.
-def cg_s_locate (spans : Maybe TokenSpans) (table : List (Pair Nat (Pair Nat Nat)))
+def cg_s_locate (spans : Maybe CgSSourceSpans) (table : List (Pair Nat (Pair Nat Nat)))
     (proofs : List CgSProof) : List CgSProof :=
-    map CgSProof CgSProof (fun (proof : CgSProof) => match proof with
-      | MkCgSProof code owner node range evidence => match range with
+    match spans with
+    | Nothing => proofs
+    | Just tokens => map CgSProof CgSProof (fun (proof : CgSProof) =>
+        let (MkCgSProof code owner node range evidence) := proof in
+        match range with
         | Just _ => proof
-        | Nothing => MkCgSProof code owner node (cg_s_node_range spans table node) evidence
-        end
-      end) proofs;
+        | Nothing => MkCgSProof code owner node (cg_s_node_range tokens table node) evidence
+        end) proofs
+    end;
 
 def cg_s_rule (fact : CgSFact) : Maybe String :=
     match fact with
-    | CgSLet _ _ _ _ annotated returned => match andb(notb annotated, returned) with
-      | True => Just String "OURO-CLIPPY-REDUNDANT-001"
-      | False => Nothing String
-      end
-    | CgSMatch _ _ _ _ atom certified => match certified with
-      | False => Nothing String
-      | True => match atom with
+    | CgSLet _ _ _ _ annotated returned => if andb(notb annotated, returned) then
+        Just String "OURO-CLIPPY-REDUNDANT-001"
+      else Nothing String
+    | CgSMatch _ _ _ _ atom certified => if certified then
+        match atom with
         | Nothing => Nothing String
         | Just _ => Just String "OURO-CLIPPY-REDUNDANT-004"
         end
-      end
+      else Nothing String
     end;
 
 def cg_s_owner (fact : CgSFact) : Nat :=
@@ -55,24 +136,34 @@ def cg_s_owner (fact : CgSFact) : Nat :=
     end;
 
 def cg_s_names (intern : InternState) : List (Pair Nat String) :=
-    match intern with
-    | MkIntern ids _ _ _ =>
-        map (Pair(List Nat, Nat)) (Pair Nat String)
-          (fun (p : Pair (List Nat) Nat) => match p with
-            | MkPair bytes id => MkPair Nat String id (prim_string_of_char_codes bytes)
-            end) ids
-    end;
+    let (MkIntern ids _ _ _) := intern in
+    map (Pair(List Nat, Nat)) (Pair Nat String)
+      (fun (p : Pair (List Nat) Nat) => let (MkPair bytes id) := p in
+        MkPair Nat String id (prim_string_of_char_codes bytes)) ids;
+
+private def cg_s_missing_name (id : Nat) : Either QualityInputError String :=
+    Left QualityInputError String (QualityInvalidInput (prim_string_concat
+      "missing compiler-interned name in structural evidence: " (prim_string_of_nat id)));
 
 def cg_s_name (names : List (Pair Nat String)) (id : Nat) : Either QualityInputError String :=
     match lookup Nat String eq_nat id names with
-    | Nothing => Left QualityInputError String (QualityInvalidInput (prim_string_concat
-        "missing compiler-interned name in structural evidence: " (prim_string_of_nat id)))
+    | Nothing => cg_s_missing_name id
     | Just name => Right QualityInputError String name
     end;
 
-def cg_s_atom_text (names : List (Pair Nat String)) (atom : CgSAtom) : Either QualityInputError String :=
+private def cg_s_intern_name (intern : InternState) (id : Nat) : Either QualityInputError String :=
+    let (MkIntern ids _ _ _) := intern in
+    match find (Pair (List Nat) Nat) (fun (entry : Pair (List Nat) Nat) =>
+      let (MkPair _ key) := entry in eq_nat id key) ids with
+    | Nothing => cg_s_missing_name id
+    | Just entry => let (MkPair bytes _) := entry in
+        Right QualityInputError String (prim_string_of_char_codes bytes)
+    end;
+
+private def cg_s_atom_text_using (resolve : Nat -> Either QualityInputError String)
+    (atom : CgSAtom) : Either QualityInputError String :=
     match atom with
-    | CgSLocal name identity => match cg_s_name names name with
+    | CgSLocal name identity => match resolve name with
       | Left error => Left QualityInputError String error
       | Right text => Right QualityInputError String (prim_string_concat "local `"
           (prim_string_concat text
@@ -83,9 +174,9 @@ def cg_s_atom_text (names : List (Pair Nat String)) (atom : CgSAtom) : Either Qu
     | CgSString id => Right QualityInputError String (prim_string_concat "decoded string literal #"
         (prim_string_concat (prim_string_of_nat id)
           " (exact bytes, within this compiler unit)"))
-    | CgSConstructor enum_id ctor => match cg_s_name names enum_id with
+    | CgSConstructor enum_id ctor => match resolve enum_id with
       | Left error => Left QualityInputError String error
-      | Right type_name => match cg_s_name names ctor with
+      | Right type_name => match resolve ctor with
         | Left error => Left QualityInputError String error
         | Right ctor_name => Right QualityInputError String
             (prim_string_concat "constructor `"
@@ -95,9 +186,10 @@ def cg_s_atom_text (names : List (Pair Nat String)) (atom : CgSAtom) : Either Qu
       end
     end;
 
-def cg_s_evidence (names : List (Pair Nat String)) (fact : CgSFact) : Either QualityInputError String :=
+private def cg_s_evidence_using (resolve : Nat -> Either QualityInputError String)
+    (fact : CgSFact) : Either QualityInputError String :=
     match fact with
-    | CgSLet _ _ name identity _ _ => match cg_s_name names name with
+    | CgSLet _ _ name identity _ _ => match resolve name with
       | Left error => Left QualityInputError String error
       | Right text => Right QualityInputError String (prim_string_concat "unannotated local `"
           (prim_string_concat text
@@ -105,11 +197,11 @@ def cg_s_evidence (names : List (Pair Nat String)) (fact : CgSFact) : Either Qua
               (prim_string_concat (prim_string_of_nat identity)
                 "; the initializer is not evaluated again and no intervening expression exists"))))
       end
-    | CgSMatch _ _ enum_id count atom _ => match cg_s_name names enum_id with
+    | CgSMatch _ _ enum_id count atom _ => match resolve enum_id with
       | Left error => Left QualityInputError String error
       | Right type_name => match atom with
         | Nothing => Left QualityInputError String (QualityInvalidInput "uniform-match evidence has no proven expression")
-        | Just value => match cg_s_atom_text names value with
+        | Just value => match cg_s_atom_text_using resolve value with
           | Left error => Left QualityInputError String error
           | Right text => Right QualityInputError String
               (prim_string_concat "all " (prim_string_concat (prim_string_of_nat count)
@@ -123,24 +215,31 @@ def cg_s_evidence (names : List (Pair Nat String)) (fact : CgSFact) : Either Qua
       end
     end;
 
-def cg_s_proofs (unit : CgSUnit) : Either QualityInputError (List CgSProof) :=
-    match unit with
-    | MkCgSUnit intern _ state spans =>
-        let names : List (Pair Nat String) := cg_s_names intern in
-        (fix go (facts : List CgSFact) (rev : List CgSProof) : Either QualityInputError (List CgSProof) :=
-          match facts with
-          | Nil => Right QualityInputError (List CgSProof)
-              (cg_s_locate(spans, cg_s_spans state, reverse_lin CgSProof rev))
-          | Cons fact rest => match cg_s_rule fact with
-            | Nothing => go rest rev
-            | Just code => match cg_s_name(names, cg_s_owner fact) with
-              | Left error => Left QualityInputError (List CgSProof) error
-              | Right owner => match cg_s_evidence names fact with
-                | Left error => Left QualityInputError (List CgSProof) error
-                | Right evidence => go rest (Cons CgSProof
-                    (MkCgSProof code owner (cg_s_node fact) (Nothing (Pair Nat Nat)) evidence) rev)
-                end
-              end
+def cg_s_evidence (names : List (Pair Nat String)) (fact : CgSFact) : Either QualityInputError String :=
+    cg_s_evidence_using (cg_s_name names) fact;
+
+def cg_s_proofs_with_spans (intern : InternState) (state : CgSState)
+    (source_spans : Unit -> Maybe CgSSourceSpans) : Either QualityInputError (List CgSProof) :=
+    let resolve : Nat -> Either QualityInputError String := cg_s_intern_name intern in
+    (fix go (facts : List CgSFact) (rev : List CgSProof) : Either QualityInputError (List CgSProof) :=
+      match facts with
+      | Nil => Right QualityInputError (List CgSProof) (match rev with
+        | Nil => Nil CgSProof
+        | Cons _ _ => cg_s_locate(source_spans MkUnit, cg_s_spans state, reverse_lin CgSProof rev)
+        end)
+      | Cons fact rest => match cg_s_rule fact with
+        | Nothing => go rest rev
+        | Just code => match resolve (cg_s_owner fact) with
+          | Left error => Left QualityInputError (List CgSProof) error
+          | Right owner => match cg_s_evidence_using resolve fact with
+            | Left error => Left QualityInputError (List CgSProof) error
+            | Right evidence => go rest (Cons CgSProof
+                (MkCgSProof code owner (cg_s_node fact) (Nothing (Pair Nat Nat)) evidence) rev)
             end
-          end) (cg_s_facts state) (Nil CgSProof)
-    end;
+          end
+        end
+      end) (cg_s_facts state) (Nil CgSProof);
+
+def cg_s_proofs (unit : CgSUnit) : Either QualityInputError (List CgSProof) :=
+    let (MkCgSUnit intern _ state spans) := unit in
+    cg_s_proofs_with_spans intern state (fun (_ : Unit) => cg_s_index_spans spans);

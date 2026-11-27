@@ -58,7 +58,25 @@ def checked_output_name (state : InternState) (ident : Nat) : CompResult (List N
       literal_map(List Nat, List Nat, checked_output_numbers, literal_lookup names ident)
     end;
 
-def checked_output_term (state : InternState) : Nat -> CoreTerm -> CompResult (List Nat) :=
+-- Every indexed declaration or constructor emits its name. Keep failures as values
+-- so the output traversal still determines which error is reported first.
+def checked_output_name_resolver (state : InternState) (entries : List Entry)
+    : Nat -> CompResult (List Nat) :=
+    match check_environment_from_entries entries with | MkCheckEnvironment _ tree =>
+      (fix prepare (names : EntryIndex) : Nat -> CompResult (List Nat) :=
+        match names with
+        | EntryIndexEmpty => checked_output_name state
+        | EntryIndexNode _ key _ left right =>
+            let rendered : CompResult (List Nat) := checked_output_name state key in
+            let smaller : Nat -> CompResult (List Nat) := prepare left in
+            let greater : Nat -> CompResult (List Nat) := prepare right in
+            fun (ident : Nat) => match compareNat ident key with
+              | LT => smaller ident | EQ => rendered | GT => greater ident end
+        end) tree
+    end;
+
+def checked_output_term_using (resolve : Nat -> CompResult (List Nat))
+    : Nat -> CoreTerm -> CompResult (List Nat) :=
   fix emit (fuel : Nat) (term : CoreTerm) : CompResult (List Nat) :=
     match fuel with
     | Z => CErr(List Nat, ErrCode 44 0)
@@ -74,14 +92,14 @@ def checked_output_term (state : InternState) : Nat -> CoreTerm -> CompResult (L
         | CApp function argument => checked_output_tag(4, [child function, child argument] : List (CompResult (List Nat)))
         | CLetIn value annotation body => checked_output_tag 5
             ([child value, child annotation, child body] : List (CompResult (List Nat)))
-        | CConst name => checked_output_tag(6, [checked_output_name state name] : List (CompResult (List Nat)))
-        | CInd name => checked_output_tag(7, [checked_output_name state name] : List (CompResult (List Nat)))
+        | CConst name => checked_output_tag(6, [resolve name] : List (CompResult (List Nat)))
+        | CInd name => checked_output_tag(7, [resolve name] : List (CompResult (List Nat)))
         | CConstruct family ordinal parameters => checked_output_tag 8
-            ([checked_output_name state family, COk(List Nat, checked_output_number ordinal),
+            ([resolve family, COk(List Nat, checked_output_number ordinal),
              COk(List Nat, checked_output_number parameters)] : List (CompResult (List Nat)))
         | CCase info motive scrutinee branches => match info with
             | MkCaseInfo family parameters arities => checked_output_tag 9
-                ([checked_output_name state family, COk(List Nat, checked_output_number parameters),
+                ([resolve family, COk(List Nat, checked_output_number parameters),
                  COk(List Nat, checked_output_numbers arities), child motive, child scrutinee,
                  checked_output_list CoreTerm child branches] : List (CompResult (List Nat)))
             end
@@ -90,9 +108,12 @@ def checked_output_term (state : InternState) : Nat -> CoreTerm -> CompResult (L
              child annotation, child body] : List (CompResult (List Nat)))
         | CStrLit name _ => CErr(List Nat, ErrCode 46 name)
         | CStrBytes bytes type_id => checked_output_tag 12
-            ([checked_output_name state type_id, COk(List Nat, checked_output_numbers bytes)] : List (CompResult (List Nat)))
+            ([resolve type_id, COk(List Nat, checked_output_numbers bytes)] : List (CompResult (List Nat)))
         end
     end;
+
+def checked_output_term (state : InternState) : Nat -> CoreTerm -> CompResult (List Nat) :=
+    checked_output_term_using (checked_output_name state);
 
 def checked_output_abi_value (emit : CoreTerm -> CompResult (List Nat))
     (value : PrimitiveAbiValue) : CompResult (List Nat) :=
@@ -136,52 +157,65 @@ def checked_output_binding (emit : CoreTerm -> CompResult (List Nat))
         end
     end;
 
-def checked_output_inductive (state : InternState) (emit : CoreTerm -> CompResult (List Nat))
+def checked_output_inductive_using (resolve : Nat -> CompResult (List Nat)) (emit : CoreTerm -> CompResult (List Nat))
     (declaration : IndDecl) : CompResult (List Nat) :=
     match declaration with | MkIndDecl name parameters indices level constructors => checked_output_join
-      ([checked_output_name state name,
+      ([resolve name,
        checked_output_list Param (fun (parameter : Param) => match parameter with | MkParam _ typ => emit typ end) parameters,
        checked_output_list CoreTerm emit indices, COk(List Nat, checked_output_number level),
        checked_output_list Ctor (fun (constructor : Ctor) => match constructor with | MkCtor ctor_name typ =>
-         checked_output_join ([checked_output_name state ctor_name, emit typ] : List (CompResult (List Nat))) end)
+         checked_output_join ([resolve ctor_name, emit typ] : List (CompResult (List Nat))) end)
            constructors] : List (CompResult (List Nat)))
     end;
 
-def checked_output_role (state : InternState) (emit : CoreTerm -> CompResult (List Nat))
+def checked_output_role_using (resolve : Nat -> CompResult (List Nat)) (emit : CoreTerm -> CompResult (List Nat))
     (binding : PrimitiveRoleBinding) : CompResult (List Nat) :=
     match binding with | PrimitiveRoleOf role shape => match shape with
       | PrimitiveInductiveOf name parameters indices typ constructors => checked_output_join
-          ([COk(List Nat, checked_output_number (primitive_role_code role)), checked_output_name state name,
+          ([COk(List Nat, checked_output_number (primitive_role_code role)), resolve name,
            COk(List Nat, checked_output_number parameters), COk(List Nat, checked_output_number indices),
            emit typ, checked_output_list CoreTerm emit constructors] : List (CompResult (List Nat)))
       end
     end;
 
-def checked_output_entry (state : InternState) (fuel : Nat) (entry : Entry) : CompResult (List Nat) :=
-    let emit : CoreTerm -> CompResult (List Nat) := checked_output_term state fuel in
+def checked_output_entry_using (resolve : Nat -> CompResult (List Nat))
+    (emit : CoreTerm -> CompResult (List Nat)) (entry : Entry) : CompResult (List Nat) :=
     match entry with
     | MkEntry name typ body => checked_output_tag 0
-        ([checked_output_name state name, emit typ, checked_output_optional emit body] : List (CompResult (List Nat)))
+        ([resolve name, emit typ, checked_output_optional emit body] : List (CompResult (List Nat)))
     | MkIndEntry name declaration => checked_output_tag 1
-        ([checked_output_name state name, checked_output_inductive state emit declaration] : List (CompResult (List Nat)))
+        ([resolve name, checked_output_inductive_using resolve emit declaration] : List (CompResult (List Nat)))
     | MkBoundEntry name typ binding => checked_output_tag 2
-        ([checked_output_name state name, emit typ, checked_output_binding emit binding] : List (CompResult (List Nat)))
-    | MkRoleEntry binding => checked_output_tag(3, [checked_output_role state emit binding] : List (CompResult (List Nat)))
+        ([resolve name, emit typ, checked_output_binding emit binding] : List (CompResult (List Nat)))
+    | MkRoleEntry binding => checked_output_tag(3, [checked_output_role_using resolve emit binding] : List (CompResult (List Nat)))
     end;
+
+def checked_output_inductive (state : InternState) (emit : CoreTerm -> CompResult (List Nat))
+    (declaration : IndDecl) : CompResult (List Nat) :=
+    checked_output_inductive_using (checked_output_name state) emit declaration;
+
+def checked_output_role (state : InternState) (emit : CoreTerm -> CompResult (List Nat))
+    (binding : PrimitiveRoleBinding) : CompResult (List Nat) :=
+    checked_output_role_using (checked_output_name state) emit binding;
+
+def checked_output_entry (state : InternState) (fuel : Nat) (entry : Entry) : CompResult (List Nat) :=
+    checked_output_entry_using (checked_output_name state) (checked_output_term state fuel) entry;
 
 def checked_program_dump (fuel : Nat) (program : CheckedProgram) : CompResult (List Nat) :=
     match fuel with
     | Z => CErr(List Nat, ErrCode 44 0)
     | S _ => match program with | CheckedProgramOf state entries cores =>
+        let resolve : Nat -> CompResult (List Nat) := checked_output_name_resolver state entries in
+        let emit : CoreTerm -> CompResult (List Nat) := checked_output_term_using resolve fuel in
         literal_map (List Nat) (List Nat)
           (fun (bytes : List Nat) => append Nat
             ([111, 117, 114, 111, 46, 99, 104, 101, 99, 107, 101, 100, 45, 112, 114, 111, 103, 114, 97, 109, 46, 118, 49, 10] : List Nat)
             (append Nat bytes ([10] : List Nat)))
           (checked_output_join
-            ([checked_output_list Entry (checked_output_entry state fuel) entries,
+            ([checked_output_list Entry (checked_output_entry_using resolve emit) entries,
              checked_output_list (Pair Nat CoreTerm) (fun (pair : Pair Nat CoreTerm) => match pair with
                | MkPair name body => checked_output_join
-                   ([checked_output_name state name, checked_output_term state fuel body] : List (CompResult (List Nat))) end)
+                   ([resolve name, emit body] : List (CompResult (List Nat))) end)
                      cores] : List (CompResult (List Nat))))
         end
     end;
@@ -270,9 +304,9 @@ def checked_program_emission_cores_indexed
               end end
           end) (checked_program_cores program));
 
--- This adapter is removed with the legacy C host. Checked identities select
--- its String and supported IO implementations. Other native operations retain
--- their exact key and fail explicitly when this host has no implementation.
+-- Checked identities select the C host's String and supported IO operations.
+-- Other native operations retain their exact keys and fail explicitly when
+-- the host has no implementation.
 def checked_c_string_key_prefix : List Nat :=
     ([112, 114, 105, 109, 95, 115, 116, 114, 105, 110, 103, 95] : List Nat);
 
@@ -345,6 +379,9 @@ def checked_c_stdin_read_bytes_key : List Nat :=
 def checked_c_file_read_key : List Nat :=
     ([112, 114, 105, 109, 95, 102, 115, 95, 114, 101, 97, 100, 95, 102, 105, 108, 101] : List Nat);
 
+def checked_c_file_read_status_key : List Nat :=
+    ([112,114,105,109,95,102,115,95,114,101,97,100,95,102,105,108,101,95,115,116,97,116,117,115] : List Nat);
+
 def checked_c_file_write_key : List Nat :=
     ([112, 114, 105, 109, 95, 102, 115, 95, 119, 114, 105, 116, 101, 95, 102, 105, 108, 101] : List Nat);
 
@@ -395,11 +432,14 @@ def checked_c_binding_key (binding : PrimitiveBinding) : List Nat :=
         | PrimitiveFileTempIn => checked_c_file_temp_in_key
         | PrimitiveProcessInherit => primitive_key id
         | PrimitiveProcessBounded => primitive_key id
+        | PrimitiveProcessBoundedAt => primitive_key id
+        | PrimitiveManagedAllocatedRequestedBytes => primitive_key id
         | PrimitiveProcessCapture => primitive_key id
         | PrimitiveHttpPost => primitive_key id
         | PrimitiveStdinReadLine => checked_c_stdin_read_line_key
         | PrimitiveStdinReadBytes => checked_c_stdin_read_bytes_key
         | PrimitiveFileRead => checked_c_file_read_key
+        | PrimitiveFileReadStatus => checked_c_file_read_status_key
         | PrimitiveFileWrite => checked_c_file_write_key
         | PrimitiveDirectoryList => checked_c_directory_list_key
         | PrimitiveDirectoryListable => checked_c_directory_listable_key

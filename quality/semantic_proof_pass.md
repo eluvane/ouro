@@ -1,26 +1,22 @@
-# Semantic proof pass: evidence record
+# Semantic proof validation on 2026-09-18
 
-The 2026-09-18 pass used provisional P1-generated tools from
-`ouro-dev-main-updated.zip`. It was a useful work-in-progress snapshot, not
-release acceptance. Exact commands, source hashes, limits, and outcomes are in
-[semantic_proof_validation.json](semantic_proof_validation.json); rule ownership
-and applicability are in [semantic_proof_rule_audit.json](semantic_proof_rule_audit.json).
+This historical report covers a snapshot built with a provisional P1 compiler.
+The [validation record](semantic_proof_validation.json) identifies the sources,
+commands, limits, and results. The [rule audit](semantic_proof_rule_audit.json)
+records ownership and applicability.
 
-The pass introduced typed proof kinds, bounded snapshot-local contract
-summaries, and syntax repair certificates. The current behavior and limits are
-documented in [Clippy-grade rules](../docs/clippy_grade_firewall.md#semantic-boundary)
-and [safe rewrites](../docs/quality.md#precision-and-safe-rewrites). The
-compiler still owns program acceptance.
+The snapshot introduced typed proof kinds, bounded per-snapshot contract
+summaries, and syntax repair certificates. The compiler determines program
+acceptance. See the [semantic boundary](../docs/clippy_grade_firewall.md#semantic-boundary)
+and [rewrite policy](../docs/quality.md#precision-and-safe-rewrites).
 
-The recorded native proof, contract, resource, precision, fix, and lifetime
-checks completed with the provisional compiler, as did the 48-case source
-matrix. The complete bootstrap did not finish within its validation limit;
-strict/release production Clippy and lint runs timed out or exhausted their
-budgets. Four isolated whole-production fix/format attempts returned 1 and
-changed zero files. No final release seal, production convergence, or
-repository-gate result was established by this pass.
+The native proof, contract, resource, precision, fix, and lifetime checks
+completed with P1. All 48 cases in the source matrix also completed. The full
+bootstrap exceeded its validation limit. Production Clippy and lint runs under
+the strict and release profiles timed out or exhausted their budgets. Four
+whole-tree fix and format runs each exited with code 1 and changed zero files.
 
-The parser lifetime probe measured about 44.1 MB of retained runtime heap after
-a checked-read chain; that is not peak process memory. The retained JSON
-record distinguishes this measurement and provisional checks from current CI
-results. See [CI](../docs/ci.md#local-profiles) for the maintained gates.
+The parser lifetime probe measured approximately 44.1 MB of retained runtime
+heap after a checked-read chain. The measurement covers retained heap only.
+The release seal, production convergence, and repository gates remained
+unverified. See the [current CI profiles](../docs/ci.md#local-profiles).

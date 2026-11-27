@@ -58,6 +58,20 @@ static ouro_v *compile_qualified_collision(void)
 		ouro_string_codes("probe.ouro")), files);
 }
 
+static ouro_v *compile_qualified_record(void)
+{
+	ouro_v *files = ouro_ctor(0, 0, 0);
+	ouro_v *check = export_value("compile_checked_units");
+	files = source_unit("owner.ouro",
+		"inductive Count : Type := | Seed : Count; "
+		"record Box : Type where value : Count; end; def box : Box := MkBox Seed;", files);
+	files = source_unit("other.ouro", "axiom Extra : Type;", files);
+	files = source_unit("probe.ouro",
+		"import \"owner.ouro\" as O; import \"other.ouro\"; def projected : O.Count := O.box.value;", files);
+	return ouro_apply(ouro_apply(ouro_apply(check, ouro_nat(5000)),
+		ouro_string_codes("probe.ouro")), files);
+}
+
 static int intern_has_name(ouro_v *intern, const char *name)
 {
 	ouro_v *found;
@@ -67,12 +81,16 @@ static int intern_has_name(ouro_v *intern, const char *name)
 	return found != 0 && found->tag == 1 && found->n == 1;
 }
 
-static int has_name(ouro_v *result, const char *name)
+static ouro_v *checked_intern(ouro_v *result)
 {
 	if (result == 0 || result->tag != 1 || result->n != 1)
 		return 0;
-	return intern_has_name(ouro_apply(export_value("checked_program_intern"),
-		OURO_F(result, 0)), name);
+	return ouro_apply(export_value("checked_program_intern"), OURO_F(result, 0));
+}
+
+static int has_name(ouro_v *result, const char *name)
+{
+	return intern_has_name(checked_intern(result), name);
 }
 
 static ouro_v *compile_and_return_output(ouro_env *env, ouro_v *unit)
@@ -108,14 +126,17 @@ static int caller_output_check(int argc, char **argv)
 static int retained_result_check(void)
 {
 	ouro_v *first = compile_one("axiom First : Type;");
+	ouro_v *first_intern = ouro_fe_last_intern();
 	ouro_v *second;
 	ouro_v *qualified;
-	if (!has_name(first, "First"))
+	ouro_v *raw;
+	if (!intern_has_name(first_intern, "First") || checked_intern(first) != first_intern)
 		return fail("initial checked result");
 	second = compile_one("axiom Second : Type;");
-	if (!has_name(second, "Second"))
+	if (!has_name(second, "Second") || checked_intern(second) != ouro_fe_last_intern())
 		return fail("second checked result");
-	if (!has_name(first, "First") || has_name(first, "Second"))
+	if (checked_intern(first) != first_intern ||
+	    !intern_has_name(first_intern, "First") || intern_has_name(first_intern, "Second"))
 		return fail("first checked result did not survive second compilation");
 	qualified = compile_qualified_collision();
 	if (!has_name(qualified, "_ouro_m_0_Shared") ||
@@ -123,15 +144,24 @@ static int retained_result_check(void)
 	    !has_name(qualified, "left") || !has_name(qualified, "right") ||
 	    !has_name(first, "First"))
 		return fail("split frontend lost qualified module identity or retained result");
+	if (!has_name(compile_qualified_record(), "projected") || !has_name(qualified, "right"))
+		return fail("split frontend lost imported record scope or retained result");
+	raw = ouro_fe_compile_checked_units(ouro_nat(5000), ouro_string_codes("probe.ouro"),
+		source_unit("probe.ouro", "axiom Raw : Type;", ouro_ctor(0, 0, 0)));
+	if (!has_name(raw, "Raw") || checked_intern(raw) != ouro_fe_last_intern())
+		return fail("direct compile lost shared intern state");
 	return 0;
 }
 
 static int typed_failure_check(void)
 {
+	const char *list_source = "axiom A : Type; def wrong : A := [];";
 	ouro_v *failed = compile_one("axiom A : Type; def wrong : A := Type;");
 	ouro_v *intern = ouro_fe_last_intern();
 	ouro_v *next;
 	ouro_v *error;
+	ouro_v *legacy;
+	ouro_v *legacy_error;
 	if (failed == 0 || failed->tag != 0 || failed->n != 1 || !intern_has_name(intern, "wrong"))
 		return fail("initial typed failure and intern table");
 	next = compile_one("axiom Second : Type;");
@@ -141,6 +171,41 @@ static int typed_failure_check(void)
 	if (error == 0 || error->tag != 0 || error->n != 2 || as_nat(OURO_F(error, 0)) != 41 ||
 	    !intern_has_name(intern, "wrong") || intern_has_name(intern, "Second"))
 		return fail("typed failure code or original diagnostic names changed");
+	legacy = compile_one(list_source);
+	if (legacy == 0 || legacy->tag != 0 || legacy->n != 1)
+		return fail("legacy list refusal shape");
+	legacy_error = OURO_F(legacy, 0);
+	if (legacy_error == 0 || legacy_error->tag != 0 || legacy_error->n != 2 ||
+	    as_nat(OURO_F(legacy_error, 0)) != 64 ||
+	    as_nat(OURO_F(legacy_error, 1)) != (unsigned long)(strchr(list_source, '[') - list_source) ||
+	    error->tag != 0 || error->n != 2 || as_nat(OURO_F(error, 0)) != 41 ||
+	    !intern_has_name(intern, "wrong") || intern_has_name(intern, "Second"))
+		return fail("legacy list code, prepared-source detail or retained failure changed");
+	return 0;
+}
+
+static int prepass_failure_order_check(void)
+{
+	ouro_v *root = source_unit("probe.ouro",
+		"import \"a.ouro\" as Alias;\nimport \"b.ouro\" as Alias;", ouro_ctor(0, 0, 0));
+	ouro_v *inputs[] = {
+		source_unit("bad.ouro", "import \"d.ouro\" as;", root),
+		ouro_ctor(1, 2, (ouro_v *[]){ouro_ctor(0, 0, 0), root})
+	};
+	const unsigned long expected[] = {82, 10};
+	ouro_v *check = ouro_apply(ouro_apply(export_value("compile_checked_units"),
+		ouro_nat(5000)), ouro_string_codes("probe.ouro"));
+	size_t i;
+	for (i = 0; i < sizeof inputs / sizeof inputs[0]; i++) {
+		ouro_v *result = ouro_apply(check, inputs[i]);
+		ouro_v *error;
+		if (result == 0 || result->tag != 0 || result->n != 1)
+			return fail("prepass accepted invalid input");
+		error = OURO_F(result, 0);
+		if (error == 0 || error->tag != 0 || error->n != 2 ||
+		    as_nat(OURO_F(error, 0)) != expected[i] || as_nat(OURO_F(error, 1)) != 0)
+			return fail("prepass selected a different error");
+	}
 	return 0;
 }
 
@@ -278,8 +343,8 @@ static int allocation_context_check(void)
 	return 0;
 }
 
-/* cm_parse threads one intern table through every imported module. Leave must
-   share that caller-owned spine; recopying it on each file is the 4 GiB OOM. */
+/* cm_parse shares one intern table across imported modules. Leave must keep
+   the caller-owned spine to avoid recopying it for every file. */
 static int shared_parent_spine_check(void)
 {
 	const unsigned long size = 1024UL * 1024UL;
@@ -518,6 +583,8 @@ int main(int argc, char **argv)
 		result = retained_result_check();
 	else if (argc == 2 && strcmp(argv[1], "typed-failure") == 0)
 		result = typed_failure_check();
+	else if (argc == 2 && strcmp(argv[1], "prepass-failure-order") == 0)
+		result = prepass_failure_order_check();
 	else if (argc == 2 && strcmp(argv[1], "wrapped-context") == 0)
 		result = wrapped_context_check();
 	else if (argc == 2 && strcmp(argv[1], "nested-context") == 0)

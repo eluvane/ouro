@@ -1,185 +1,160 @@
-# Automation instructions
+# Repository automation policy
 
-Repository-specific rules for coding agents. Human contributors start with
-[CONTRIBUTING.md](CONTRIBUTING.md); topic owners are listed in the
-[documentation index](docs/README.md).
+## Scope and sources
 
-## Purpose and authority
+Follow the maintainer's request. Use this file for automation policy and the topic pages
+indexed in docs/README.md for product contracts. Human contributors start with
+CONTRIBUTING.md. Check that cited files exist. Do not infer policy from filenames.
 
-Follow the current maintainer request while preserving trust boundaries, tests,
-generated-artifact integrity, and strict CI gates. This file defines automation
-policy; the linked area documentation defines the product and its contracts.
-Do not infer policy from filenames or cite files that do not exist.
+Confirm the task and run git status --short. Keep the agreed repository, branch, base
+and scope. Preserve user edits, supplied names and revisions. Ask only for missing
+information that affects the task. Before editing, read the relevant docs, source,
+callers, tests, fixtures and rules for generated artifacts.
 
-## Accepted native transition
+Use docs/getting_started.md and docs/tooling.md for commands and examples. Use
+docs/build.md and docs/ci.md for builds, caches, bootstrap and generated output. For
+compiler work, read docs/architecture.md alongside the build guide.
 
-Follow the [native toolchain contract](docs/design.md#native-toolchain-contract)
-and [roadmap](docs/roadmap.md). The historical proposal in `docs/ouro.md` does
-not override them. Keep existing checker, runtime, bootstrap inputs, build
-entry points, and required gates until working replacements satisfy the
-retained contracts and their consumers are migrated. Stage equality and cache
-success do not establish behavioral correctness; toolchain independence needs
-isolated-host and artifact evidence.
+Follow docs/design.md#native-toolchain-contract and docs/roadmap.md. Treat docs/ouro.md
+as historical. Keep the checker, runtime, bootstrap inputs, build entry points and
+required gates until replacements meet their contracts and consumers have migrated.
+Matching stages and cache hits do not prove correct behavior. Require evidence from an
+isolated host and from built artifacts before claiming toolchain independence.
 
-## First steps for every agent
+## Implementation and compatibility
 
-1. Establish the task, repository, branch, and scope; inspect `git status --short`.
-   Resolve a PR's base and title only when a PR is requested. Preserve supplied
-   names, revisions, and scope; ask only for missing information that matters.
-2. Read the relevant canonical pages below, then source, callers, nearby tests,
-   fixtures, and any generated-artifact rules before editing.
-3. Reproduce a reported bug or establish its incorrect behavior. If blocked,
-   explain the limitation rather than claiming reproduction.
-4. Make the smallest coherent change at the layer that owns the behavior.
-5. Add focused regression coverage where behavior changes, run the relevant
-   checks from [CI](docs/ci.md#validation-matrix), and inspect the diff.
-6. Before opening a requested PR, run the [PR profile](docs/ci.md#local-profiles)
-   when feasible and report unavailable checks as described below.
+Reproduce the bug or show the incorrect behavior. If reproduction is blocked, say why.
+Make the smallest fix in the layer that owns the behavior. Reuse existing helpers and
+dependencies. Leave out unrelated cleanup, formatting, moves, refactors, speculative
+abstractions and compatibility layers. Never substitute a TODO, FIXME, HACK, placeholder
+or demo for a requested feature, regression test or acceptance fixture.
 
-## Read before editing
+Change public APIs only as required. Ask before choosing between incompatible APIs. Get
+approval for a repository-wide rewrite or out-of-scope changes to syntax, typechecking,
+packages or runtime. In docs-only, lint-only or comment-only work, leave parser,
+checker, kernel, runtime and package behavior unchanged. Never change kernel semantics
+as cleanup. Report unrelated problems as limitations or in a separately authorized
+issue.
 
-| Area | Canonical documentation |
-| --- | --- |
-| Contribution workflow | [Contributing](CONTRIBUTING.md) |
-| Commands and examples | [Getting started](docs/getting_started.md), [Tooling](docs/tooling.md) |
-| Language and project style | [Syntax](docs/syntax.md), [Quality](docs/quality.md) |
-| Standard library | [Practical APIs](docs/practical_stdlib.md), [API reference](docs/api/README.md) |
-| Build, caches, bootstrap, generated output | [Build](docs/build.md), [CI](docs/ci.md) |
-| Compiler architecture | [Architecture](docs/architecture.md), [Build](docs/build.md) |
-| Checker and trust-sensitive work | [Compiler checking](docs/kernel_design.md), [TCB](docs/tcb.md), [Architecture](docs/architecture.md) |
-| Public GitHub surface and releases | [CI](docs/ci.md), [Contributing](CONTRIBUTING.md), [Releasing](docs/releasing.md) |
+Follow docs/syntax.md and docs/quality.md. Keep definitions focused and public names
+clear and searchable. Avoid one-letter public names, broad imports and top-level
+namespace leaks. Use aliases or local opens to remove ambiguity.
 
-## Scope and implementation
+Prefer typed errors and explicit failure branches. Handle every Result, Either and
+validation value. Do not hide malformed input with defaults or report an error and
+return success.
 
-- One change has one reason to exist. Do not add unrelated cleanup, formatting,
-  file moves, adjacent refactors, speculative abstractions, or compatibility
-  layers. Change public APIs only when required by the task.
-- Preserve existing user work. Do not change the repository, branch, base, or
-  requested scope silently. Record any necessary scope change in the PR.
-- Fix causes in their owning layer, not generated output or displayed symptoms.
-  Read source before changing tests; reuse existing helpers and dependencies.
-- Do not change parser, checker, kernel, runtime, or package behavior during
-  docs-only, lint-only, or comment-only work. Kernel semantics never change as
-  an incidental cleanup.
-- Do not add network-dependent local validation or unsafe shell invocation.
-- Do not leave TODO, FIXME, HACK, placeholders, or demos in place of a requested
-  capability, regression test, or acceptance fixture.
-- Report larger unrelated problems as limitations or in a separately authorized
-  issue; do not silently expand the diff.
+Use the existing checked filesystem, process, config, CLI, CSV, line, table, validation
+and workflow APIs in user-facing tools. Use structured process specs instead of shell
+strings when available. Never invoke a shell unsafely. Keep CLI usage and output
+deterministic. On failure, exit nonzero and name the input and failing rule or phase.
+Preserve golden stdout and the tool's stdout/stderr split.
 
-## Ouro code and tools
+Read docs/practical_stdlib.md and docs/api/README.md for standard-library work. Provide
+reusable typed APIs and relevant shape tests. Add user-facing examples where they
+demonstrate acceptance. When the public API changes, update the practical reference and
+regenerate the API docs.
 
-Follow [syntax](docs/syntax.md) and [project style](docs/quality.md).
+Comment only on non-obvious decisions, invariants, proof strategy, assumptions or trust
+boundaries. Keep comments current. Preserve license notices, required annotations and
+suppression reasons. Omit narration, decoration and edit history.
 
-- Keep definitions focused and public names clear and searchable. Avoid
-  one-letter public names, broad imports, and top-level namespace leakage;
-  use aliases or local opens where they reduce ambiguity.
-- Prefer typed errors and explicit failure branches. Never hide malformed input
-  behind defaults, ignore Result/Either/validation values, or emit a diagnostic
-  and return fake success.
-- User-facing tools must use existing checked filesystem, process, config, CLI,
-  CSV, line, table, validation, and workflow APIs. Use structured process specs,
-  not shell strings, when those APIs exist.
-- Keep CLI usage and output deterministic. Fail with a nonzero exit, identify
-  the input and failing rule or phase, preserve golden stdout, and follow the
-  tool's existing stdout/stderr split.
-- Standard-library changes need reusable typed APIs, relevant shape tests,
-  user-facing examples where they demonstrate acceptance, and updates to the
-  practical reference and generated API documentation when their surface changes.
-- Keep comments sparse: explain non-obvious decisions, invariants, proof
-  strategy, assumptions, or trust boundaries. Preserve license notices and
-  required annotations/suppression reasons; update comments with their code.
-  Do not narrate operations, decorate files, or record edit history in comments.
+## Tests and quality gates
 
-## Tests, fixtures, and quality rules
+Preserve tests, fixtures, manifests and golden files. Do not delete failing cases,
+weaken assertions or hide host failures with broad skips. Do not dismiss a flaky test
+without evidence and maintainer direction. Ask before deleting fixtures. Change golden
+output only when you can show why the new result is correct. If the cause is unclear,
+ask.
 
-- Preserve tests, fixtures, manifests, and golden files. Do not delete failures,
-  weaken assertions, hide host failures behind broad skips, or label a flaky
-  test disposable without evidence and maintainer direction.
-- Behavior fixes need focused regression coverage; rejected behavior needs
-  negative fixtures, accepted behavior and analyzer precision need positive
-  fixtures. Preserve stable diagnostic IDs and deterministic expected output.
-- Change a golden result only after establishing why the new behavior is correct.
-- Run the adjacent suite when behavior crosses a module boundary. Do not claim
-  root cause, a fix, or lack of regressions without the corresponding evidence.
-- Quality rules live in their existing analyzer/linter owners and fixture trees.
-  Read [Quality](docs/quality.md) before editing rules, registries, or fixtures.
-  Require stable IDs and profile severity, precise messages, a suggested fix for
-  blocking rules, inventory updates for public rules, and low false positives.
-- Strict/deny/fatal/release paths must fail nonzero on violations. Never weaken
-  gates, baselines, hashes, rechecks, or trust checks; broad suppressions,
-  file-wide ignores, undocumented migration debt, warn-only decisions, optional
-  reporting, and continue-on-error are not substitutes for required checks.
-- Do not duplicate an analyzer or add noisy rules merely to increase rule count.
+Add focused regression tests for behavior changes. Use negative fixtures for rejection
+and positive fixtures for acceptance and analyzer precision. Keep diagnostic IDs stable
+and expected output deterministic. Run the adjacent suite when behavior crosses a module
+boundary.
 
-## Trust and generated artifacts
+Read docs/quality.md before changing rules, registries or fixtures. Keep each rule in
+its existing analyzer or linter and its tests in the existing fixture tree. Keep rule
+IDs and profile severity stable, messages precise and false positives low. Suggest a fix
+for each blocking rule. Update the inventory when public rules change. Do not duplicate
+analyzers or add noisy rules to increase the count.
 
-Trust-sensitive work includes checker/environment construction, runtime,
-`compiler/stage0/`, core-artifact schemas and fixtures, stage tooling, and the
-CI gates protecting them. Apply the [TCB contract](docs/tcb.md).
+Strict, deny, fatal and release paths must exit nonzero on violations. Preserve gates,
+baselines, hashes, rechecks and trust checks. If a task would weaken a strict gate, stop
+and ask. Never replace required checks with broad suppressions, file-wide ignores,
+undocumented migration debt, warn-only decisions, optional reporting or
+continue-on-error.
 
-- Do not broaden authority into IO, network, processes, caches, generated C, or
-  build tooling without design rationale, focused tests, and explicit trust
-  impact in the PR. Preserve fail-closed acceptance and complete import and
-  declaration checking with typed failures in every consumer.
-- Frontend, analyzer, wrapper, or generated-artifact success never substitutes
-  for compiler-owned acceptance. Checker changes need focused negative tests.
-- Follow [generated-artifact procedures](docs/build.md#generated-artifacts-and-stage-loop).
-  Never hand-edit generated C or API output, use generated output as the primary
-  handwritten change, or promote stage0 without an explicit artifact task.
-  Promotion needs matching hashes and stage-loop evidence; every generated diff
-  needs its source/generator change, regeneration command, and supporting checks.
-- Do not commit `_build/`, `_cache/`, logs, scratch files, editor backups, or
-  host-specific artifacts.
+## Checker, trust, and generated artifacts
 
-## Markdown documentation
+For checker and trust work, read the architecture guide, docs/kernel_design.md and
+docs/tcb.md. Apply the trusted computing base (TCB) contract to checker and environment
+construction, runtime, compiler/stage0/, core artifact schemas and fixtures, stage
+tooling and their CI gates. Ask before broadening the TCB or changing the rules for
+acceptance. To extend authority to IO, networks, processes, caches, generated C or build
+tooling, give a design reason, add focused tests and state the trust impact in the PR.
 
-- Keep each topic in its existing canonical page and link to it from other
-  pages or repeated sections. Do not add duplicate documents, banners,
-  decorative separators, or copied instructions.
-- Keep examples short and runnable, commands fenced, and expected output stable.
-  Update the documentation index for a genuinely new canonical page.
-- Mark experimental/pre-1.0 limits honestly. Do not write pass-history stories,
-  AI work narratives, private reasoning, stale promises, or unsupported claims
-  such as production-ready, fully safe, or guaranteed correct.
-- Follow [compatibility policy](CONTRIBUTING.md#documentation-and-compatibility)
-  for user-visible changes. Update existing API/module docs with their interfaces.
+Fail closed. Every consumer must check all imports and declarations and return typed
+failures. Require compiler acceptance. Success in the frontend, analyzer, wrappers or
+generated artifacts cannot replace it. Add focused negative tests for checker changes.
 
-## Commands and validation policy
+Follow docs/build.md#generated-artifacts-and-stage-loop. Never hand-edit generated C or
+API output. Include the source or generator change, regeneration command and supporting
+checks with every generated diff. Ask before committing a large generated diff whose
+source changes are unclear. Promote stage0 only with matching hashes and stage-loop
+evidence. If there is no explicit artifact task, ask for one first. Do not commit
+_build/, _cache/, logs, scratch files, editor backups or host-specific artifacts.
 
-The [CI validation matrix](docs/ci.md#validation-matrix) is the single command
-reference for selecting focused checks; [local profiles](docs/ci.md#local-profiles)
-cover PR readiness. Start with the smallest applicable suite and broaden only
-for missing coverage, new changes, failures, or unresolved risks.
+## Documentation
 
-Use `Ran`, `Not run`, `Changed`, and `Risk` fields for the exact commands and
-observed outcomes, reasons for unavailable checks, changed behavior/docs/tests/
-generated artifacts, and compatibility, trust, runtime, or performance risks.
-A missing tool, timeout, memory limit, or SKIP is
-not a pass. Follow [report interpretation](docs/ci.md#reports-and-failures).
-Never claim tests pass, validated, fixed, no regressions, CI clean, fully
-implemented, or production-ready beyond the evidence actually obtained.
+Keep each topic on its existing canonical page. Link to it instead of copying
+instructions. Add new canonical pages to docs/README.md. Use short runnable examples,
+fenced commands and stable expected output. Omit banners, decorative separators, pass
+histories, AI work narratives, private reasoning and stale promises. State experimental
+and pre-1.0 limits. Do not make unsupported claims of safety, correctness or production
+readiness. Follow CONTRIBUTING.md#documentation-and-compatibility for user-visible
+changes. Update existing API and module docs when their interfaces change.
 
-## Pull request policy
+## Validation and reporting
 
-- Create branches and PRs only when requested, one focused task branch per PR.
-  Preserve the supplied branch, title, and base. Local edits do not require a PR.
-- Do not merge your own PR without explicit instruction; do not close, reopen,
-  relabel, or retarget unrelated PRs. Force-push only when necessary to fix your
-  own branch.
-- Follow the [submission workflow](CONTRIBUTING.md#opening-a-pull-request).
-  Describe the concrete change and reason concisely, with applicable risks and
-  limitations. Omit empty sections, checklists, validation inventories, and
-  broad completion claims; keep execution evidence in task reports and CI.
+Select focused checks from docs/ci.md#validation-matrix. Run the smallest applicable
+suite first. Broaden only for coverage gaps, new changes, failures or unresolved risks.
+Keep local checks offline. Ask before adding one that needs the network. Inspect the
+diff. Before opening a requested PR, run the PR profile in docs/ci.md#local-profiles
+when feasible.
 
-## When to stop and ask for maintainer guidance
+Follow docs/ci.md#reports-and-failures in task reports. Use Ran for exact commands and
+observed results. Use Not run for unavailable checks and reasons. Use Changed for
+changes to behavior, docs, tests and generated artifacts. Use Risk for compatibility,
+trust, runtime and performance risks. A missing tool, timeout, memory limit or SKIP is
+not a pass. Claim a root cause, fix, passing checks, clean CI, lack of regressions,
+completion or production readiness only when the evidence supports it.
 
-Ask before an action would broaden the TCB, change acceptance semantics,
-change syntax/typechecker/package/runtime behavior outside scope, promote
-stage0 without an artifact task, weaken strict gates, delete fixtures or change
-golden output without a clear cause, add network-dependent local checks, make
-an unrequested repository-wide rewrite, choose incompatible public APIs, or
-commit large generated diffs with unclear source changes.
+## Collaboration and integration
 
-If guidance is unavailable, make the safe smaller change, document the
-limitation, and do not describe the larger task as complete.
+Work in local main by default. A parallel task, probe or diagnostic run does not
+authorize a branch, PR, commit, push or remote workflow run.
+
+Give parallel writers non-overlapping files. Use detached worktrees from the agreed
+revision when isolation is needed. The coordinator owns Git integration and publication.
+Delegated writers must not change refs or remotes.
+
+Integrate reviewed changes into local main. Before removing a task-owned worktree,
+preserve its uncommitted files and any commits not retained in main. Remove temporary
+worktrees once their results are retained. Do not remove another task's worktree or stop
+its processes.
+
+## Pull requests and releases
+
+For public GitHub and release work, read CONTRIBUTING.md, docs/ci.md and
+docs/releasing.md. Create branches and PRs only on request. Use one focused task branch
+per PR. Resolve the base and title only for a requested PR. Preserve the supplied
+branch, title and base. Record any agreed scope change in the PR.
+
+Follow CONTRIBUTING.md#opening-a-pull-request. State what changed, why, and the risks
+and limits. Omit empty sections, checklists, validation inventories and broad completion
+claims. Keep execution evidence in task reports and CI. Merge your own PR only on
+explicit instruction. Do not close, reopen, relabel or retarget unrelated PRs.
+Force-push only when necessary to repair your own branch.
+
+If maintainer guidance is unavailable, make the safe smaller change. Say what remains
+undone.

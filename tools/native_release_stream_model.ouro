@@ -1,0 +1,110 @@
+import "../std/fs_bounded_model.ouro";
+import "../std/process.ouro" as Process exposing (process_directory_valid);
+
+inductive NativeReleaseStreamWritePhase : Type :=
+  | ReleaseStreamCreate : NativeReleaseStreamWritePhase
+  | ReleaseStreamKind : NativeReleaseStreamWritePhase
+  | ReleaseStreamWrite : NativeReleaseStreamWritePhase
+  | ReleaseStreamFlush : NativeReleaseStreamWritePhase
+  | ReleaseStreamLength : NativeReleaseStreamWritePhase;
+
+inductive NativeReleaseStreamError : Type :=
+  | ReleaseStreamInput : FsBoundedReadError -> NativeReleaseStreamError
+  | ReleaseStreamStagePath : FsBoundedReadError -> NativeReleaseStreamError
+  | ReleaseStreamOutput : NativeReleaseStreamWritePhase -> Nat -> NativeReleaseStreamError
+  | ReleaseStreamSourceLength : Nat -> Nat -> NativeReleaseStreamError
+  | ReleaseStreamStageLength : Nat -> Nat -> NativeReleaseStreamError
+  | ReleaseStreamGuard : NativeReleaseStreamError;
+
+inductive NativeReleaseStreamFailure : Type :=
+  | NativeReleaseStreamFailureOf : Bool -> NativeReleaseStreamError -> NativeReleaseStreamFailure;
+
+inductive NativeReleaseClosedStage : Type :=
+  | NativeReleaseClosedStageOf : String -> Nat -> NativeReleaseClosedStage;
+
+def native_release_stream_created (failure : NativeReleaseStreamFailure) : Bool :=
+    match failure with | NativeReleaseStreamFailureOf created _ => created end;
+
+def native_release_stream_error (failure : NativeReleaseStreamFailure) : NativeReleaseStreamError :=
+    match failure with | NativeReleaseStreamFailureOf _ error => error end;
+
+def native_release_stream_closed_path (stage : NativeReleaseClosedStage) : String :=
+    match stage with | NativeReleaseClosedStageOf path _ => path end;
+
+def native_release_stream_closed_bytes (stage : NativeReleaseClosedStage) : Nat :=
+    match stage with | NativeReleaseClosedStageOf _ bytes => bytes end;
+
+def native_release_stream_error_code (error : NativeReleaseStreamError) : String :=
+    match error with
+    | ReleaseStreamInput _ => "release_stream_input"
+    | ReleaseStreamStagePath _ => "release_stream_stage_path"
+    | ReleaseStreamOutput phase _ => match phase with
+      | ReleaseStreamCreate => "release_stream_create"
+      | ReleaseStreamKind => "release_stream_kind"
+      | ReleaseStreamWrite => "release_stream_write"
+      | ReleaseStreamFlush => "release_stream_flush"
+      | ReleaseStreamLength => "release_stream_length"
+      end
+    | ReleaseStreamSourceLength _ _ => "release_stream_source_length"
+    | ReleaseStreamStageLength _ _ => "release_stream_stage_length"
+    | ReleaseStreamGuard => "release_stream_guard"
+    end;
+
+def native_release_stream_is_guard (error : NativeReleaseStreamError) : Bool :=
+    match error with
+    | ReleaseStreamGuard => True
+    | ReleaseStreamInput _ => False | ReleaseStreamStagePath _ => False
+    | ReleaseStreamOutput _ _ => False | ReleaseStreamSourceLength _ _ => False
+    | ReleaseStreamStageLength _ _ => False
+    end;
+
+def native_release_stream_path_error (stage : Bool) (error : FsBoundedReadError)
+    : NativeReleaseStreamError :=
+    match stage with | False => ReleaseStreamInput error | True => ReleaseStreamStagePath error end;
+
+private def native_release_stream_path_limit : Nat := mul 3 (pow_nat 2 15);
+
+def native_release_stream_path_checked (stage : Bool) (path : String)
+    : Either NativeReleaseStreamError Unit :=
+    match fs_bounded_read_path_length path native_release_stream_path_limit with
+    | Left error => Left NativeReleaseStreamError Unit (native_release_stream_path_error stage error)
+    | Right _ => if process_directory_valid path then Right NativeReleaseStreamError Unit MkUnit
+      else
+        Left NativeReleaseStreamError Unit
+          (native_release_stream_path_error stage FsBoundedReadInvalidPath)
+    end;
+
+def native_release_stream_plan_checked (cap : Nat) (bytes : Nat) (source : String) (stage : String)
+    : Either NativeReleaseStreamError Unit :=
+    match native_release_stream_path_checked False source with
+    | Left error => Left NativeReleaseStreamError Unit error
+    | Right _ => match native_release_stream_path_checked True stage with
+      | Left error => Left NativeReleaseStreamError Unit error
+      | Right _ => match fs_bounded_read_length cap bytes with
+        | Left error => Left NativeReleaseStreamError Unit (ReleaseStreamInput error)
+        | Right _ => Right NativeReleaseStreamError Unit MkUnit
+        end
+      end
+    end;
+
+def native_release_stream_source_length (cap : Nat) (expected : Nat) (actual : Nat)
+    : Either NativeReleaseStreamError Unit :=
+    match fs_bounded_read_length cap actual with
+    | Left error => Left NativeReleaseStreamError Unit (ReleaseStreamInput error)
+    | Right _ => if eq_nat expected actual then Right NativeReleaseStreamError Unit MkUnit
+      else Left NativeReleaseStreamError Unit (ReleaseStreamSourceLength expected actual)
+    end;
+
+def native_release_stream_progress (writing : Bool) (requested : Nat) (actual : Nat)
+    : Either NativeReleaseStreamError Nat :=
+    if andb (ltb_nat 0 requested) (leb_nat actual requested) then
+      if eq_nat actual 0 then
+        if writing then Left NativeReleaseStreamError Nat ReleaseStreamGuard
+        else Left NativeReleaseStreamError Nat (ReleaseStreamInput FsBoundedReadChanged)
+      else Right NativeReleaseStreamError Nat actual
+    else Left NativeReleaseStreamError Nat ReleaseStreamGuard;
+
+def native_release_stream_stage_length (expected : Nat) (actual : Nat)
+    : Either NativeReleaseStreamError Unit :=
+    if eq_nat expected actual then Right NativeReleaseStreamError Unit MkUnit
+    else Left NativeReleaseStreamError Unit (ReleaseStreamStageLength expected actual);

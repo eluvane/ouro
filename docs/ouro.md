@@ -1,11 +1,8 @@
 # Ouro concept and native transition
 
-> **A language that helps write itself.**
-
-**Document status:** current direction followed by a historical research concept;
-neither is a language specification or a product-readiness promise.
-
-**Comparative claims last externally checked:** 2026-07-27.
+This record preserves the early research proposal and identifies the native
+toolchain design that superseded it. The proposal's comparative references
+were last checked on 2026-07-27.
 
 ## Current direction: standalone native Ouro
 

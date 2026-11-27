@@ -1,0 +1,408 @@
+import "origin_model.ouro", "image_types.ouro", "pe_model.ouro", "../pipeline_support.ouro",
+  "../source_name_index.ouro";
+
+inductive NativeDebugError : Type :=
+  | NativeDebugNoImage : NativeDebugError
+  | NativeDebugSourceMetadata : SourceOriginError -> NativeDebugError
+  | NativeDebugMissingFunction : Nat -> NativeDebugError
+  | NativeDebugDuplicateFunction : Nat -> NativeDebugError
+  | NativeDebugUnexpectedFunction : Nat -> NativeDebugError
+  | NativeDebugInvalidRange : Nat -> NativeDebugError
+  | NativeDebugUnknownUnit : Nat -> NativeDebugError
+  | NativeDebugInvalidPathMap : NativeDebugError;
+
+-- The byte interval covers a whole original declaration.
+inductive NativeSourceLocation : Type :=
+  | NativeSourceLocationOf : List Nat -> Pair Nat Nat -> Bool -> NativeSourceLocation;
+
+-- RVA intervals are half-open and ordered. Gaps have no owning function.
+inductive NativeFunctionSourceRange : Type :=
+  | NativeFunctionSourceAt : Nat -> Nat -> Nat -> Maybe NativeSourceLocation -> NativeFunctionSourceRange;
+
+inductive NativeSourceMap : Type :=
+  | NativeSourceMapOf : List NativeFunctionSourceRange -> NativeSourceMap;
+
+inductive NativePcSource : Type :=
+  | NativePcOutside : NativePcSource
+  | NativePcUnknown : Nat -> NativePcSource
+  | NativePcKnown : Nat -> NativeSourceLocation -> NativePcSource;
+
+def native_debug_bind (A : Type) (B : Type) (result : Either NativeDebugError A)
+    (next : A -> Either NativeDebugError B) : Either NativeDebugError B :=
+    match result with
+    | Left error => Left NativeDebugError B error
+    | Right value => next value
+    end;
+
+private def native_debug_index_has (symbol : Nat) (index : EntryIndex) : Bool :=
+    match entry_index_lookup symbol index with | Nothing => False | Just _ => True end;
+
+private def native_debug_id_key (id : Nat) : List Nat := [add id Z];
+
+private def native_debug_seen_index (symbols : List Nat) : EntryIndex :=
+    foldl Nat EntryIndex (fun (index : EntryIndex) (symbol : Nat) => entry_index_reserve symbol index)
+      EntryIndexEmpty symbols;
+
+-- These derived indexes use exact IDs. The source and PE lists keep their order.
+private inductive NativeDebugOriginIndex : Type :=
+  | NativeDebugOriginIndexOf : SourceNameIndex -> EntryIndex -> EntryIndex -> EntryIndex -> NativeDebugOriginIndex;
+
+private def native_debug_origin_index (origins : List NativeFunctionOrigin) : NativeDebugOriginIndex :=
+    (fix collect (remaining : List NativeFunctionOrigin) (sources : SourceNameIndex)
+        (seen : EntryIndex) (duplicates : EntryIndex) (generated : EntryIndex) : NativeDebugOriginIndex :=
+      match remaining with
+      | Nil => NativeDebugOriginIndexOf sources seen duplicates generated
+      | Cons row rest => match row with | NativeFunctionOriginOf symbol owner =>
+        match native_debug_index_has symbol seen with
+        | True => collect rest sources seen (entry_index_reserve symbol duplicates) generated
+        | False => match owner with
+          | NativeFunctionUnknown => collect rest sources (entry_index_reserve symbol seen) duplicates generated
+          | NativeFunctionSource source inherited => collect rest
+              (source_name_index_insert (native_debug_id_key symbol) source sources)
+              (entry_index_reserve symbol seen) duplicates
+              (match inherited with | False => generated | True => entry_index_reserve symbol generated end)
+          end
+        end end
+      end) origins SourceNameIndexEmpty EntryIndexEmpty EntryIndexEmpty EntryIndexEmpty;
+
+private def native_debug_origin_at (symbol : Nat) (index : NativeDebugOriginIndex)
+    : Either NativeDebugError NativeFunctionOwner :=
+    match index with | NativeDebugOriginIndexOf sources seen duplicates generated =>
+      match native_debug_index_has symbol duplicates with
+      | True => Left NativeDebugError NativeFunctionOwner (NativeDebugDuplicateFunction symbol)
+      | False => match native_debug_index_has symbol seen with
+        | False => Left NativeDebugError NativeFunctionOwner (NativeDebugMissingFunction symbol)
+        | True => Right NativeDebugError NativeFunctionOwner
+            (match source_name_index_lookup (native_debug_id_key symbol) sources with
+             | Nothing => NativeFunctionUnknown
+             | Just source => NativeFunctionSource source (native_debug_index_has symbol generated)
+             end)
+        end
+      end
+    end;
+
+private inductive NativeDebugOwnerIndex : Type :=
+  | NativeDebugOwnerIndexOf : SourceNameIndex -> SourceNameIndex -> SourceNameIndex
+      -> EntryIndex -> NativeDebugOwnerIndex;
+
+private def native_debug_owner_index (owners : List SourceCheckedOwner) : NativeDebugOwnerIndex :=
+    (fix collect (remaining : List SourceCheckedOwner) (units : SourceNameIndex)
+        (kinds : SourceNameIndex) (names : SourceNameIndex) (seen : EntryIndex) (duplicates : EntryIndex)
+        : NativeDebugOwnerIndex :=
+      match remaining with
+      | Nil => NativeDebugOwnerIndexOf units kinds names duplicates
+      | Cons row rest => match row with | SourceCheckedOwnerOf entry location =>
+        match source_checked_entry_slot entry with | MkPair kind source =>
+          match eqNat kind 0 with
+          | False => collect rest units kinds names seen duplicates
+          | True => match native_debug_index_has source seen with
+            | True => collect rest units kinds names seen (entry_index_reserve source duplicates)
+            | False => let next_seen : EntryIndex := entry_index_reserve source seen in
+              match location with
+              | Nothing => collect rest units kinds names next_seen duplicates
+              | Just owner => match owner with | MkPair unit slot => match slot with | MkPair original_kind original_name =>
+                  let key : List Nat := native_debug_id_key source in
+                  collect rest (source_name_index_insert key unit units)
+                    (source_name_index_insert key original_kind kinds)
+                    (source_name_index_insert key original_name names) next_seen duplicates
+                end end
+              end
+            end
+          end
+        end end
+      end) owners SourceNameIndexEmpty SourceNameIndexEmpty SourceNameIndexEmpty EntryIndexEmpty EntryIndexEmpty;
+
+private def native_debug_owner_at (source : Nat) (index : NativeDebugOwnerIndex)
+    : Either NativeDebugError (Maybe (Pair Nat (Pair Nat Nat))) :=
+    match index with | NativeDebugOwnerIndexOf units kinds names duplicates =>
+      match native_debug_index_has source duplicates with
+      | True => Right NativeDebugError (Maybe (Pair Nat (Pair Nat Nat))) (Nothing (Pair Nat (Pair Nat Nat)))
+      | False => let key : List Nat := native_debug_id_key source in
+        match source_name_index_lookup key units with
+        | Nothing => Right NativeDebugError (Maybe (Pair Nat (Pair Nat Nat))) (Nothing (Pair Nat (Pair Nat Nat)))
+        | Just unit => match source_name_index_lookup key kinds, source_name_index_lookup key names with
+          | Just kind, Just name => Right NativeDebugError (Maybe (Pair Nat (Pair Nat Nat)))
+              (Just (Pair Nat (Pair Nat Nat)) (MkPair Nat (Pair Nat Nat) unit (MkPair Nat Nat kind name)))
+          | Just _, Nothing => Left NativeDebugError (Maybe (Pair Nat (Pair Nat Nat)))
+              (NativeDebugSourceMetadata SourceOriginOccurrence)
+          | Nothing, Just _ => Left NativeDebugError (Maybe (Pair Nat (Pair Nat Nat)))
+              (NativeDebugSourceMetadata SourceOriginOccurrence)
+          | Nothing, Nothing => Left NativeDebugError (Maybe (Pair Nat (Pair Nat Nat)))
+              (NativeDebugSourceMetadata SourceOriginOccurrence)
+          end
+        end
+      end
+    end;
+
+private def native_debug_occurrence_key (unit : Nat) (slot : Pair Nat Nat) : List Nat :=
+    match slot with | MkPair kind name => [add unit Z, add kind Z, add name Z] end;
+
+private inductive NativeDebugEnvelopeIndex : Type :=
+  | NativeDebugEnvelopeIndexOf : SourceNameIndex -> SourceNameIndex -> SourceNameIndex
+      -> SourceNameIndex -> NativeDebugEnvelopeIndex;
+
+private def native_debug_envelope_index (occurrences : List OwnedSourceOccurrence) : NativeDebugEnvelopeIndex :=
+    (fix collect (remaining : List OwnedSourceOccurrence) (starts : SourceNameIndex) (finishes : SourceNameIndex)
+        (inherited : SourceNameIndex) (seen : SourceNameIndex) (duplicates : SourceNameIndex) : NativeDebugEnvelopeIndex :=
+      match remaining with
+      | Nil => NativeDebugEnvelopeIndexOf starts finishes inherited duplicates
+      | Cons row rest => match row with | OwnedSourceOccurrenceOf unit captured => match captured with
+        | MkPair occurrence envelope => match occurrence with | ParsedSourceOccurrenceOf decl _ =>
+          let key : List Nat := native_debug_occurrence_key unit (source_decl_slot decl) in
+          match source_name_index_lookup key seen with
+          | Just _ => collect rest starts finishes inherited seen (source_name_index_insert key unit duplicates)
+          | Nothing => let next_seen : SourceNameIndex := source_name_index_insert key unit seen in
+            match envelope with
+            | Nothing => collect rest starts finishes inherited next_seen duplicates
+            | Just original => match original with | OriginalEnvelopeOf span generated => match span with | MkPair first last =>
+                collect rest (source_name_index_insert key first starts) (source_name_index_insert key last finishes)
+                  (match generated with | False => inherited | True => source_name_index_insert key unit inherited end)
+                  next_seen duplicates
+              end end
+            end
+          end
+        end end end
+      end) occurrences SourceNameIndexEmpty SourceNameIndexEmpty SourceNameIndexEmpty SourceNameIndexEmpty SourceNameIndexEmpty;
+
+private def native_debug_envelope_at (unit : Nat) (slot : Pair Nat Nat) (index : NativeDebugEnvelopeIndex)
+    : Either NativeDebugError (Maybe OriginalEnvelope) :=
+    match index with | NativeDebugEnvelopeIndexOf starts finishes inherited duplicates =>
+      let key : List Nat := native_debug_occurrence_key unit slot in
+      match source_name_index_lookup key duplicates with
+      | Just _ => Right NativeDebugError (Maybe OriginalEnvelope) (Nothing OriginalEnvelope)
+      | Nothing => match source_name_index_lookup key starts with
+        | Nothing => Right NativeDebugError (Maybe OriginalEnvelope) (Nothing OriginalEnvelope)
+        | Just first => match source_name_index_lookup key finishes with
+          | Nothing => Left NativeDebugError (Maybe OriginalEnvelope) (NativeDebugSourceMetadata SourceOriginOccurrence)
+          | Just last => Right NativeDebugError (Maybe OriginalEnvelope)
+              (Just OriginalEnvelope (OriginalEnvelopeOf (MkPair Nat Nat first last)
+                (match source_name_index_lookup key inherited with | Nothing => False | Just _ => True end)))
+          end
+        end
+      end
+    end;
+
+-- Each stored key has one unique unit ID followed by its original path.
+-- Comparing the first element therefore preserves the AVL key order.
+private inductive NativeDebugUnitIndex : Type :=
+  | NativeDebugUnitIndexOf : SourceNameIndex -> EntryIndex -> NativeDebugUnitIndex;
+
+private def native_debug_unit_index (state : InternState) : NativeDebugUnitIndex :=
+    match state with | MkIntern _ _ strings _ =>
+      (fix collect (remaining : List (Pair (List Nat) Nat)) (paths : SourceNameIndex)
+          (seen : EntryIndex) (duplicates : EntryIndex) : NativeDebugUnitIndex :=
+        match remaining with
+        | Nil => NativeDebugUnitIndexOf paths duplicates
+        | Cons row rest => match row with | MkPair path unit =>
+          match native_debug_index_has unit seen with
+          | True => collect rest paths seen (entry_index_reserve unit duplicates)
+          | False => collect rest (source_name_index_insert (Cons Nat (add unit Z) path) unit paths)
+              (entry_index_reserve unit seen) duplicates
+          end end
+        end) strings SourceNameIndexEmpty EntryIndexEmpty EntryIndexEmpty
+    end;
+
+private def native_debug_unit_path_at (unit : Nat) (index : NativeDebugUnitIndex)
+    : Either NativeDebugError (List Nat) :=
+    match index with | NativeDebugUnitIndexOf paths duplicates =>
+      match native_debug_index_has unit duplicates with
+      | True => Left NativeDebugError (List Nat) (NativeDebugUnknownUnit unit)
+      | False => let canonical_unit : Nat := add unit Z in
+        (fix lookup (tree : SourceNameIndex) : Either NativeDebugError (List Nat) :=
+          match tree with
+          | SourceNameIndexEmpty => Left NativeDebugError (List Nat) (NativeDebugUnknownUnit unit)
+          | SourceNameIndexNode _ key _ left right => match key with
+            | Nil => Left NativeDebugError (List Nat) (NativeDebugUnknownUnit unit)
+            | Cons current path => match compareNat canonical_unit current with
+              | EQ => Right NativeDebugError (List Nat) path
+              | LT => lookup left
+              | GT => lookup right
+              end
+            end
+          end) paths
+      end
+    end;
+
+def native_debug_path_table : List (Pair (List Nat) (List Nat)) -> Either NativeDebugError Unit :=
+  fix validate (paths : List (Pair (List Nat) (List Nat))) : Either NativeDebugError Unit :=
+    match paths with
+    | Nil => Right NativeDebugError Unit MkUnit
+    | Cons path rest => match path with | MkPair original _ =>
+      match any (Pair (List Nat) (List Nat)) (fun (other : Pair (List Nat) (List Nat)) =>
+          match other with | MkPair candidate _ => pe_bytes_equal original candidate end) rest with
+      | True => Left NativeDebugError Unit NativeDebugInvalidPathMap
+      | False => validate rest
+      end end
+    end;
+
+def native_debug_display_path (path : List Nat) (paths : List (Pair (List Nat) (List Nat))) : List Nat :=
+    match filter (Pair (List Nat) (List Nat)) (fun (row : Pair (List Nat) (List Nat)) =>
+        match row with | MkPair original _ => pe_bytes_equal path original end) paths with
+    | Nil => path
+    | Cons row _ => match row with | MkPair _ replacement => replacement end
+    end;
+
+def native_debug_source_owner (source : Nat) (packet : CheckedSourcePacket)
+    : Maybe (Pair Nat (Pair Nat Nat)) :=
+    match filter SourceCheckedOwner (fun (row : SourceCheckedOwner) => match row with
+        | SourceCheckedOwnerOf entry _ => source_slot_equal (source_checked_entry_slot entry) (MkPair Nat Nat 0 source)
+        end) (checked_source_packet_owners packet) with
+    | Nil => Nothing (Pair Nat (Pair Nat Nat))
+    | Cons row rest => match rest with
+      | Cons _ _ => Nothing (Pair Nat (Pair Nat Nat))
+      | Nil => match row with | SourceCheckedOwnerOf _ location => location end
+      end
+    end;
+
+private def native_debug_source_location_at (source : Nat) (generated : Bool) (owners : NativeDebugOwnerIndex)
+    (envelopes : NativeDebugEnvelopeIndex) (units : NativeDebugUnitIndex) (paths : List (Pair (List Nat) (List Nat)))
+    : Either NativeDebugError (Maybe NativeSourceLocation) :=
+    native_debug_bind (Maybe (Pair Nat (Pair Nat Nat))) (Maybe NativeSourceLocation)
+      (native_debug_owner_at source owners) (fun (owner : Maybe (Pair Nat (Pair Nat Nat))) =>
+        match owner with
+        | Nothing => Right NativeDebugError (Maybe NativeSourceLocation) (Nothing NativeSourceLocation)
+        | Just location => match location with | MkPair unit slot =>
+          native_debug_bind (Maybe OriginalEnvelope) (Maybe NativeSourceLocation)
+            (native_debug_envelope_at unit slot envelopes) (fun (envelope : Maybe OriginalEnvelope) =>
+              match envelope with
+              | Nothing => Right NativeDebugError (Maybe NativeSourceLocation) (Nothing NativeSourceLocation)
+              | Just original => match original with | OriginalEnvelopeOf span inherited =>
+                native_debug_bind (List Nat) (Maybe NativeSourceLocation) (native_debug_unit_path_at unit units)
+                  (fun (path : List Nat) => Right NativeDebugError (Maybe NativeSourceLocation)
+                    (Just NativeSourceLocation (NativeSourceLocationOf (native_debug_display_path path paths)
+                      span (orb generated inherited))))
+                end
+              end)
+          end
+        end);
+
+def native_debug_origin (symbol : Nat) (origins : List NativeFunctionOrigin)
+    : Either NativeDebugError NativeFunctionOwner :=
+    match filter NativeFunctionOrigin (fun (row : NativeFunctionOrigin) =>
+        eqNat symbol (native_origin_symbol row)) origins with
+    | Nil => Left NativeDebugError NativeFunctionOwner (NativeDebugMissingFunction symbol)
+    | Cons row rest => match rest with
+      | Cons _ _ => Left NativeDebugError NativeFunctionOwner (NativeDebugDuplicateFunction symbol)
+      | Nil => match row with | NativeFunctionOriginOf _ owner => Right NativeDebugError NativeFunctionOwner owner end
+      end
+    end;
+
+def native_debug_address_id (address : PeFunctionAddress) : Nat :=
+    match address with | PeFunctionAt symbol _ _ _ => symbol end;
+
+private def native_debug_address_index (addresses : List PeFunctionAddress) : EntryIndex :=
+    foldl PeFunctionAddress EntryIndex (fun (index : EntryIndex) (address : PeFunctionAddress) =>
+      entry_index_reserve (native_debug_address_id address) index) EntryIndexEmpty addresses;
+
+private def native_debug_extra_origins_at (addresses : EntryIndex)
+    : List NativeFunctionOrigin -> Either NativeDebugError Unit :=
+  fix validate (origins : List NativeFunctionOrigin) : Either NativeDebugError Unit :=
+    match origins with
+    | Nil => Right NativeDebugError Unit MkUnit
+    | Cons row rest => match native_debug_index_has (native_origin_symbol row) addresses with
+      | False => Left NativeDebugError Unit (NativeDebugUnexpectedFunction (native_origin_symbol row))
+      | True => validate rest
+      end
+    end;
+
+def native_debug_extra_origins (addresses : List PeFunctionAddress) (origins : List NativeFunctionOrigin)
+    : Either NativeDebugError Unit := native_debug_extra_origins_at (native_debug_address_index addresses) origins;
+
+private def native_debug_addresses_at (owners : NativeDebugOwnerIndex) (envelopes : NativeDebugEnvelopeIndex)
+    (units : NativeDebugUnitIndex) (paths : List (Pair (List Nat) (List Nat))) (origins : NativeDebugOriginIndex)
+    : Nat -> EntryIndex -> List PeFunctionAddress -> Either NativeDebugError (List NativeFunctionSourceRange) :=
+  fun (initial_end_rva : Nat) (initial_seen : EntryIndex) (initial_addresses : List PeFunctionAddress) =>
+    (fix build (addresses : List PeFunctionAddress) (previous : Nat) (seen : EntryIndex)
+      : Either NativeDebugError (List NativeFunctionSourceRange) :=
+    match addresses with
+    | Nil => Right NativeDebugError (List NativeFunctionSourceRange) []
+    | Cons address rest => match address with | PeFunctionAt symbol first last _ =>
+      match native_debug_index_has symbol seen with
+      | True => Left NativeDebugError (List NativeFunctionSourceRange) (NativeDebugDuplicateFunction symbol)
+      | False => match andb (leb_nat previous first) (andb (ltb_nat first last) (leb_nat last pe_max_rva)) with
+        | False => Left NativeDebugError (List NativeFunctionSourceRange) (NativeDebugInvalidRange symbol)
+        | True => native_debug_bind NativeFunctionOwner (List NativeFunctionSourceRange)
+            (native_debug_origin_at symbol origins) (fun (owner : NativeFunctionOwner) =>
+              native_debug_bind (Maybe NativeSourceLocation) (List NativeFunctionSourceRange)
+                (match owner with
+                 | NativeFunctionUnknown => Right NativeDebugError (Maybe NativeSourceLocation) (Nothing NativeSourceLocation)
+                 | NativeFunctionSource source generated => native_debug_source_location_at source generated owners envelopes units paths
+                 end)
+                (fun (location : Maybe NativeSourceLocation) => native_debug_bind (List NativeFunctionSourceRange)
+                  (List NativeFunctionSourceRange) (build rest last (entry_index_reserve symbol seen))
+                  (fun (more : List NativeFunctionSourceRange) => Right NativeDebugError (List NativeFunctionSourceRange)
+                    (Cons NativeFunctionSourceRange (NativeFunctionSourceAt symbol first last location) more))))
+        end
+      end end
+    end) initial_addresses initial_end_rva initial_seen;
+
+def native_debug_addresses (packet : CheckedSourcePacket) (state : InternState)
+    (metadata : SourceOriginMetadata) (paths : List (Pair (List Nat) (List Nat)))
+    (origins : List NativeFunctionOrigin) (previous : Nat) (seen : List Nat) (addresses : List PeFunctionAddress)
+    : Either NativeDebugError (List NativeFunctionSourceRange) :=
+    match metadata with | SourceOriginMetadataOf locations _ => match locations with | MkPair _ occurrences =>
+      native_debug_addresses_at (native_debug_owner_index (checked_source_packet_owners packet))
+        (native_debug_envelope_index occurrences) (native_debug_unit_index state) paths
+        (native_debug_origin_index origins) previous (native_debug_seen_index seen) addresses
+      end end;
+
+def native_debug_build_map (packet : CheckedSourcePacket) (state : InternState) (metadata : SourceOriginMetadata)
+    (image : NativeImage) (origins : List NativeFunctionOrigin) (paths : List (Pair (List Nat) (List Nat)))
+    : Either NativeDebugError NativeSourceMap :=
+    match image with | NativeImageOf pe _ => match pe with | PeImageFile _ addresses =>
+      native_debug_bind Unit NativeSourceMap (native_debug_path_table paths) (fun (_ : Unit) =>
+        native_debug_bind Unit NativeSourceMap (native_debug_extra_origins addresses origins) (fun (_ : Unit) =>
+          native_debug_bind (List NativeFunctionSourceRange) NativeSourceMap
+            (native_debug_addresses packet state metadata paths origins 0 ([] : List Nat) addresses)
+            (fun (rows : List NativeFunctionSourceRange) => Right NativeDebugError NativeSourceMap (NativeSourceMapOf rows))))
+      end end;
+
+private def native_debug_validate_rows_at : Nat -> EntryIndex -> List NativeFunctionSourceRange -> Either NativeDebugError Unit :=
+  fun (initial_end_rva : Nat) (initial_seen : EntryIndex) (initial_rows : List NativeFunctionSourceRange) =>
+    (fix validate (rows : List NativeFunctionSourceRange) (previous : Nat) (seen : EntryIndex) : Either NativeDebugError Unit :=
+    match rows with
+    | Nil => Right NativeDebugError Unit MkUnit
+    | Cons row rest => match row with | NativeFunctionSourceAt symbol first last _ =>
+      match native_debug_index_has symbol seen with
+      | True => Left NativeDebugError Unit (NativeDebugDuplicateFunction symbol)
+      | False => match andb (leb_nat previous first) (andb (ltb_nat first last) (leb_nat last pe_max_rva)) with
+        | False => Left NativeDebugError Unit (NativeDebugInvalidRange symbol)
+        | True => validate rest last (entry_index_reserve symbol seen)
+        end
+      end end
+    end) initial_rows initial_end_rva initial_seen;
+
+def native_debug_validate_rows (previous : Nat) (seen : List Nat) (rows : List NativeFunctionSourceRange)
+    : Either NativeDebugError Unit := native_debug_validate_rows_at previous (native_debug_seen_index seen) rows;
+
+def native_debug_find_rva (rva : Nat) : List NativeFunctionSourceRange -> NativePcSource :=
+  fix find (rows : List NativeFunctionSourceRange) : NativePcSource :=
+    match rows with
+    | Nil => NativePcOutside
+    | Cons row rest => match row with | NativeFunctionSourceAt symbol first last location =>
+      match andb (leb_nat first rva) (ltb_nat rva last) with
+      | False => find rest
+      | True => match location with
+        | Nothing => NativePcUnknown symbol
+        | Just source => NativePcKnown symbol source
+        end
+      end end
+    end;
+
+-- Public map constructors are forgeable. Every lookup validates the full layout.
+def native_debug_locate_rva (mapping : NativeSourceMap) (rva : Nat) : Either NativeDebugError NativePcSource :=
+    match mapping with | NativeSourceMapOf rows =>
+      native_debug_bind Unit NativePcSource (native_debug_validate_rows 0 ([] : List Nat) rows)
+        (fun (_ : Unit) => Right NativeDebugError NativePcSource (native_debug_find_rva rva rows))
+    end;
+
+def native_debug_locate_pc (mapping : NativeSourceMap) (loaded_base : Nat) (pc : Nat)
+    : Either NativeDebugError NativePcSource :=
+    match mapping with | NativeSourceMapOf rows =>
+      native_debug_bind Unit NativePcSource (native_debug_validate_rows 0 ([] : List Nat) rows)
+        (fun (_ : Unit) => Right NativeDebugError NativePcSource
+          (match ltb_nat pc loaded_base with
+           | True => NativePcOutside
+           | False => native_debug_find_rva (sub pc loaded_base) rows
+           end))
+      end;

@@ -90,9 +90,8 @@ def main() -> int:
         path.write_text(source, encoding="utf-8")
         return path
 
-    # Verify and install the current compiler, reusing source-bound build evidence.
+    # Build the parser laws with the current compiler to test current syntax.
     run([sys.executable, "scripts/ouro_build.py", "build"])
-    # A fresh native binary avoids silently testing only the stage0 parser.
     where_driver = work / "where-parser-laws"
     run(["sh", "scripts/build_tool.sh", "tests/language_ergonomics/where_parser_laws.ouro",
          str(where_driver), "60000"])
@@ -110,14 +109,18 @@ def main() -> int:
     if "ERGO_PARSER_OK" not in result.stdout:
         raise AssertionError("native parser laws did not report success")
 
-    runtime = work / "coalesce-runtime"
-    run(["sh", "scripts/build_tool.sh", "tests/language_ergonomics/coalesce_runtime.ouro",
-         str(runtime), "60000"])
-    if runtime.with_suffix(".exe").exists():
-        runtime = runtime.with_suffix(".exe")
-    result = run([str(runtime)])
-    if result.stdout != "selected\nfallback\n":
-        raise AssertionError("coalesce selected the wrong runtime branch: " + repr(result.stdout))
+    for name, expected in (
+        ("coalesce", "selected\nfallback\n"),
+        ("match_bang", "action\ntrue branch\naction\nfalse branch\n"),
+    ):
+        runtime = work / (name + "-runtime")
+        run(["sh", "scripts/build_tool.sh", f"tests/language_ergonomics/{name}_runtime.ouro",
+             str(runtime), "60000"])
+        if runtime.with_suffix(".exe").exists():
+            runtime = runtime.with_suffix(".exe")
+        result = run([str(runtime)])
+        if result.stdout != expected or result.stderr:
+            raise AssertionError(f"{name} runtime output: {result.stdout!r} / {result.stderr!r}")
 
     support = (("support.ouro", support_source()),)
     canary = fixture("canary", 'import "support.ouro";\ndef valid : ErgNat := ErgZero;\n', support)

@@ -1,15 +1,18 @@
 """Generated host/direct/stage and eval contracts."""
 from __future__ import annotations
 
-import hashlib
 import json
 
+from local_scheduler import Task, run_tasks
 from ourosmith import ROOT
-from ourosmith.host import environment, shell
+from ourosmith.host import environment, job_count, shell
+from ourosmith.limits import run_limited
+from ourosmith.native import save_result
 from ourosmith.surface.gen import PRELUDE, evaluate, generate, nat_output, program
 from ourosmith.surface.forms import programs as form_programs
 from ourosmith.surface.mutate import mutations
-from ourosmith.surface.run import checked_program_snapshot
+from ourosmith.surface.run import StepFailure, checked_program_snapshot
+from repo_support import sha256_file
 
 
 def programs(seed):
@@ -68,17 +71,44 @@ def stage(run):
     run.require(type(number) is int and 1 <= number <= 32, "stage-fixpoint-proof", "valid recorded stage number", number)
     path = ROOT / f"_build/stage_loop/ouro1_stage{number}"
     valid = all(record.get(key) is True for key in ("pass", "frontend_eq", "backend_eq"))
-    valid = valid and path.is_file() and hashlib.sha256(path.read_bytes()).hexdigest() == record.get("artifacts", {}).get("binary_sha256")
+    valid = valid and path.is_file() and sha256_file(path) == record.get("artifacts", {}).get("binary_sha256")
     run.require(valid, "stage-fixpoint-proof", "binary matches recorded FE+BE fixpoint", str(path))
     run.report.sections["stage_parity"] = {"status": "exercised", "binary": path.relative_to(ROOT).as_posix(),
                                           "sha256": record["artifacts"]["binary_sha256"]}
     return path
 
 
+def eval_pair(run, directory, wrapper, path, first):
+    modes = {"print": ("--print", "result"), "expr": ("--eval", first["successor"] + " result")}
+    tasks = [Task(name, max_jobs=1, memory_mib=run.memory_mb) for name in modes]
+    env = environment(jobs=1, build=True, shell_path=wrapper[0])
+
+    def execute(task, allocation):
+        argv = [*(part.as_posix() for part in wrapper), "eval", path.as_posix(), *modes[task.name],
+                "--type", first["type_name"], "--fuel", "999999"]
+        return run_limited(argv, cwd=directory, env={**env, **allocation.environment()},
+                           timeout_s=60, memory_mb=allocation.memory_mib)
+
+    jobs = run.allocation.jobs if run.allocation is not None else job_count()
+    results, stats = run_tasks(tasks, jobs=jobs, memory_mib=run.memory_budget_mib, run=execute)
+    run.report.timing.update({f"surface.eval-pair.scheduler.{name}": value for name, value in stats.items() if value is not None})
+    ordered = [results[name] for name in modes]
+    for name, result in zip(modes, ordered, strict=True):
+        save_result(directory / f"parallel-{name}", result)
+    actual = {name: run.output(results[name]) for name in modes}
+    for result in ordered:
+        if result.classify() not in {"ok", "nonzero"}:
+            raise StepFailure("eval-parallel", "normal process termination", actual, result.classify())
+    expected = {"print": nat_output(first["expected"]), "expr": nat_output(first["expected"] + 1)}
+    run.require(all(results[name].ok and results[name].stdout == expected[name] for name in modes),
+                "eval-parallel", expected, actual)
+
+
 def run_checks(run, directory, saved=None):
     cases = saved["cases"] if saved is not None else list(inputs(run.seed))
     run.input = {"recipe": "compiler_parity", "cases": cases}
-    wrapper = [shell(), run.overrides.get("ouro-wrapper", ROOT / "scripts/ouro1.sh")]
+    sh = shell()
+    wrapper = [sh, run.overrides.get("ouro-wrapper", ROOT / "scripts/ouro1.sh")]
     staged = stage(run)
     for case in cases:
         work = directory / case["name"]
@@ -107,7 +137,8 @@ def run_checks(run, directory, saved=None):
         artifact.unlink(missing_ok=True)
         host = run.command([*wrapper, "check", path, "999999", "--emit-checked-program", artifact], work, "parity-host")
         run.require(host.ok and "CHECK_OK" in host.stdout and artifact.is_file(), "parity-host-accept", "CHECK_OK and artifact", run.output(host))
-        run.require(checked_program_snapshot(artifact) == core, "parity-host-core", core, checked_program_snapshot(artifact))
+        host_core = checked_program_snapshot(artifact)
+        run.require(host_core == core, "parity-host-core", core, host_core)
         if staged is not None:
             artifact = work / "stage.checked"
             artifact.unlink(missing_ok=True)
@@ -116,17 +147,19 @@ def run_checks(run, directory, saved=None):
                 args += ["--unit", unit]
             result = run.command(args, work, "parity-stage")
             run.require(result.ok and "CHECK_OK" in result.stdout and artifact.is_file(), "parity-stage-accept", "CHECK_OK and artifact", run.output(result))
-            run.require(checked_program_snapshot(artifact) == core, "parity-stage-core", core, checked_program_snapshot(artifact))
+            stage_core = checked_program_snapshot(artifact)
+            run.require(stage_core == core, "parity-stage-core", core, stage_core)
         expected = nat_output(case["expected"])
         native = run.native(path, units=units)
         run.require(native.ok and native.stdout == expected, "parity-native-reference", expected, run.output(native))
         for mode, expression, value in (("--print", "result", case["expected"]),
                                          ("--eval", case["successor"] + " result", case["expected"] + 1)):
             result = run.command([*wrapper, "eval", path, mode, expression, "--type", case["type_name"], "--fuel", "999999"],
-                                 work, "eval-reference", env=environment(build=True), timeout=60)
+                                 work, "eval-reference", env=environment(build=True, shell_path=sh), timeout=60)
             run.require(result.ok and result.stdout == nat_output(value), "eval-reference", nat_output(value), run.output(result))
         run.count("features", "parity:" + case["name"])
-    path = directory / next(case["name"] for case in cases if "expected" in case) / "main.ouro"
+    first = next(case for case in cases if "expected" in case)
+    path = directory / first["name"] / "main.ouro"
     failures = [([path], 2, "EVAL_FAIL: require exactly one of --eval / --print"),
                 ([path, "--print", "result", "--eval", "result"], 2, "EVAL_FAIL: require exactly one of --eval / --print"),
                 ([directory / "missing.ouro", "--print", "result"], 2, "EVAL_FAIL: missing"),
@@ -134,6 +167,9 @@ def run_checks(run, directory, saved=None):
                 # detailed check-mode diagnostics use the separate 41+ range.
                 ([path, "--eval", "missing_symbol", "--fuel", "999999"], 1, "CErr code=2")]
     for args, code, diagnostic in failures:
-        result = run.command([*wrapper, "eval", *args], directory, "eval-negative", env=environment(build=True), timeout=60)
+        result = run.command([*wrapper, "eval", *args], directory, "eval-negative",
+                             env=environment(build=True, shell_path=sh), timeout=60)
         run.require(result.returncode == code and diagnostic in result.stderr and not result.stdout,
                     "eval-negative", {"exit_code": code, "diagnostic": diagnostic}, run.output(result))
+
+    eval_pair(run, directory, wrapper, path, first)

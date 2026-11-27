@@ -1,14 +1,12 @@
 #define _POSIX_C_SOURCE 200809L
-/* runtime/frontend_link.c: generated-style split-frontend linker.
-   Built into _build/gen/fe_link.c by scripts/ouro_build.py.
-   Drives packed Ouro pipeline functions phase by phase and releases
-   temporary arenas between units. Grammar, preprocessing, import resolution,
-   lowering and checking remain in Ouro; C preserves typed failures and
-   prints their diagnostics without retrying another compiler implementation.
-   Type-app erasure belongs in extract.ouro, not here. */
+/* Source for _build/gen/fe_link.c. The linker releases temporary arenas
+   between compilation units and reports the original typed failures.
+   Ouro owns parsing, preprocessing, import resolution, lowering and checking.
+   Type-argument erasure belongs to extract.ouro. */
 #include "ouro_host_values.h"
 
 #include <stdio.h>
+#include <math.h>
 #include <limits.h>
 #include <stdlib.h>
 #include <string.h>
@@ -39,6 +37,113 @@ static ouro_v *quality_parse_source(ouro_env *env, ouro_v *source)
 ouro_v *ouro_wrap_quality_parse(ouro_v *raw)
 {
 	return ouro_clos(quality_parse_source, ouro_cons(raw, 0));
+}
+
+static int lower_ctor_lookup_packed_name(ouro_v *value, unsigned long *name)
+{
+	if (value != 0 && value->tag == OURO_TAG_NAT && value->n >= 0) {
+		*name = (unsigned long)value->n;
+		return 1;
+	}
+	if (value == 0 ||
+	    !((value->tag == OURO_TAG_NAT && value->n >= 0) ||
+	      (value->tag == OURO_TAG_BIG_NAT && value->n > 0 && value->n <= 2)))
+		return 0;
+	/* Preserve raw equality for noncanonical BIG_NAT limbs. */
+	if (value->tag == OURO_TAG_BIG_NAT &&
+	    ((const uint32_t *)(value + 1))[value->n - 1] == 0)
+		return 0;
+	return ouro_nat_to_ulong(value, name);
+}
+
+static ouro_v *lower_ctor_lookup_list(ouro_env *env, ouro_v *original)
+{
+	ouro_v *raw = ouro_get(env, 1);
+	ouro_v *name = ouro_get(env, 0);
+	ouro_v *cursor = original;
+	unsigned long wanted, current;
+
+	if (!lower_ctor_lookup_packed_name(name, &wanted))
+		return ouro_apply(ouro_apply(raw, name), original);
+	while (cursor != 0) {
+		ouro_v *info;
+		if (cursor->tag == 0 && cursor->n == 0)
+			return ouro_ctor(0, 0, 0);
+		if (cursor->tag != 1 || cursor->n != 2)
+			break;
+		info = OURO_F(cursor, 0);
+		if (info == 0 || info->tag != 0 || info->n != 6 ||
+		    !lower_ctor_lookup_packed_name(OURO_F(info, 0), &current))
+			break;
+		/* Preserve the first hit without reading the other fields or tail. */
+		if (current == wanted)
+			return ouro_ctor(1, 1, &info);
+		cursor = OURO_F(cursor, 1);
+	}
+	/* Retry from the original head with the captured canonical function. */
+	return ouro_apply(ouro_apply(raw, name), original);
+}
+
+static ouro_v *lower_ctor_lookup_name(ouro_env *env, ouro_v *name)
+{
+	return ouro_clos(lower_ctor_lookup_list, ouro_cons(name, env));
+}
+
+ouro_v *ouro_wrap_lower_ctor_lookup(ouro_v *raw)
+{
+	return ouro_clos(lower_ctor_lookup_name, ouro_cons(raw, 0));
+}
+
+static ouro_v *module_lookup_list(ouro_env *env, ouro_v *original)
+{
+	ouro_v *raw = ouro_get(env, 1);
+	ouro_v *name = ouro_get(env, 0);
+	ouro_v *cursor = original;
+	unsigned long wanted, current;
+
+	if (!lower_ctor_lookup_packed_name(name, &wanted))
+		return ouro_apply(ouro_apply(raw, name), original);
+	while (cursor != 0) {
+		ouro_v *row;
+		if (cursor->tag == 0 && cursor->n == 0)
+			return ouro_ctor(0, 0, 0);
+		if (cursor->tag != 1 || cursor->n != 2)
+			break;
+		row = OURO_F(cursor, 0);
+		if (row == 0 || row->tag != 0 || row->n != 2 ||
+		    !lower_ctor_lookup_packed_name(OURO_F(row, 0), &current))
+			break;
+		if (current == wanted) {
+			/* The payload and the unvisited tail remain opaque to raw lookup. */
+			ouro_v *payload = OURO_F(row, 1);
+			return ouro_ctor(1, 1, &payload);
+		}
+		cursor = OURO_F(cursor, 1);
+	}
+	/* Preserve the scanned prefix when an unsupported shape requires raw lookup. */
+	return ouro_apply(ouro_apply(raw, name), original);
+}
+
+static ouro_v *module_lookup_name(ouro_env *env, ouro_v *name)
+{
+	return ouro_clos(module_lookup_list, ouro_cons(name, env));
+}
+
+ouro_v *ouro_wrap_module_lookup(ouro_v *raw)
+{
+	return ouro_clos(module_lookup_name, ouro_cons(raw, 0));
+}
+
+ouro_v *ouro_wrap_module_pure_scope(ouro_v *raw, unsigned long arity);
+
+ouro_v *ouro_wrap_source_name_compare_scope(ouro_v *raw)
+{
+	return ouro_wrap_module_pure_scope(raw, 2);
+}
+
+ouro_v *ouro_wrap_elem_scope(ouro_v *raw)
+{
+	return ouro_wrap_module_pure_scope(raw, 3);
 }
 
 #define MAX_PATH 4096
@@ -101,9 +206,13 @@ static ouro_v *compile_units_files(ouro_env *env, ouro_v *files);
 static ouro_v *compile_checked_units_clos(ouro_env *env, ouro_v *fuel);
 static ouro_v *compile_checked_units_root(ouro_env *env, ouro_v *root);
 static ouro_v *compile_checked_units_files(ouro_env *env, ouro_v *files);
+static ouro_v *compile_source_units_clos(ouro_env *env, ouro_v *fuel);
+static ouro_v *compile_source_units_root(ouro_env *env, ouro_v *root);
+static ouro_v *compile_source_units_files(ouro_env *env, ouro_v *files);
 static ouro_v *compile_to_cores_impl(ouro_v *fuel, ouro_v *src);
 static ouro_v *compile_units_impl(ouro_v *fuel, ouro_v *root, ouro_v *files);
-static ouro_v *compile_checked_units_impl(ouro_v *fuel, ouro_v *root, ouro_v *files);
+static ouro_v *compile_checked_units_impl(ouro_v *fuel, ouro_v *root, ouro_v *files,
+					 int legacy_result);
 void ouro_fe_reset_mir_pins(void);
 static ouro_v *list_from_items(ouro_v **items, int n);
 static ouro_v *perm_nil(void);
@@ -113,16 +222,47 @@ static int collect_file_pairs(ouro_v *files, ouro_v ***out_items, int *out_n);
 static ouro_v *pair_fst(ouro_v *p);
 static ouro_v *pair_snd(ouro_v *p);
 
+enum { FE_EXPORT_CACHE_SIZE = 128 };
+
+typedef struct {
+	const char *name;
+	const char *(*table)(int);
+	int count;
+	int index;
+} fe_export_index;
+
+/* Requests use static names and the linked export tables are immutable.
+   Keep indices across heap contexts and invoke the getter in each context. */
+static fe_export_index fe_export_cache[FE_EXPORT_CACHE_SIZE];
+
 static ouro_v *find_exp(const char *name, int n, const char *(*nm)(int),
-			ouro_v *(*val)(int))
+			ouro_v *(*val)(int), int required)
 {
+	uintptr_t key = (uintptr_t)name;
+	fe_export_index *cached = &fe_export_cache[
+		((key >> 3) ^ (key >> 9)) & (FE_EXPORT_CACHE_SIZE - 1U)];
 	int i;
-	for (i = 0; i < n; i++) {
-		if (strcmp(nm(i), name) == 0)
-			return val(i);
+	if (cached->name == name && cached->table == nm && cached->count == n) {
+		i = cached->index;
+	} else {
+		for (i = 0; i < n; i++) {
+			if (strcmp(nm(i), name) == 0) {
+				*cached = (fe_export_index){name, nm, n, i};
+				break;
+			}
+		}
 	}
-	fprintf(stderr, "ouro1: frontend glue missing export %s\n", name);
-	exit(2);
+	if (i < n) {
+		ouro_v *value = val(i);
+		if (value != 0 || required)
+			return value;
+		fprintf(stderr, "ouro1: frontend glue invalid export %s\n", name);
+		exit(2);
+	}
+	if (required) {
+		fprintf(stderr, "ouro1: frontend glue missing export %s\n", name);
+		exit(2);
+	}
 	return 0;
 }
 
@@ -139,11 +279,17 @@ static const char *fe_flat_alias(const char *name)
 
 #define FIND(mod, name)                                                        \
 	find_exp(fe_flat_alias(name), ouro_export_count(), ouro_export_name,    \
-		 ouro_export_value)
+		 ouro_export_value, 1)
+#define FIND_OPTIONAL(mod, name)                                               \
+	find_exp(fe_flat_alias(name), ouro_export_count(), ouro_export_name,    \
+		 ouro_export_value, 0)
 #else
 #define FIND(mod, name)                                                        \
 	find_exp((name), ouro_export_count_##mod(), ouro_export_name_##mod,    \
-		 ouro_export_value_##mod)
+		 ouro_export_value_##mod, 1)
+#define FIND_OPTIONAL(mod, name)                                               \
+	find_exp((name), ouro_export_count_##mod(), ouro_export_name_##mod,    \
+		 ouro_export_value_##mod, 0)
 #endif
 
 
@@ -270,8 +416,12 @@ static void print_diag(const char *code, const char *path, const char *src,
 
 static char *src_from_codes(ouro_v *xs, size_t *out_n)
 {
-	char *buf = (char *)malloc(1 << 20);
+	char *buf;
 	int n;
+	*out_n = 0;
+	if (xs == 0)
+		return 0;
+	buf = (char *)malloc(1 << 20);
 	if (buf == 0)
 		return 0;
 	n = codes_to_buf(xs, buf, 1 << 20);
@@ -510,6 +660,81 @@ static void print_units_diag(ouro_v *files, ouro_v *r)
 	                      code, cerr_det(r));
 }
 
+/* Only the compiler-owned envelope selects declaration, unit and cause. The
+   renderer never searches source or turns an absent span into byte zero. */
+static void print_source_result_diag(ouro_v *source_result, ouro_v *raw_result, ouro_v *src)
+{
+	ouro_v *failure, *view, *diagnostic, *owner, *info, *unit, *cause, *phase;
+	const char *phase_name;
+	char pathbuf[MAX_PATH];
+	char namebuf[256];
+	int code = cerr_code(raw_result);
+	unsigned long name;
+	if (source_result == 0 || source_result->tag != 0 || source_result->n < 1)
+		return;
+	failure = OURO_F(source_result, source_result->n - 1);
+	view = ouro_apply(FIND(pl, "source_failure_diagnostic"), failure);
+	if (view == 0 || view->tag != 1 || view->n < 1) {
+		(void)print_prep_diag("<input>", src, code, cerr_det(raw_result));
+		return;
+	}
+	diagnostic = OURO_F(view, view->n - 1);
+	owner = pair_fst(diagnostic);
+	info = pair_snd(diagnostic);
+	phase = pair_snd(owner);
+	if (owner == 0 || info == 0 || phase == 0 || phase->tag > 4) {
+		fprintf(stderr, "<input>: invalid compilation failure metadata; code=%d detail=%d\n",
+			code, cerr_det(raw_result));
+		return;
+	}
+	name = as_nat(pair_fst(owner));
+	unit = pair_fst(info);
+	cause = pair_snd(info);
+	pathbuf[0] = 0;
+	if (unit != 0 && unit->tag == 1 && unit->n >= 1) {
+		ouro_v *path = ouro_apply(ouro_apply(FIND(pl, "str_of_id"), g_last_intern),
+			OURO_F(unit, unit->n - 1));
+		codes_to_buf(path, pathbuf, MAX_PATH);
+	}
+	if (pathbuf[0] == 0)
+		snprintf(pathbuf, sizeof pathbuf, "<input>");
+	if (name > INT_MAX || decl_name_from_intern((int)name, namebuf, (int)sizeof namebuf) <= 0)
+		snprintf(namebuf, sizeof namebuf, "declaration#%lu", name);
+	switch (phase->tag) {
+	case 0: phase_name = "future-slot"; break;
+	case 1: phase_name = "duplicate"; break;
+	case 2: phase_name = "future-global"; break;
+	case 3: phase_name = "surface"; break;
+	case 4: phase_name = "core"; break;
+	default: return;
+	}
+	if (cause != 0 && cause->tag == 1 && cause->n >= 1) {
+		ouro_v *root = OURO_F(cause, cause->n - 1);
+		if (root != 0 && root->tag == 0 && root->n >= 1) {
+			ouro_v *list_refusal = OURO_F(root, root->n - 1);
+			if (list_refusal != 0 && list_refusal->tag <= 3) {
+				fprintf(stderr, "%s: OURO-LIST-001: list literal without known List A context in %s (%s)\n",
+					pathbuf, namebuf, phase_name);
+				fputs("  hint: Add a declaration/ascription such as : List Nat.\n", stderr);
+				return;
+			}
+		}
+		if (root != 0 && root->tag == 1 && root->n >= 1) {
+			fprintf(stderr, "%s: OURO-HOLE-001: unresolved named hole in %s (%s)\n",
+				pathbuf, namebuf, phase_name);
+			fputs("  hint: Replace the named hole before release/profile checking.\n", stderr);
+			return;
+		}
+	}
+	if (phase->tag == 4 && code >= 41 && code <= 49 &&
+	    name <= INT_MAX && (int)name == cerr_det(raw_result)) {
+		(void)print_prep_diag(pathbuf, src, code, cerr_det(raw_result));
+		return;
+	}
+	fprintf(stderr, "%s: compilation failed in %s (%s); code=%d detail=%d\n",
+		pathbuf, namebuf, phase_name, code, cerr_det(raw_result));
+}
+
 static ouro_v *pair_fst(ouro_v *p)
 {
 	if (p == 0 || p->n < 2)
@@ -546,13 +771,13 @@ static ouro_v *packed_stitch_source(void)
 	if (g_stitch_source != 0)
 		return g_stitch_source;
 	ouro_static_begin();
-	fn = FIND(pl, "stitch_checked_source");
+	fn = FIND(pl, "stitch_checked_source_with_origin");
 	fn = ouro_apply(fn, FIND(lx, "lex_go_import"));
 	fn = ouro_apply(fn, closed_parse_file_visibility());
 	fn = ouro_apply(fn, FIND(ds, "desugar_file"));
 	fn = ouro_apply(fn, FIND(lr, "rewrite_declarations"));
-	fn = ouro_apply(fn, FIND(lo, "lower_expr_env2"));
-	fn = ouro_apply(fn, FIND(co, "compile_program"));
+	fn = ouro_apply(fn, FIND(lo, "lower_expr_env2_with_cause"));
+	fn = ouro_apply(fn, FIND(co, "compile_program_with_location"));
 	fn = ouro_apply(fn, FIND(el, "elaborate_surfaces"));
 	fn = ouro_apply(fn, FIND(el, "elaborate_fuel"));
 	fn = ouro_apply(fn, FIND(fc, "check_module"));
@@ -567,15 +792,11 @@ static ouro_v *compile_to_cores_impl(ouro_v *fuel, ouro_v *src)
 {
 	ouro_v *pair;
 	ouro_v *r;
-	int code;
 	g_last_checked_program = 0;
 	pair = ouro_apply(ouro_apply(packed_stitch_source(), fuel), src);
-	r = pair_fst(pair);
+	r = ouro_apply(FIND(pl, "source_result_comp"), pair_fst(pair));
 	g_last_intern = pair_snd(pair);
-	if (r == 0 || r->tag != 1) {
-		code = cerr_code(r);
-		(void)print_prep_diag("", src, code, cerr_det(r));
-	}
+	print_source_result_diag(pair_fst(pair), r, src);
 	return publish_checked_result(r);
 }
 
@@ -585,7 +806,7 @@ static void fe_phase_done(const char *label);
 static ouro_v *g_closed_preprocess_src;
 static ouro_v *g_closed_parse_unit;
 static ouro_v *g_closed_compile_from_decls;
-static ouro_v *g_closed_remap_comp_files;
+static ouro_v *g_closed_compile_source_packet;
 
 static ouro_v *closed_preprocess_src(void)
 {
@@ -617,11 +838,99 @@ static ouro_v *bounded_call(ouro_v *fn, int count, ouro_v **args,
 	return result;
 }
 
+/* Compile / elaborate / lower seams keep their result in the caller's
+   allocator. A nested work context drops the callee graph without parking
+   a permanent clone of every intermediate stage. */
+static ouro_v *context_call(ouro_v *fn, int count, ouro_v **args)
+{
+	ouro_heap_context *context = ouro_heap_context_enter();
+	int i;
+	for (i = 0; i < count; i++)
+		fn = ouro_apply(fn, args[i]);
+	return ouro_heap_context_leave(context, fn);
+}
+
+enum check_profile_phase {
+	CHECK_PROFILE_LOWER,
+	CHECK_PROFILE_PREFLIGHT,
+	CHECK_PROFILE_FALLBACK,
+	CHECK_PROFILE_PHASE_COUNT
+};
+
+struct check_profile_total {
+	unsigned long long calls;
+	unsigned long long allocated_bytes;
+	double elapsed_s;
+	int invalid_allocation;
+	int invalid_clock;
+};
+
+static double (*g_check_profile_clock)(void);
+static struct check_profile_total g_check_profile_totals[CHECK_PROFILE_PHASE_COUNT];
+static unsigned long long g_check_profile_preflight_items;
+
+/* Preflight totals include the bounded item calls and their result copies. */
+static ouro_v *check_profile_context_call(enum check_profile_phase phase,
+	ouro_v *fn, int count, ouro_v **args)
+{
+	struct check_profile_total *total = &g_check_profile_totals[phase];
+	unsigned long long before_alloc, after_alloc, allocated_delta;
+	double before, after, elapsed;
+	ouro_v *result;
+	if (g_check_profile_clock == 0)
+		return context_call(fn, count, args);
+	before_alloc = ouro_heap_total_alloc_bytes();
+	before = g_check_profile_clock();
+	result = context_call(fn, count, args);
+	after = g_check_profile_clock();
+	after_alloc = ouro_heap_total_alloc_bytes();
+	total->calls++;
+	if (after_alloc < before_alloc) {
+		total->invalid_allocation = 1;
+	} else {
+		allocated_delta = after_alloc - before_alloc;
+		if (allocated_delta > ULLONG_MAX - total->allocated_bytes)
+			total->invalid_allocation = 1;
+		else
+			total->allocated_bytes += allocated_delta;
+	}
+	if (!isfinite(before) || !isfinite(after) || before < 0.0 || after < before) {
+		total->invalid_clock = 1;
+	} else {
+		elapsed = total->elapsed_s + (after - before);
+		if (!isfinite(elapsed))
+			total->invalid_clock = 1;
+		else
+			total->elapsed_s = elapsed;
+	}
+	return result;
+}
+
+static void check_profile_report_totals(void)
+{
+	static const char *const names[] = {"lower-expr", "preflight", "fallback-elaborate"};
+	int i;
+	for (i = 0; i < CHECK_PROFILE_PHASE_COUNT; i++) {
+		const struct check_profile_total *total = &g_check_profile_totals[i];
+		fprintf(stderr, "n1-host: check-profile phase=%s calls=%llu", names[i], total->calls);
+		if (i == CHECK_PROFILE_PREFLIGHT)
+			fprintf(stderr, " items=%llu", g_check_profile_preflight_items);
+		if (total->invalid_clock)
+			fputs(" elapsed_s=unavailable", stderr);
+		else
+			fprintf(stderr, " elapsed_s=%.6f", total->elapsed_s);
+		if (total->invalid_allocation)
+			fputs(" allocated_bytes=unavailable\n", stderr);
+		else
+			fprintf(stderr, " allocated_bytes=%llu\n", total->allocated_bytes);
+	}
+}
+
 static ouro_v *bounded_token_state(ouro_env *env, ouro_v *st)
 {
-	return bounded_call(FIND(lx, "next_import_token_indexed"), 3,
+	return bounded_call(ouro_get(env, 2), 3,
 		(ouro_v *[]){ouro_get(env, 1), ouro_get(env, 0), st},
-		ouro_clone_perm);
+		ouro_clone_perm_with_stack_scratch);
 }
 
 static ouro_v *bounded_token_source(ouro_env *env, ouro_v *src)
@@ -660,6 +969,124 @@ static ouro_v *import_token_fuel(ouro_env *env, ouro_v *fuel)
 ouro_v *ouro_wrap_settled3(ouro_v *raw)
 {
 	return ouro_clos(import_token_fuel, ouro_cons(raw, 0));
+}
+
+static ouro_v *mir_settled_first_argument(ouro_env *env, ouro_v *argument)
+{
+	return ouro_wrap_settled3(ouro_apply(ouro_get(env, 0), argument));
+}
+
+ouro_v *ouro_wrap_mir_check_instruction(ouro_v *raw)
+{
+	return ouro_clos(mir_settled_first_argument, ouro_cons(raw, 0));
+}
+
+/* Bootstrap-only: borrow caller inputs and retain the complete pure result. */
+static ouro_v *module_pure_scope_argument(ouro_env *env, ouro_v *argument)
+{
+	unsigned long remaining;
+	ouro_v *args[7], *result;
+	ouro_heap_context *context;
+	int count = 0;
+	if (env == 0 || !ouro_nat_to_ulong(env->v, &remaining) ||
+	    remaining < 1 || remaining > 7) {
+		fputs("ouro_rt: invalid module pure scope curry state\n", stderr);
+		exit(1);
+	}
+	if (remaining > 1)
+		return ouro_clos(module_pure_scope_argument,
+			ouro_cons(ouro_nat(remaining - 1), ouro_cons(argument, env->next)));
+	args[count++] = argument;
+	env = env->next;
+	while (env != 0 && env->next != 0) {
+		if (count == 7) {
+			fputs("ouro_rt: invalid module pure scope arguments\n", stderr);
+			exit(1);
+		}
+		args[count++] = env->v;
+		env = env->next;
+	}
+	if (env == 0 || env->v == 0 || env->v->tag != OURO_TAG_CLOS ||
+	    (count != 1 && count != 2 && count != 3 && count != 7)) {
+		fputs("ouro_rt: invalid module pure scope callable\n", stderr);
+		exit(1);
+	}
+	context = ouro_heap_context_enter();
+	result = env->v;
+	while (count > 0)
+		result = ouro_apply(result, args[--count]);
+	return ouro_heap_context_leave(context, result);
+}
+
+ouro_v *ouro_wrap_module_pure_scope(ouro_v *raw, unsigned long arity)
+{
+	if (raw == 0 || raw->tag != OURO_TAG_CLOS ||
+	    (arity != 1 && arity != 2 && arity != 3 && arity != 7)) {
+		fputs("ouro_rt: invalid module pure scope arity or callable\n", stderr);
+		exit(1);
+	}
+	return ouro_clos(module_pure_scope_argument,
+		ouro_cons(ouro_nat(arity), ouro_cons(raw, 0)));
+}
+
+static ouro_v *module_pure_scope_prefix_last(ouro_env *env, ouro_v *argument)
+{
+	return ouro_wrap_module_pure_scope(ouro_apply(ouro_get(env, 0), argument), 7);
+}
+
+static ouro_v *module_pure_scope_prefix_second(ouro_env *env, ouro_v *argument)
+{
+	return ouro_clos(module_pure_scope_prefix_last,
+		ouro_cons(ouro_apply(ouro_get(env, 0), argument), 0));
+}
+
+static ouro_v *module_pure_scope_prefix_third(ouro_env *env, ouro_v *argument)
+{
+	return ouro_clos(module_pure_scope_prefix_second,
+		ouro_cons(ouro_apply(ouro_get(env, 0), argument), 0));
+}
+
+/* Leading lambdas capture caller values; only the saturated body needs a scope. */
+ouro_v *ouro_wrap_module_maps_for_scope(ouro_v *raw)
+{
+	return ouro_clos(module_pure_scope_prefix_second, ouro_cons(raw, 0));
+}
+
+ouro_v *ouro_wrap_module_rewrite_decls_scope(ouro_v *raw)
+{
+	return ouro_clos(module_pure_scope_prefix_third, ouro_cons(raw, 0));
+}
+
+static ouro_v *module_pure_scope_body2_prefix_last(ouro_env *env, ouro_v *argument)
+{
+	return ouro_wrap_module_pure_scope(ouro_apply(ouro_get(env, 0), argument), 2);
+}
+
+static ouro_v *module_pure_scope_body2_prefix_second(ouro_env *env, ouro_v *argument)
+{
+	return ouro_clos(module_pure_scope_body2_prefix_last,
+		ouro_cons(ouro_apply(ouro_get(env, 0), argument), 0));
+}
+
+static ouro_v *module_pure_scope_body2_prefix_third(ouro_env *env, ouro_v *argument)
+{
+	return ouro_clos(module_pure_scope_body2_prefix_second,
+		ouro_cons(ouro_apply(ouro_get(env, 0), argument), 0));
+}
+
+ouro_v *ouro_wrap_module_scope_maps_scope(ouro_v *raw)
+{
+	return ouro_clos(module_pure_scope_body2_prefix_second, ouro_cons(raw, 0));
+}
+
+ouro_v *ouro_wrap_module_bare_ctors_scope(ouro_v *raw)
+{
+	return ouro_clos(module_pure_scope_body2_prefix_third, ouro_cons(raw, 0));
+}
+
+ouro_v *ouro_wrap_module_invalid_maps_scope(ouro_v *raw)
+{
+	return ouro_clos(module_pure_scope_body2_prefix_last, ouro_cons(raw, 0));
 }
 
 /* PE operations borrow immutable caller inputs. Only their complete
@@ -706,6 +1133,18 @@ ouro_v *ouro_wrap_pe_apply_patches(ouro_v *raw)
 	return ouro_clos(pe_scoped_argument, ouro_cons(ouro_nat(2), ouro_cons(raw, 0)));
 }
 
+/* The unary pure step uses the same complete-result context protocol. */
+ouro_v *ouro_wrap_pe_patch_prefix_step(ouro_v *raw)
+{
+	return ouro_wrap_pe_word32(raw);
+}
+
+/* The thunk and its immutable captures predate the complete-result context. */
+ouro_v *ouro_wrap_pe_run_fixup_step(ouro_v *raw)
+{
+	return ouro_wrap_pe_word32(raw);
+}
+
 ouro_v *ouro_wrap_pe_function_scan(ouro_v *raw)
 {
 	return ouro_clos(pe_scoped_argument, ouro_cons(ouro_nat(4), ouro_cons(raw, 0)));
@@ -727,10 +1166,10 @@ static ouro_v *closed_parse_unit(void)
 	if (g_closed_parse_unit != 0)
 		return g_closed_parse_unit;
 	ouro_static_begin();
-	fn = FIND(pl, "parse_unit");
-	fn = ouro_apply(fn, ouro_apply(FIND(lx, "lex_go_indexed_with"),
-		ouro_clos(bounded_token_fuel, 0)));
-	fn = ouro_apply(fn, FIND(lx, "intern_string"));
+	fn = FIND(pl, "parse_unit_indexed");
+	fn = ouro_apply(fn, ouro_apply(FIND(lx, "lex_go_carried_with"),
+		ouro_clos(bounded_token_fuel,
+			ouro_cons(FIND(lx, "next_import_token_indexed"), 0))));
 	fn = ouro_apply(fn, closed_parse_file_visibility());
 	g_closed_parse_unit = fn;
 	ouro_static_end();
@@ -739,13 +1178,13 @@ static ouro_v *closed_parse_unit(void)
 
 /* The generated pipeline retains its own stack and phase values while lowering
    successive declarations. Reclaim only allocations made inside one lowerer
-   call, after cloning its data result. This seam is not recursively re-entered:
-   recursion inside lower_expr_env2 stays in the generated lowerer. */
+   call, after copying its data result into the caller heap. This seam is not
+   recursively re-entered: recursion inside lower_expr_env2_with_cause stays
+   in the generated lowerer. */
 static ouro_v *bounded_lower_expr(ouro_env *env, ouro_v *expr)
 {
-	return bounded_call(FIND(lo, "lower_expr_env2"), 3,
-		(ouro_v *[]){ouro_get(env, 1), ouro_get(env, 0), expr},
-		ouro_clone_perm_deep);
+	return check_profile_context_call(CHECK_PROFILE_LOWER, FIND(lo, "lower_expr_env2_with_cause"), 3,
+		(ouro_v *[]){ouro_get(env, 1), ouro_get(env, 0), expr});
 }
 
 static ouro_v *bounded_lower_expected(ouro_env *env, ouro_v *expected)
@@ -758,21 +1197,73 @@ static ouro_v *bounded_lower_environment(ouro_env *env, ouro_v *lower_env)
 	return ouro_clos(bounded_lower_expected, ouro_cons(lower_env, env));
 }
 
+/* Borrow item inputs from the suspended traversal. Retain the complete
+   phase/error or future/core result before releasing the work context. */
+static ouro_v *bounded_compile_program_item_seen(ouro_env *env, ouro_v *seen)
+{
+	ouro_v *fn = ouro_get(env, 4);
+	ouro_v *name = ouro_get(env, 3);
+	ouro_v *surface = ouro_get(env, 2);
+	ouro_v *future = ouro_get(env, 1);
+	ouro_v *ctx = ouro_get(env, 0);
+	ouro_heap_context *context = ouro_heap_context_enter();
+	ouro_v *result = ouro_apply(ouro_apply(ouro_apply(ouro_apply(ouro_apply(
+		fn, name), surface), future), ctx), seen);
+	result = ouro_heap_context_leave(context, result);
+	if (g_check_profile_clock != 0)
+		g_check_profile_preflight_items++;
+	return result;
+}
+
+static ouro_v *bounded_compile_program_item_context(ouro_env *env, ouro_v *ctx)
+{
+	return ouro_clos(bounded_compile_program_item_seen, ouro_cons(ctx, env));
+}
+
+static ouro_v *bounded_compile_program_item_future(ouro_env *env, ouro_v *future)
+{
+	return ouro_clos(bounded_compile_program_item_context, ouro_cons(future, env));
+}
+
+static ouro_v *bounded_compile_program_item_surface(ouro_env *env, ouro_v *surface)
+{
+	return ouro_clos(bounded_compile_program_item_future, ouro_cons(surface, env));
+}
+
+static ouro_v *bounded_compile_program_item_name(ouro_env *env, ouro_v *name)
+{
+	return ouro_clos(bounded_compile_program_item_surface, ouro_cons(name, env));
+}
+
+static ouro_v *bounded_compile_program_item_scope(ouro_env *env, ouro_v *item)
+{
+	(void)env;
+	return ouro_clos(bounded_compile_program_item_name, ouro_cons(item, 0));
+}
+
 /* Preflight compilation may return an error and fall back to elaboration.
    Neither attempt's temporary graph is needed by the next pipeline step.
    These generated callbacks do not invoke the bounded lower/check callbacks,
-   so each mark belongs to one complete, non-reentrant pure pass. */
+   so each work context belongs to one complete, non-reentrant pure pass. */
 static ouro_v *bounded_compile_program(ouro_env *env, ouro_v *surfaces)
 {
+	ouro_v *indexed, *compile_item;
 	(void)env;
-	return bounded_call(FIND(co, "compile_program"), 1,
-		(ouro_v *[]){surfaces}, ouro_clone_perm);
+	indexed = FIND_OPTIONAL(co, "compile_program_with_location_indexed_with");
+	if (indexed != 0)
+		return check_profile_context_call(CHECK_PROFILE_PREFLIGHT, indexed, 2,
+			(ouro_v *[]){ouro_clos(bounded_compile_program_item_scope, 0), surfaces});
+	/* Older export tables use the list-based walk with the same item scope. */
+	compile_item = bounded_compile_program_item_scope(0, FIND(co, "compile_program_item_pure"));
+	return check_profile_context_call(CHECK_PROFILE_PREFLIGHT,
+		FIND(co, "compile_program_with_location_with"), 2,
+		(ouro_v *[]){compile_item, surfaces});
 }
 
 static ouro_v *bounded_elaborate_surfaces(ouro_env *env, ouro_v *surfaces)
 {
-	return bounded_call(FIND(el, "elaborate_surfaces"), 2,
-		(ouro_v *[]){ouro_get(env, 0), surfaces}, ouro_clone_perm);
+	return check_profile_context_call(CHECK_PROFILE_FALLBACK, FIND(el, "elaborate_surfaces"), 2,
+		(ouro_v *[]){ouro_get(env, 0), surfaces});
 }
 
 static ouro_v *bounded_elaborate_surfaces_fuel(ouro_env *env, ouro_v *fuel)
@@ -783,8 +1274,8 @@ static ouro_v *bounded_elaborate_surfaces_fuel(ouro_env *env, ouro_v *fuel)
 
 static ouro_v *bounded_elaborate_context(ouro_env *env, ouro_v *names)
 {
-	return bounded_call(FIND(el, "elaborate_fuel"), 3,
-		(ouro_v *[]){ouro_get(env, 1), ouro_get(env, 0), names}, ouro_clone_perm);
+	return context_call(FIND(el, "elaborate_fuel"), 3,
+		(ouro_v *[]){ouro_get(env, 1), ouro_get(env, 0), names});
 }
 
 static ouro_v *bounded_elaborate_surface(ouro_env *env, ouro_v *surface)
@@ -798,6 +1289,45 @@ static ouro_v *bounded_elaborate_fuel(ouro_env *env, ouro_v *fuel)
 	return ouro_clos(bounded_elaborate_surface, ouro_cons(fuel, 0));
 }
 
+static ouro_v *g_check_profile_intern;
+static unsigned long long g_check_profile_ordinal;
+
+void ouro_fe_set_check_profile(double (*clock_now)(void))
+{
+	if (g_check_profile_clock != 0 && clock_now == 0)
+		check_profile_report_totals();
+	if (clock_now != 0) {
+		memset(g_check_profile_totals, 0, sizeof(g_check_profile_totals));
+		g_check_profile_preflight_items = 0;
+	}
+	g_check_profile_clock = clock_now;
+	g_check_profile_intern = 0;
+	g_check_profile_ordinal = 0;
+}
+
+static void check_profile_identity(ouro_v *mode, ouro_v *fuel, ouro_v *item)
+{
+	ouro_heap_context *context = ouro_heap_context_enter();
+	ouro_v *name = ouro_apply(FIND(fc, "file_item_name"), item);
+	ouro_v *decimal = ouro_nat_decimal(name);
+	ouro_v *spelling = g_check_profile_intern == 0 ? 0 :
+		ouro_apply(ouro_apply(FIND(pl, "name_of_id"), g_check_profile_intern), name);
+	const char *kind = mode != 0 && mode->n == 0 ?
+		(mode->tag == 1 ? "source" : mode->tag == 0 ? "exact" : "unknown") : "unknown";
+	fprintf(stderr, "n1-host: declaration-start ordinal=%llu mode=%s name_id=",
+		g_check_profile_ordinal, kind);
+	fputs(decimal->u.s, stderr);
+	fputs(" name=", stderr);
+	if (list_done(spelling))
+		fputs("<unknown>", stderr);
+	else
+		ouro_write_codes(spelling, stderr);
+	fputs(" fuel=", stderr);
+	fputs(ouro_nat_decimal(fuel)->u.s, stderr);
+	fputc('\n', stderr);
+	(void)ouro_heap_context_leave(context, 0);
+}
+
 /* The generated checker owns coverage, ordering and judgments. Suspend the
    caller's growing signature while checking one declaration; copy only the
    result's new cells back, sharing caller-owned terms and accepted entries. */
@@ -807,9 +1337,35 @@ static ouro_v *bounded_check_item(ouro_env *env, ouro_v *item)
 	ouro_v *mode = ouro_get(env, 2);
 	ouro_v *fuel = ouro_get(env, 1);
 	ouro_v *sig = ouro_get(env, 0);
-	ouro_heap_context *context = ouro_heap_context_enter();
-	ouro_v *result = ouro_apply(ouro_apply(ouro_apply(ouro_apply(fn, mode), fuel), sig), item);
-	return ouro_heap_context_leave(context, result);
+	ouro_heap_context *context;
+	ouro_v *result;
+	double before = -1.0, after;
+	unsigned long long allocated = 0, total;
+	if (g_check_profile_clock != 0) {
+		g_check_profile_ordinal++;
+		check_profile_identity(mode, fuel, item);
+		allocated = ouro_heap_total_alloc_bytes();
+		before = g_check_profile_clock();
+	}
+	context = ouro_heap_context_enter();
+	result = ouro_apply(ouro_apply(ouro_apply(ouro_apply(fn, mode), fuel), sig), item);
+	result = ouro_heap_context_leave(context, result);
+	if (g_check_profile_clock != 0) {
+		after = g_check_profile_clock();
+		total = ouro_heap_total_alloc_bytes();
+		fprintf(stderr, "n1-host: declaration-end ordinal=%llu result=%s elapsed_s=",
+			g_check_profile_ordinal, result != 0 && result->tag == 0 && result->n == 1 ? "ok" :
+			result != 0 && result->tag == 1 && result->n == 3 ? "refused" : "invalid-result");
+		if (isfinite(before) && isfinite(after) && before >= 0.0 && after >= before)
+			fprintf(stderr, "%.6f", after - before);
+		else
+			fputs("unavailable", stderr);
+		if (total >= allocated)
+			fprintf(stderr, " allocated_bytes=%llu\n", total - allocated);
+		else
+			fputs(" allocated_bytes=unavailable\n", stderr);
+	}
+	return result;
 }
 
 static ouro_v *bounded_check_signature(ouro_env *env, ouro_v *sig)
@@ -833,13 +1389,13 @@ static ouro_v *bounded_check_declaration(void)
 		ouro_cons(FIND(fc, "check_indexed_declaration"), 0));
 }
 
-static ouro_v *closed_compile_from_decls(void)
+static ouro_v *closed_compile_decls_entry(const char *name, ouro_v **cache)
 {
 	ouro_v *fn;
-	if (g_closed_compile_from_decls != 0)
-		return g_closed_compile_from_decls;
+	if (*cache != 0)
+		return *cache;
 	ouro_static_begin();
-	fn = FIND(pl, "compile_checked_from_decls");
+	fn = FIND(pl, name);
 	fn = ouro_apply(fn, FIND(ds, "desugar_file"));
 	fn = ouro_apply(fn, FIND(lr, "rewrite_declarations"));
 	fn = ouro_apply(fn, ouro_clos(bounded_lower_environment, 0));
@@ -848,21 +1404,21 @@ static ouro_v *closed_compile_from_decls(void)
 	fn = ouro_apply(fn, ouro_clos(bounded_elaborate_fuel, 0));
 	fn = ouro_apply(fn, ouro_apply(FIND(fc, "check_indexed_module_with"),
 		bounded_check_declaration()));
-	g_closed_compile_from_decls = fn;
+	*cache = fn;
 	ouro_static_end();
 	return fn;
 }
 
-static ouro_v *closed_remap_comp_files(void)
+static ouro_v *closed_compile_from_decls(void)
 {
-	ouro_v *fn;
-	if (g_closed_remap_comp_files != 0)
-		return g_closed_remap_comp_files;
-	ouro_static_begin();
-	fn = FIND(pl, "remap_comp_files_for");
-	g_closed_remap_comp_files = fn;
-	ouro_static_end();
-	return fn;
+	return closed_compile_decls_entry("compile_checked_from_decls_with_origin",
+		&g_closed_compile_from_decls);
+}
+
+static ouro_v *closed_compile_source_packet(void)
+{
+	return closed_compile_decls_entry("compile_checked_from_decls_with_source_packet",
+		&g_closed_compile_source_packet);
 }
 
 static ouro_v *perm_nil(void)
@@ -956,86 +1512,48 @@ static int unit_prepass_incremental(ouro_v *files, ouro_v **out_files,
 	ouro_v *preprocess_src = closed_preprocess_src();
 	ouro_v *reg = FIND(pl, "empty_rec_reg_pl");
 	ouro_v **in_items = 0;
-	ouro_v **out_items = 0;
-	ouro_v **alias_items = 0;
+	ouro_v *prepared;
+	ouro_v *alias_files;
 	int n = 0;
 	int i;
-	int ok = 1;
 	if (!collect_file_pairs(files, &in_items, &n))
 		return 0;
-	if (n > 0) {
-		out_items = (ouro_v **)calloc((unsigned long)n, sizeof(ouro_v *));
-		alias_items = (ouro_v **)calloc((unsigned long)n, sizeof(ouro_v *));
-		if (out_items == 0 || alias_items == 0) {
-			free(in_items);
-			free(out_items);
-			free(alias_items);
-			return 0;
-		}
-	}
+	/* All input fields are retained in this bank. Check every pair before
+	   source diagnostics can take precedence over a malformed input list. */
 	for (i = 0; i < n; i++) {
 		ouro_v *f = in_items[i];
-		ouro_v *path;
-		ouro_v *src;
 		if (f == 0 || f->n < 2) {
 			free(in_items);
-			free(out_items);
-			free(alias_items);
 			return 0;
 		}
-		/* Inputs already live in this perm bank. Share them; a deep clone
-		   here recopies every source before preprocessing starts. */
-		path = ouro_clone_perm(pair_fst(f));
-		src = ouro_clone_perm(pair_snd(f));
-		in_items[i] = perm_pair(path, src);
 	}
-	if (n > 0 && out_items != 0) {
-		for (i = n - 1; i >= 0; i--) {
-			ouro_v *f = in_items[i];
-			ouro_v *path;
-			ouro_v *src;
-			ouro_v *r;
-			ouro_v *src2;
-			ouro_v *aliases;
-			if (f == 0 || f->n < 2) {
-				ok = 0;
-				break;
-			}
-			path = pair_fst(f);
-			src = pair_snd(f);
-			r = ouro_apply(ouro_apply(ouro_apply(preprocess_src, path), reg), src);
-			if (r == 0 || r->tag != 1 || r->n < 3) {
-				if (r != 0 && r->tag == 0 && r->n >= 2)
-					*out_error = ouro_clone_perm_deep(cerr(
-						as_nat(pair_fst(r)), as_nat(pair_snd(r))));
-				fe_phase_done("frontend-after-preprocess-unit-error");
-				ok = 0;
-				break;
-			}
-			/* The record registry is threaded through every file. Deep-cloning
-			   it recopies the whole accumulated graph on each file and is
-			   what pushes one native_build emit past the 900s host budget.
-			   Share nodes already in this perm bank; copy only this file's
-			   phase allocations. discard_phase below then drops the scratch. */
-			reg = ouro_clone_perm(OURO_F(r, r->n - 3));
-			aliases = ouro_clone_perm(OURO_F(r, r->n - 2));
-			src2 = ouro_clone_perm(OURO_F(r, r->n - 1));
-			path = ouro_clone_perm(path);
-			out_items[i] = perm_pair(path, src2);
-			alias_items[i] = perm_pair(path, aliases);
-			fe_phase_done("frontend-after-preprocess-unit");
+	prepared = perm_nil();
+	alias_files = perm_nil();
+	for (i = n - 1; i >= 0; i--) {
+		ouro_v *path = pair_fst(in_items[i]);
+		ouro_v *src = pair_snd(in_items[i]);
+		ouro_v *r = ouro_apply(ouro_apply(ouro_apply(preprocess_src, path), reg), src);
+		ouro_v *aliases;
+		ouro_v *expanded;
+		if (r == 0 || r->tag != 1 || r->n < 3) {
+			if (r != 0 && r->tag == 0 && r->n >= 2)
+				*out_error = ouro_clone_perm_deep(cerr(
+					as_nat(pair_fst(r)), as_nat(pair_snd(r))));
+			fe_phase_done("frontend-after-preprocess-unit-error");
+			free(in_items);
+			return 0;
 		}
+		/* Retain only the new phase nodes in the accumulated registry. */
+		reg = ouro_clone_perm(OURO_F(r, r->n - 3));
+		aliases = ouro_clone_perm(OURO_F(r, r->n - 2));
+		expanded = ouro_clone_perm(OURO_F(r, r->n - 1));
+		prepared = perm_cons(perm_pair(path, expanded), prepared);
+		alias_files = perm_cons(perm_pair(path, aliases), alias_files);
+		fe_phase_done("frontend-after-preprocess-unit");
 	}
 	free(in_items);
-	if (!ok) {
-		free(out_items);
-		free(alias_items);
-		return 0;
-	}
-	*out_files = list_from_items(out_items, n);
-	*out_alias_files = list_from_items(alias_items, n);
-	free(out_items);
-	free(alias_items);
+	*out_files = prepared;
+	*out_alias_files = alias_files;
 	return 1;
 }
 
@@ -1044,7 +1562,7 @@ static int parse_units_incremental(ouro_v *fuel, ouro_v *files,
 				   ouro_v **out_error)
 {
 	ouro_v *parse_unit = closed_parse_unit();
-	ouro_v *st = FIND(lx, "empty_intern");
+	ouro_v *indexed = ouro_apply(FIND(lx, "lexer_intern_from"), FIND(lx, "empty_intern"));
 	ouro_v **items = 0;
 	int nitems = 0;
 	int cap = 0;
@@ -1067,7 +1585,7 @@ static int parse_units_incremental(ouro_v *fuel, ouro_v *files,
 		}
 		path = pair_fst(f);
 		src = pair_snd(f);
-		r = ouro_apply(ouro_apply(ouro_apply(ouro_apply(parse_unit, fuel), st), path), src);
+		r = ouro_apply(ouro_apply(ouro_apply(ouro_apply(parse_unit, fuel), indexed), path), src);
 		if (r == 0 || r->tag != 0 || r->n < 2) {
 			if (r != 0 && r->tag == 1 && r->n >= 3) {
 				ouro_v *error = ouro_apply(ouro_apply(ouro_apply(
@@ -1080,11 +1598,10 @@ static int parse_units_incremental(ouro_v *fuel, ouro_v *files,
 			ok = 0;
 			break;
 		}
-		/* Parsed units and the intern state share immutable values in this
-		   bank. Copy only phase allocations; the resolve seam deep-clones
-		   its survivors before releasing the entire parse bank. */
+		/* Parsed units and the lexer indexes share immutable nodes in this
+		   bank. The resolver retains only the ordered intern state. */
 		u = ouro_clone_perm(OURO_F(r, r->n - 2));
-		st = ouro_clone_perm(OURO_F(r, r->n - 1));
+		indexed = ouro_clone_perm(OURO_F(r, r->n - 1));
 		if (!append_unit(&items, &nitems, &cap, u)) {
 			fe_phase_done("frontend-after-parse-unit-oom");
 			ok = 0;
@@ -1098,7 +1615,7 @@ static int parse_units_incremental(ouro_v *fuel, ouro_v *files,
 		return 0;
 	}
 	*out_units = list_from_items(items, nitems);
-	*out_st = st;
+	*out_st = ouro_clone_perm(ouro_apply(FIND(lx, "lexer_intern_state"), indexed));
 	free(items);
 	return 1;
 }
@@ -1109,7 +1626,15 @@ static void fe_phase_done(const char *label)
 	ouro_heap_report(label);
 }
 
-static ouro_v *compile_checked_units_impl(ouro_v *fuel, ouro_v *root, ouro_v *files)
+enum fe_units_result {
+	FE_UNITS_RAW,
+	FE_UNITS_LEGACY,
+	FE_UNITS_ORIGIN,
+	FE_UNITS_PACKET
+};
+
+static ouro_v *compile_units_source_impl(ouro_v *fuel, ouro_v *root, ouro_v *files,
+					enum fe_units_result mode)
 {
 	ouro_v *files1 = 0;
 	ouro_v *alias_files = 0;
@@ -1128,7 +1653,10 @@ static ouro_v *compile_checked_units_impl(ouro_v *fuel, ouro_v *root, ouro_v *fi
 	ouro_v *r = 0;
 	ouro_v *intern_fn = 0;
 	ouro_v *resolve_fn = 0;
-	ouro_v *falseb;
+	ouro_v *source_result = 0;
+	ouro_v *slots = 0;
+	int packet_result = mode == FE_UNITS_PACKET;
+	int with_state = packet_result || mode == FE_UNITS_ORIGIN;
 
 	/* Survivors are ouro_clone_perm_deep (static share only). Mid-cone
 	   discard_phase then drops the parse/preprocess bump. Host prims
@@ -1156,14 +1684,15 @@ static ouro_v *compile_checked_units_impl(ouro_v *fuel, ouro_v *root, ouro_v *fi
 	fe_phase_done("frontend-after-parse-units");
 
 	intern_fn = FIND(lx, "intern_string");
-	resolve_fn = FIND(ir, "resolve_imports");
+	resolve_fn = FIND(ir, "resolve_imports_with_sources");
 	ouro_perm_select(0);
 	canonical_root = ouro_apply(ouro_apply(FIND(pl, "canon_path"), perm_nil()), root);
 	pair = ouro_apply(ouro_apply(intern_fn, st), canonical_root);
 	root_id = pair_fst(pair);
 	st2 = pair_snd(pair);
 	module_plan = ouro_apply(ouro_apply(ouro_apply(ouro_apply(
-		FIND(pl, "module_resolve_units"), fuel), units), alias_files), root_id);
+		FIND(pl, packet_result ? "module_resolve_units_with_slots" : "module_resolve_units"),
+		fuel), units), alias_files), root_id);
 	module_plan = ouro_apply(module_plan, st2);
 	if (module_plan == 0 || module_plan->tag != 0) {
 		g_last_intern = ouro_clone_perm_deep(st2);
@@ -1173,8 +1702,27 @@ static ouro_v *compile_checked_units_impl(ouro_v *fuel, ouro_v *root, ouro_v *fi
 		fe_phase_done("frontend-after-module-resolve-error");
 		goto failed;
 	}
-	scoped = pair_fst(OURO_F(module_plan, 0));
-	st2 = pair_snd(OURO_F(module_plan, 0));
+	if (with_state && module_plan->n != 1) {
+		fputs(packet_result ? "ouro1: frontend glue invalid ModuleResolvedUnits\n"
+			: "ouro1: frontend glue invalid resolved-unit result\n", stderr);
+		exit(2);
+	}
+	pair = OURO_F(module_plan, 0);
+	if (packet_result) {
+		/* ModuleResolvedUnits has exactly the two erased nominal fields. */
+		if (pair == 0 || pair->tag != 0 || pair->n != 2) {
+			fputs("ouro1: frontend glue invalid ModuleResolvedUnits\n", stderr);
+			exit(2);
+		}
+		slots = OURO_F(pair, 1);
+		pair = OURO_F(pair, 0);
+	}
+	if (with_state && (pair == 0 || pair->tag != 0 || pair->n != 2)) {
+		fputs("ouro1: frontend glue invalid resolved-unit pair\n", stderr);
+		exit(2);
+	}
+	scoped = pair_fst(pair);
+	st2 = pair_snd(pair);
 	selected = ouro_apply(ouro_apply(FIND(pl, "unit_decl_names"), scoped), root_id);
 	resolved = ouro_apply(ouro_apply(resolve_fn, scoped), root_id);
 	if (resolved == 0 || resolved->tag != 0) {
@@ -1185,25 +1733,60 @@ static ouro_v *compile_checked_units_impl(ouro_v *fuel, ouro_v *root, ouro_v *fi
 		fe_phase_done("frontend-after-resolve-error");
 		goto failed;
 	}
-	ds = ouro_clone_perm_deep(OURO_F(resolved, 0));
-	selected = ouro_clone_perm_deep(selected);
-	st2 = ouro_clone_perm_deep(st2);
+	if (with_state) {
+		pair = ouro_clone_perm_deep(perm_pair(
+			perm_pair(OURO_F(resolved, 0), selected),
+			packet_result ? perm_pair(st2, slots) : st2));
+		ds = pair_fst(pair_fst(pair));
+		selected = pair_snd(pair_fst(pair));
+		st2 = pair_snd(pair);
+		if (packet_result) {
+			slots = pair_snd(st2);
+			st2 = pair_fst(st2);
+		}
+	} else {
+		ds = ouro_clone_perm_deep(OURO_F(resolved, 0));
+		selected = ouro_clone_perm_deep(selected);
+		st2 = ouro_clone_perm_deep(st2);
+	}
 	ouro_perm_reset_bank(1);
 	fe_phase_done("frontend-after-resolve-imports");
 
-	fn = closed_compile_from_decls();
+	fn = packet_result ? ouro_apply(closed_compile_source_packet(), slots)
+		: closed_compile_from_decls();
 	ouro_perm_select(1);
+	g_check_profile_intern = g_check_profile_clock == 0 ? 0 : st2;
 	r = ouro_apply(ouro_apply(ouro_apply(ouro_apply(fn, selected), fuel), st2), ds);
-	/* Only generic lowering failures need source hints. Preserve the checked
-	   result across the same lifetime seam before calling the Ouro remapper. */
-	r = ouro_clone_perm_deep(r);
+	g_check_profile_intern = 0;
+	/* Preserve shared references with the intern table before releasing bank 0. */
+	if (packet_result)
+		pair = ouro_clone_perm_deep(ouro_apply(ouro_apply(
+			FIND(pl, "checked_source_packet_snapshot"), r), st2));
+	else
+		pair = ouro_clone_perm_deep(ouro_ctor(0, 2, (ouro_v *[]){r, st2}));
+	source_result = pair_fst(pair);
+	st2 = pair_snd(pair);
 	fe_phase_done("frontend-after-check-decls");
-	falseb = ouro_ctor(1, 0, 0);
-	r = ouro_apply(ouro_apply(ouro_apply(closed_remap_comp_files(), falseb), files1), r);
+	if (packet_result)
+		source_result = ouro_apply(FIND(pl, "checked_source_packet_project"), source_result);
+	if (mode != FE_UNITS_ORIGIN)
+		r = ouro_apply(FIND(pl, "source_result_comp"), source_result);
 	g_last_intern = st2;
-	print_units_diag(files1, r);
-	r = ouro_clone_perm_deep(r);
-	g_last_intern = ouro_clone_perm_deep(st2);
+	if (!with_state)
+		print_source_result_diag(source_result, r, 0);
+	if (with_state) {
+		g_last_checked_program = 0;
+		ouro_perm_reset_bank(0);
+		fe_phase_done("frontend-after-compile-from-decls");
+		return pair;
+	}
+	/* The ordinary Ouro getter retains numeric compatibility diagnostics.
+	   The renderer above and direct/CLI callers keep the original error. */
+	if (mode == FE_UNITS_LEGACY)
+		r = ouro_apply(ouro_apply(ouro_apply(FIND(pl, "remap_comp_files_for"),
+			ouro_ctor(1, 0, 0)), files1), r);
+	/* Reuse bank-1 payloads; still retain new phase or old-bank cells. */
+	r = ouro_clone_perm(r);
 	ouro_perm_reset_bank(0);
 	fe_phase_done("frontend-after-compile-from-decls");
 	if (r != 0 && r->tag == 1 && r->n >= 1)
@@ -1211,17 +1794,37 @@ static ouro_v *compile_checked_units_impl(ouro_v *fuel, ouro_v *root, ouro_v *fi
 	return r;
 
 failed:
-	/* Keep the original typed failure. Re-running an unbounded stitcher here
-	   used to repeat failed work and could exhaust memory on rejected input. */
+	/* Retain the typed failure. Retrying an unbounded stitch on rejected input
+	   can exhaust memory. */
 	if (r == 0)
 		r = cerr(FE_PARSE_ERR, 0);
+	if (with_state) {
+		if (r->tag != 0 || r->n != 1) {
+			fputs("ouro1: frontend glue invalid compiler failure\n", stderr);
+			exit(2);
+		}
+		source_result = ouro_apply(FIND(pl, "checked_source_packet_reject"), OURO_F(r, 0));
+		if (!packet_result) {
+			source_result = ouro_apply(FIND(pl, "checked_source_packet_project"), source_result);
+			return ouro_clone_perm_deep(ouro_ctor(0, 2, (ouro_v *[]){source_result, g_last_intern}));
+		}
+		return ouro_clone_perm_deep(ouro_apply(ouro_apply(
+			FIND(pl, "checked_source_packet_snapshot"), source_result), g_last_intern));
+	}
 	print_units_diag(files1 != 0 ? files1 : files, r);
 	return r;
 }
 
+static ouro_v *compile_checked_units_impl(ouro_v *fuel, ouro_v *root, ouro_v *files,
+					 int legacy_result)
+{
+	return compile_units_source_impl(fuel, root, files,
+		legacy_result ? FE_UNITS_LEGACY : FE_UNITS_RAW);
+}
+
 static ouro_v *compile_units_impl(ouro_v *fuel, ouro_v *root, ouro_v *files)
 {
-	ouro_v *r = compile_checked_units_impl(fuel, root, files);
+	ouro_v *r = compile_checked_units_impl(fuel, root, files, 0);
 	if (r != 0 && r->tag == 1)
 		return publish_checked_result(r);
 	return r;
@@ -1270,7 +1873,7 @@ static ouro_v *compile_checked_units_files(ouro_env *env, ouro_v *files)
 	ouro_v *fuel = ouro_get(env, 1);
 	ouro_v *root = ouro_get(env, 0);
 	ouro_heap_context *context = ouro_heap_context_enter();
-	ouro_v *result = compile_checked_units_impl(fuel, root, files);
+	ouro_v *result = compile_checked_units_impl(fuel, root, files, 1);
 	ouro_v *survivors = ouro_ctor(0, 2, (ouro_v *[]){result, g_last_intern});
 	ouro_fe_reset_mir_pins();
 	survivors = ouro_heap_context_leave(context, survivors);
@@ -1283,12 +1886,41 @@ static ouro_v *compile_checked_units_files(ouro_env *env, ouro_v *files)
 
 ouro_v *ouro_fe_compile_checked_units(ouro_v *fuel, ouro_v *root, ouro_v *files)
 {
-	return compile_checked_units_impl(fuel, root, files);
+	return compile_checked_units_impl(fuel, root, files, 0);
+}
+
+static ouro_v *compile_source_units_clos(ouro_env *env, ouro_v *fuel)
+{
+	return ouro_clos(compile_source_units_root, ouro_cons(fuel, env));
+}
+
+static ouro_v *compile_source_units_root(ouro_env *env, ouro_v *root)
+{
+	return ouro_clos(compile_source_units_files, ouro_cons(root, env));
+}
+
+static ouro_v *compile_source_units_files(ouro_env *env, ouro_v *files)
+{
+	enum fe_units_result mode = (enum fe_units_result)ouro_get(env, 2)->n;
+	ouro_heap_context *context = ouro_heap_context_enter();
+	ouro_v *result = compile_units_source_impl(ouro_get(env, 1), ouro_get(env, 0), files, mode);
+	ouro_fe_reset_mir_pins();
+	result = ouro_heap_context_leave(context, result);
+	g_last_intern = pair_snd(result);
+	g_last_checked_program = 0;
+	return result;
+}
+
+ouro_v *ouro_wrap_compile_checked_units_with_origin(ouro_v *raw)
+{
+	(void)raw;
+	return ouro_clos(compile_source_units_clos, ouro_cons(ouro_nat(FE_UNITS_ORIGIN), 0));
 }
 
 static ouro_v *g_compile_to_cores;
 static ouro_v *g_compile_units;
 static ouro_v *g_compile_checked_units;
+static ouro_v *g_compile_source_packet_units;
 
 ouro_v *ouro_fe_compile_checked_units_clos(void)
 {
@@ -1300,9 +1932,20 @@ ouro_v *ouro_fe_compile_checked_units_clos(void)
 	return g_compile_checked_units;
 }
 
+ouro_v *ouro_fe_compile_checked_units_with_source_packet_clos(void)
+{
+	if (g_compile_source_packet_units == 0) {
+		ouro_static_begin();
+		g_compile_source_packet_units = ouro_clos(compile_source_units_clos,
+			ouro_cons(ouro_nat(FE_UNITS_PACKET), 0));
+		ouro_static_end();
+	}
+	return g_compile_source_packet_units;
+}
+
 int ouro_export_count_fe(void)
 {
-	return 5;
+	return 6;
 }
 
 const char *ouro_export_name_fe(int i)
@@ -1318,6 +1961,8 @@ const char *ouro_export_name_fe(int i)
 		return "empty_intern";
 	case 4:
 		return "compile_checked_units";
+	case 5:
+		return "compile_checked_units_with_source_packet";
 	default:
 		return "";
 	}
@@ -1340,6 +1985,8 @@ ouro_v *ouro_export_value_fe(int i)
 		return FIND(lx, "empty_intern");
 	case 4:
 		return ouro_fe_compile_checked_units_clos();
+	case 5:
+		return ouro_fe_compile_checked_units_with_source_packet_clos();
 	default:
 		return 0;
 	}
@@ -1349,10 +1996,18 @@ ouro_v *ouro_export_value_fe(int i)
 /* Ordinary generated programs keep stderr for diagnostics. Only the
    diagnostic N1 executable explicitly enables these progress messages. */
 static int g_fe_progress;
+static int g_fe_lowering_timings;
+static unsigned long g_fe_prepare_depth;
+static unsigned long long g_fe_prepare_spelling_calls;
 
 void ouro_fe_set_progress(int enabled)
 {
 	g_fe_progress = enabled != 0;
+}
+
+void ouro_fe_set_lowering_timings(int enabled)
+{
+	g_fe_lowering_timings = enabled != 0;
 }
 
 static void fe_progress(const char *format, ...)
@@ -1365,15 +2020,290 @@ static void fe_progress(const char *format, ...)
 	va_end(args);
 }
 
-/* Recheck the full forgeable CheckedProgram using the same generated
-   exact-Core traversal. Only each declaration's temporary arena is reset;
-   declaration ordering, typed failures, metadata and bodies stay in Ouro. */
+/* The generated source checker keeps the full module plan and typed result.
+   Release each declaration's scratch before checking the next declaration;
+   the outer three-argument scope retains the complete result in the caller. */
+ouro_v *ouro_wrap_check_module(ouro_v *raw)
+{
+	(void)raw;
+	return ouro_wrap_settled3(ouro_apply(FIND(fc, "check_indexed_module_with"),
+		bounded_check_declaration()));
+}
+
+/* Retain the complete exact replay before releasing its work banks.
+   Declaration scopes still borrow earlier entries; ordering, metadata,
+   bodies and typed failures remain in Ouro. */
 ouro_v *ouro_wrap_lower_recheck_program(ouro_v *raw)
 {
 	(void)raw;
-	return ouro_apply(FIND(lo, "lower_recheck_program_with"),
-		bounded_check_declaration());
+	return ouro_wrap_module_pure_scope(ouro_apply(FIND(lo, "lower_recheck_program_with"),
+		bounded_check_declaration()), 2);
 }
+
+/* Borrow immutable caller captures. Copy the complete typed result back
+   before releasing normalization scratch; fuel, malformed-input checks
+   and error mapping remain in the generated function. */
+static ouro_v *lower_normalize_term(ouro_env *env, ouro_v *term)
+{
+	ouro_heap_context *context = ouro_heap_context_enter();
+	ouro_v *result = ouro_apply(ouro_apply(ouro_apply(
+		ouro_get(env, 2), ouro_get(env, 1)), ouro_get(env, 0)), term);
+
+	return ouro_heap_context_leave(context, result);
+}
+
+static ouro_v *lower_normalize_sig(ouro_env *env, ouro_v *sig)
+{
+	return ouro_clos(lower_normalize_term, ouro_cons(sig, env));
+}
+
+static ouro_v *lower_normalize_fuel(ouro_env *env, ouro_v *fuel)
+{
+	return ouro_clos(lower_normalize_sig, ouro_cons(fuel, env));
+}
+
+ouro_v *ouro_wrap_lower_normalize(ouro_v *raw)
+{
+	return ouro_clos(lower_normalize_fuel, ouro_cons(raw, 0));
+}
+
+/* Borrow caller-owned inputs; retain the full Either before releasing the
+   per-contract signature and primitive-environment scratch. */
+static ouro_v *lower_make_contract_binding(ouro_env *env, ouro_v *binding)
+{
+	ouro_heap_context *context = ouro_heap_context_enter();
+	ouro_v *result = ouro_get(env, 4);
+	int i;
+	for (i = 3; i >= 0; i--)
+		result = ouro_apply(result, ouro_get(env, i));
+	result = ouro_apply(result, binding);
+	return ouro_heap_context_leave(context, result);
+}
+
+static ouro_v *lower_make_contract_typ(ouro_env *env, ouro_v *typ)
+{
+	return ouro_clos(lower_make_contract_binding, ouro_cons(typ, env));
+}
+
+static ouro_v *lower_make_contract_id(ouro_env *env, ouro_v *id)
+{
+	return ouro_clos(lower_make_contract_typ, ouro_cons(id, env));
+}
+
+static ouro_v *lower_make_contract_sig(ouro_env *env, ouro_v *sig)
+{
+	return ouro_clos(lower_make_contract_id, ouro_cons(sig, env));
+}
+
+static ouro_v *lower_make_contract_fuel(ouro_env *env, ouro_v *fuel)
+{
+	return ouro_clos(lower_make_contract_sig, ouro_cons(fuel, env));
+}
+
+ouro_v *ouro_wrap_lower_make_contract_indexed(ouro_v *raw)
+{
+	return ouro_clos(lower_make_contract_fuel, ouro_cons(raw, 0));
+}
+
+static void native_lower_progress(const char *phase)
+{
+	if (g_fe_lowering_timings)
+		fe_progress("n1-host: lowering-phase=%s live=%llu total=%llu\n",
+			phase, ouro_heap_live_bytes(), ouro_heap_total_alloc_bytes());
+	ouro_heap_report(phase);
+}
+
+/* These pure callbacks have no host cache. Borrow immutable caller inputs
+   and retain the complete index, Either or Bool before releasing scratch. */
+static ouro_v *check_environment_entries(ouro_env *env, ouro_v *entries)
+{
+	ouro_v *result;
+	if (g_fe_lowering_timings && g_fe_prepare_depth != 0)
+		native_lower_progress("native-prepare-environment-start");
+	result = ouro_apply(ouro_get(env, 0), entries);
+	if (g_fe_lowering_timings && g_fe_prepare_depth != 0)
+		native_lower_progress("native-prepare-environment-end");
+	return result;
+}
+
+ouro_v *ouro_wrap_check_environment_from_entries(ouro_v *raw)
+{
+	return ouro_clos(check_environment_entries,
+		ouro_cons(ouro_wrap_module_pure_scope(raw, 1), 0));
+}
+
+static ouro_v *managed_symbol_name(ouro_env *env, ouro_v *name)
+{
+	ouro_v *result;
+	if (g_fe_lowering_timings && g_fe_prepare_depth != 0)
+		native_lower_progress("native-prepare-symbol-start");
+	result = ouro_apply(ouro_get(env, 0), name);
+	if (g_fe_lowering_timings && g_fe_prepare_depth != 0)
+		native_lower_progress("native-prepare-symbol-end");
+	return result;
+}
+
+static ouro_v *managed_symbol_environment(ouro_env *env, ouro_v *environment)
+{
+	return ouro_clos(managed_symbol_name,
+		ouro_cons(ouro_apply(ouro_get(env, 0), environment), 0));
+}
+
+static ouro_v *managed_symbol_program(ouro_env *env, ouro_v *program)
+{
+	return ouro_clos(managed_symbol_environment,
+		ouro_cons(ouro_apply(ouro_get(env, 0), program), 0));
+}
+
+ouro_v *ouro_wrap_managed_source_symbol_using(ouro_v *raw)
+{
+	return ouro_clos(managed_symbol_program,
+		ouro_cons(ouro_wrap_module_pure_scope(raw, 3), 0));
+}
+
+static ouro_v *managed_spelling_value(ouro_env *env, ouro_v *spelling)
+{
+	ouro_v *result = ouro_apply(ouro_get(env, 0), spelling);
+	if (g_fe_lowering_timings && g_fe_prepare_depth != 0) {
+		g_fe_prepare_spelling_calls++;
+		/* Long intern tables must not produce a trace line for every comparison. */
+		if ((g_fe_prepare_spelling_calls & (g_fe_prepare_spelling_calls - 1)) == 0)
+			fe_progress("n1-host: native-prepare-spelling calls=%llu live=%llu total=%llu\n",
+				g_fe_prepare_spelling_calls, ouro_heap_live_bytes(), ouro_heap_total_alloc_bytes());
+	}
+	return result;
+}
+
+static ouro_v *managed_spelling_requested(ouro_env *env, ouro_v *requested)
+{
+	return ouro_clos(managed_spelling_value,
+		ouro_cons(ouro_apply(ouro_get(env, 0), requested), 0));
+}
+
+ouro_v *ouro_wrap_managed_source_spelling(ouro_v *raw)
+{
+	return ouro_clos(managed_spelling_requested,
+		ouro_cons(ouro_wrap_module_pure_scope(raw, 2), 0));
+}
+
+/* The plan and raw-function builders only traverse immutable Core and return
+   data. Keep their complete typed result; downstream managed/MIR/codegen
+   wrappers cache permanent pointers and must remain outside these contexts. */
+static ouro_v *managed_prepare_types(ouro_env *env, ouro_v *types)
+{
+	ouro_heap_context *context;
+	ouro_v *result;
+	int i;
+	native_lower_progress("native-prepare-start");
+	if (g_fe_prepare_depth == 0)
+		g_fe_prepare_spelling_calls = 0;
+	g_fe_prepare_depth++;
+	context = ouro_heap_context_enter();
+	result = ouro_get(env, 3);
+	for (i = 2; i >= 0; i--)
+		result = ouro_apply(result, ouro_get(env, i));
+	result = ouro_apply(result, types);
+	g_fe_prepare_depth--;
+	native_lower_progress("native-prepare-return");
+	result = ouro_heap_context_leave(context, result);
+	native_lower_progress("native-prepare-end");
+	return result;
+}
+
+static ouro_v *managed_prepare_program(ouro_env *env, ouro_v *program)
+{
+	return ouro_clos(managed_prepare_types, ouro_cons(program, env));
+}
+
+static ouro_v *managed_prepare_entry(ouro_env *env, ouro_v *entry)
+{
+	return ouro_clos(managed_prepare_program, ouro_cons(entry, env));
+}
+
+static ouro_v *managed_prepare_fuel(ouro_env *env, ouro_v *fuel)
+{
+	return ouro_clos(managed_prepare_entry, ouro_cons(fuel, env));
+}
+
+ouro_v *ouro_wrap_managed_prepare_rechecked(ouro_v *raw)
+{
+	return ouro_clos(managed_prepare_fuel, ouro_cons(raw, 0));
+}
+
+static ouro_v *lower_function_body(ouro_env *env, ouro_v *body)
+{
+	ouro_heap_context *context;
+	ouro_v *result;
+	int i;
+	native_lower_progress("native-raw-start");
+	context = ouro_heap_context_enter();
+	result = ouro_get(env, 5);
+	for (i = 4; i >= 0; i--)
+		result = ouro_apply(result, ouro_get(env, i));
+	result = ouro_apply(result, body);
+	native_lower_progress("native-raw-return");
+	result = ouro_heap_context_leave(context, result);
+	native_lower_progress("native-raw-end");
+	return result;
+}
+
+static ouro_v *lower_function_contract(ouro_env *env, ouro_v *contract)
+{
+	return ouro_clos(lower_function_body, ouro_cons(contract, env));
+}
+
+static ouro_v *lower_function_contracts(ouro_env *env, ouro_v *contracts)
+{
+	return ouro_clos(lower_function_contract, ouro_cons(contracts, env));
+}
+
+static ouro_v *lower_function_sig(ouro_env *env, ouro_v *sig)
+{
+	return ouro_clos(lower_function_contracts, ouro_cons(sig, env));
+}
+
+static ouro_v *lower_function_program(ouro_env *env, ouro_v *program)
+{
+	return ouro_clos(lower_function_sig, ouro_cons(program, env));
+}
+
+static ouro_v *lower_function_fuel(ouro_env *env, ouro_v *fuel)
+{
+	return ouro_clos(lower_function_program, ouro_cons(fuel, env));
+}
+
+ouro_v *ouro_wrap_lower_function_indexed(ouro_v *raw)
+{
+	return ouro_clos(lower_function_fuel, ouro_cons(raw, 0));
+}
+
+/* Trace the existing whole finish call without reclaiming its banks: mg_*
+   deliberately retain compiler/fuel pointers until the existing cache fence. */
+static ouro_v *managed_finish_raw(ouro_env *env, ouro_v *functions)
+{
+	ouro_v *result;
+	native_lower_progress("native-finish-start");
+	result = ouro_apply(ouro_apply(ouro_apply(ouro_get(env, 2),
+		ouro_get(env, 1)), ouro_get(env, 0)), functions);
+	native_lower_progress("native-finish-end");
+	return result;
+}
+
+static ouro_v *managed_finish_plan(ouro_env *env, ouro_v *plan)
+{
+	return ouro_clos(managed_finish_raw, ouro_cons(plan, env));
+}
+
+static ouro_v *managed_finish_fuel(ouro_env *env, ouro_v *fuel)
+{
+	return ouro_clos(managed_finish_plan, ouro_cons(fuel, env));
+}
+
+ouro_v *ouro_wrap_managed_finish_plan(ouro_v *raw)
+{
+	return ouro_clos(managed_finish_fuel, ouro_cons(raw, 0));
+}
+
 
 static ouro_v *g_raw_managed_global;
 static ouro_v *g_source_managed_compiler;
@@ -1502,17 +2432,48 @@ static ouro_v *mir_bounds_limits(ouro_env *env, ouro_v *limits)
 ouro_v *ouro_wrap_mir_check_bounds(ouro_v *raw)
 {
 	(void)raw;
-	return ouro_clos(mir_bounds_limits, 0);
+	return ouro_wrap_module_pure_scope(ouro_clos(mir_bounds_limits, 0), 2);
 }
 
-static ouro_v *g_source_mir_program;
-static ouro_v *g_perm_mir_program;
-static ouro_v *g_source_flow;
-static ouro_v *g_perm_flow;
 static unsigned long g_cf_count;
 
 static ouro_v *g_source_cg_program;
 static ouro_v *g_perm_cg_program;
+static ouro_v *g_cgn_prog;
+static int g_cgn_meta_ok;
+
+typedef struct {
+	unsigned long id;
+	int ordinal;
+} cgn_id_position;
+
+typedef struct {
+	unsigned long *ids;
+	int count;
+	int capacity;
+	int available;
+} cgn_extern_index;
+
+/* The pinned program owns the indexes. They retain only numeric data. */
+static cgn_id_position *g_cgn_function_positions;
+static int g_cgn_function_count;
+static int g_cgn_function_index_ready;
+static cgn_extern_index g_cgn_externs;
+
+static void cgn_release_extern_index(cgn_extern_index *index)
+{
+	free(index->ids);
+	*index = (cgn_extern_index){ 0 };
+}
+
+static void cgn_reset_program_indexes(void)
+{
+	free(g_cgn_function_positions);
+	g_cgn_function_positions = 0;
+	g_cgn_function_count = 0;
+	g_cgn_function_index_ready = 0;
+	cgn_release_extern_index(&g_cgn_externs);
+}
 
 void ouro_fe_reset_mir_pins(void)
 {
@@ -1520,12 +2481,12 @@ void ouro_fe_reset_mir_pins(void)
 	g_perm_managed_compiler = 0;
 	g_source_managed_fuel = 0;
 	g_perm_managed_fuel = 0;
-	g_source_mir_program = 0;
-	g_perm_mir_program = 0;
-	g_source_flow = 0;
-	g_perm_flow = 0;
 	g_source_cg_program = 0;
 	g_perm_cg_program = 0;
+	/* A later MIR program can reuse the address after an arena reset. */
+	g_cgn_prog = 0;
+	g_cgn_meta_ok = 0;
+	cgn_reset_program_indexes();
 }
 
 /* The frontier thunk borrows the current reachability round's immutable
@@ -1549,52 +2510,47 @@ ouro_v *ouro_wrap_mir_reachable(ouro_v *raw)
 
 /* The Ouro callbacks retain phase order and exact typed results. A nested
    heap context releases one unit phase or complete flow round without
-   replacing cf_function's mark or freeing the thunk's captures. Copying the
+   freeing the thunk's borrowed captures. Copying the
    complete round together preserves sharing between its block facts. */
 static ouro_v *mir_check_phase(ouro_env *env, ouro_v *work)
 {
 	return mir_reachable_ids(env, work);
 }
 
+/* Borrow the immutable caller inputs. Retain the complete typed result in
+   that caller before releasing this function's nested work banks. */
 static ouro_v *cf_function(ouro_env *env, ouro_v *function)
 {
+	ouro_heap_context *context;
 	ouro_v *r;
 	ouro_v *run_unit;
 	ouro_v *check_flow;
+	ouro_v *predecessors;
 
 	g_cf_count++;
 	if ((g_cf_count % 25UL) == 0UL)
 		fe_progress("n1-host: checkfn %lu live=%llu\n",
 			g_cf_count, ouro_heap_live_bytes());
-	function = ouro_clone_perm(function);
-	ouro_heap_mark();
+	context = ouro_heap_context_enter();
 	run_unit = ouro_clos(mir_check_phase, 0);
+	predecessors = ouro_clos(mir_settled_first_argument,
+		ouro_cons(FIND(lo, "mir_predecessor_declared"), 0));
 	check_flow = ouro_apply(ouro_apply(ouro_apply(FIND(lo, "mir_check_declared_flow_with"),
-		run_unit), run_unit), FIND(lo, "mir_predecessor_declared"));
+		run_unit), run_unit), predecessors);
 	r = ouro_apply(ouro_apply(FIND(lo, "mir_check_function_with"), run_unit), check_flow);
 	r = ouro_apply(ouro_apply(ouro_apply(r, ouro_get(env, 1)), ouro_get(env, 0)), function);
-	r = ouro_clone_perm(r);
-	ouro_heap_reset();
-	return r;
+	return ouro_heap_context_leave(context, r);
 }
 
 static ouro_v *cf_flow(ouro_env *env, ouro_v *flow)
 {
-	if (g_perm_flow == 0 || g_source_flow != flow) {
-		g_source_flow = flow;
-		g_perm_flow = ouro_clone_perm(flow);
-	}
-	return ouro_clos(cf_function, ouro_cons(g_perm_flow, env));
+	return ouro_clos(cf_function, ouro_cons(flow, env));
 }
 
 static ouro_v *cf_program(ouro_env *env, ouro_v *program)
 {
 	(void)env;
-	if (g_perm_mir_program == 0 || g_source_mir_program != program) {
-		g_source_mir_program = program;
-		g_perm_mir_program = ouro_clone_perm(program);
-	}
-	return ouro_clos(cf_flow, ouro_cons(g_perm_mir_program, 0));
+	return ouro_clos(cf_flow, ouro_cons(program, 0));
 }
 
 ouro_v *ouro_wrap_mir_check_function(ouro_v *raw)
@@ -1608,106 +2564,52 @@ static ouro_v *g_raw_prepare_step;
 static unsigned long g_prep_count;
 
 static int x64enc_dec_nat(ouro_v *v, unsigned long *out);
-static int host_list_collect(ouro_v *list, ouro_v ***out, int *n, int *cap);
+static int host_list_collect(ouro_v *list, ouro_v ***out, int *n, int *cons_list);
 
-static int cgp_bytes_len(ouro_v *v, unsigned long *n)
+static int cgasm_grow(void **p, int *cap, int n, unsigned long elem);
+
+static int cgp_walk_bytes(ouro_v *v, unsigned char *dst, unsigned long *off,
+			  unsigned long limit, ouro_v ***stack, int *cap)
 {
-	ouro_v **stack = 0;
-	int sp = 0;
-	int cap = 0;
+	int depth = 0;
 
 	while (v != 0) {
 		if (v->tag == 0 && v->n == 0)
 			v = 0;
 		else if (v->tag == OURO_TAG_BYTES) {
-			if (v->n < 0) {
-				free(stack);
+			unsigned long length;
+
+			if (v->n < 0 || (v->n > 0 && v->u.s == 0))
 				return -1;
-			}
-			*n += (unsigned long)v->n;
+			length = (unsigned long)v->n;
+			if (length > limit - *off)
+				return -1;
+			if (dst != 0 && length != 0)
+				memcpy(dst + *off, v->u.s, (size_t)length);
+			*off += length;
 			v = 0;
 		} else if (v->tag == OURO_TAG_CAT && v->n == 2) {
-			if (cap < sp + 1) {
-				int nc = cap == 0 ? 64 : cap * 2;
-				ouro_v **p = (ouro_v **)realloc(stack,
-					sizeof(ouro_v *) * (unsigned long)nc);
-
-				if (p == 0) {
-					free(stack);
-					return -1;
-				}
-				stack = p;
-				cap = nc;
-			}
-			stack[sp++] = OURO_F(v, 1);
+			if (depth == *cap &&
+			    (*cap > INT_MAX / 2 || (unsigned long)*cap > ULONG_MAX / 2 / sizeof **stack
+			     || !cgasm_grow((void **)stack, cap, depth, sizeof **stack)))
+				return -1;
+			(*stack)[depth++] = OURO_F(v, 1);
 			v = OURO_F(v, 0);
 		} else if (v->tag == 1 && v->n == 2) {
-			unsigned long b;
+			unsigned long byte;
 
-			if (x64enc_dec_nat(OURO_F(v, 0), &b) != 0 || b > 255UL) {
-				free(stack);
+			if (x64enc_dec_nat(OURO_F(v, 0), &byte) != 0 || byte > 255UL || *off == limit)
 				return -1;
-			}
-			*n += 1UL;
+			if (dst != 0)
+				dst[*off] = (unsigned char)byte;
+			(*off)++;
 			v = OURO_F(v, 1);
 		} else {
-			free(stack);
 			return -1;
 		}
-		if (v == 0 && sp > 0)
-			v = stack[--sp];
+		if (v == 0 && depth > 0)
+			v = (*stack)[--depth];
 	}
-	free(stack);
-	return 0;
-}
-
-static int cgp_bytes_copy(ouro_v *v, unsigned char *dst, unsigned long *off)
-{
-	ouro_v **stack = 0;
-	int sp = 0;
-	int cap = 0;
-
-	while (v != 0) {
-		if (v->tag == 0 && v->n == 0)
-			v = 0;
-		else if (v->tag == OURO_TAG_BYTES) {
-			if (v->n > 0 && v->u.s != 0) {
-				memcpy(dst + *off, v->u.s, (unsigned long)v->n);
-				*off += (unsigned long)v->n;
-			}
-			v = 0;
-		} else if (v->tag == OURO_TAG_CAT && v->n == 2) {
-			if (cap < sp + 1) {
-				int nc = cap == 0 ? 64 : cap * 2;
-				ouro_v **p = (ouro_v **)realloc(stack,
-					sizeof(ouro_v *) * (unsigned long)nc);
-
-				if (p == 0) {
-					free(stack);
-					return -1;
-				}
-				stack = p;
-				cap = nc;
-			}
-			stack[sp++] = OURO_F(v, 1);
-			v = OURO_F(v, 0);
-		} else if (v->tag == 1 && v->n == 2) {
-			unsigned long b;
-
-			if (x64enc_dec_nat(OURO_F(v, 0), &b) != 0 || b > 255UL) {
-				free(stack);
-				return -1;
-			}
-			dst[(*off)++] = (unsigned char)b;
-			v = OURO_F(v, 1);
-		} else {
-			free(stack);
-			return -1;
-		}
-		if (v == 0 && sp > 0)
-			v = stack[--sp];
-	}
-	free(stack);
 	return 0;
 }
 
@@ -1727,8 +2629,10 @@ static ouro_v *cgp_cat(ouro_v *a, ouro_v *b)
 static ouro_v *cgp_concat_functions(ouro_v *completed)
 {
 	ouro_v **items = 0;
+	ouro_v **stack = 0;
 	unsigned char *buf = 0;
 	ouro_v *cur = completed;
+	ouro_v *result = 0;
 	ouro_v *symbols = 0;
 	ouro_v *fixups = 0;
 	ouro_v *records = 0;
@@ -1738,6 +2642,7 @@ static ouro_v *cgp_concat_functions(ouro_v *completed)
 	unsigned long off = 0;
 	int n = 0;
 	int cap = 0;
+	int stack_cap = 0;
 	int i;
 
 	while (cur != 0 && cur->tag == 1 && cur->n == 2) {
@@ -1746,60 +2651,54 @@ static ouro_v *cgp_concat_functions(ouro_v *completed)
 			ouro_v **p = (ouro_v **)realloc(items,
 				sizeof(ouro_v *) * (unsigned long)nc);
 
-			if (p == 0) {
-				free(items);
-				return 0;
-			}
+			if (p == 0)
+				goto done;
 			items = p;
 			cap = nc;
 		}
 		items[n++] = OURO_F(cur, 0);
 		cur = OURO_F(cur, 1);
 	}
-	if (cur != 0 && !(cur->tag == 0 && cur->n == 0)) {
-		free(items);
-		return 0;
-	}
+	if (cur != 0 && !(cur->tag == 0 && cur->n == 0))
+		goto done;
 	for (i = n - 1; i >= 0; i--) {
 		if (items[i] == 0 || items[i]->n < 5
-		    || cgp_bytes_len(OURO_F(items[i], 0), &nbytes) != 0) {
-			free(items);
-			return 0;
-		}
+		    || cgp_walk_bytes(OURO_F(items[i], 0), 0, &nbytes, INT_MAX, &stack, &stack_cap) != 0)
+			goto done;
 	}
 	if (nbytes > 0) {
 		buf = (unsigned char *)malloc(nbytes);
-		if (buf == 0) {
-			free(items);
-			return 0;
-		}
+		if (buf == 0)
+			goto done;
 	}
 	symbols = ouro_ctor(0, 0, 0);
 	fixups = ouro_ctor(0, 0, 0);
 	records = ouro_ctor(0, 0, 0);
 	frames = ouro_ctor(0, 0, 0);
 	for (i = n - 1; i >= 0; i--) {
-		if (cgp_bytes_copy(OURO_F(items[i], 0), buf, &off) != 0) {
-			free(items);
-			free(buf);
-			return 0;
-		}
+		if (cgp_walk_bytes(OURO_F(items[i], 0), buf, &off, nbytes, &stack, &stack_cap) != 0)
+			goto done;
 		symbols = cgp_cat(symbols, OURO_F(items[i], 1));
 		fixups = cgp_cat(fixups, OURO_F(items[i], 2));
 		records = cgp_cat(records, OURO_F(items[i], 3));
 		frames = cgp_cat(frames, OURO_F(items[i], 4));
 	}
-	free(items);
+	if (off != nbytes)
+		goto done;
 	fields[0] = ouro_packed(buf, nbytes);
 	fields[1] = symbols;
 	fields[2] = fixups;
 	fields[3] = records;
 	fields[4] = frames;
-	free(buf);
 	fe_progress("n1-host: finish-c functions=%d bytes=%lu\n", n,
 		nbytes);
 	fflush(stderr);
-	return ouro_ctor(0, 5, fields);
+	result = ouro_ctor(0, 5, fields);
+done:
+	free(items);
+	free(buf);
+	free(stack);
+	return result;
 }
 
 static ouro_v *ps_state(ouro_env *env, ouro_v *state)
@@ -1841,6 +2740,7 @@ static ouro_v *ps_program(ouro_env *env, ouro_v *program)
 {
 	(void)env;
 	if (g_perm_cg_program == 0 || g_source_cg_program != program) {
+		cgn_reset_program_indexes();
 		g_source_cg_program = program;
 		g_perm_cg_program = ouro_clone_perm(program);
 	}
@@ -2664,16 +3564,15 @@ ouro_v *ouro_wrap_x64_encode(ouro_v *raw)
 #define PE_SECTION_ALIGN 4096UL
 
 typedef struct {
-	ouro_v *atom;
 	int tag;
 	int n;
-	unsigned char b[CGASM_MAX_INS];
 	int cond;
 	int imported;
 	int lab_kind;
 	unsigned long lab[3];
 	unsigned long id;
 	unsigned long site;
+	unsigned long off;
 } cgasm_atom;
 
 typedef struct {
@@ -2767,15 +3666,6 @@ static int cgasm_enc_rip(int tag, int width, int reg, x64enc_buf *x)
 	return cgasm_run_enc(&d, x);
 }
 
-static int cgasm_save(const x64enc_buf *x, cgasm_atom *a)
-{
-	if (x->n < 0 || x->n > CGASM_MAX_INS)
-		return CGASM_FALLBACK;
-	memcpy(a->b, x->b, (unsigned long)x->n);
-	a->n = x->n;
-	return CGASM_OK;
-}
-
 static int cgasm_dec_label(ouro_v *v, int *kind, unsigned long ids[3])
 {
 	ids[0] = ids[1] = ids[2] = 0;
@@ -2799,7 +3689,6 @@ static int cgasm_dec_label(ouro_v *v, int *kind, unsigned long ids[3])
 static int cgasm_read_atom(ouro_v *atom, cgasm_atom *a)
 {
 	memset(a, 0, sizeof *a);
-	a->atom = atom;
 	if (atom == 0 || atom->tag < 0 || atom->tag > 7)
 		return CGASM_FALLBACK;
 	if (atom->n != cgasm_arity[atom->tag])
@@ -2844,14 +3733,14 @@ static int cgasm_read_atom(ouro_v *atom, cgasm_atom *a)
 	}
 }
 
-static int cgasm_measure_atom(cgasm_atom *a, x64enc_buf *x)
+static int cgasm_measure_atom(ouro_v *atom, const cgasm_atom *a, x64enc_buf *x)
 {
 	static const unsigned long z[4] = { 0, 0, 0, 0 };
 
 	memset(x, 0, sizeof *x);
 	switch (a->tag) {
 	case 0:
-		return cgasm_enc_ins(OURO_F(a->atom, 0), x);
+		return cgasm_enc_ins(OURO_F(atom, 0), x);
 	case 1:
 	case 7:
 		return CGASM_OK;
@@ -2889,23 +3778,50 @@ static void cgasm_relative(unsigned long target, unsigned long origin,
 	disp[3] = (d >> 24) & 255UL;
 }
 
-static int cgasm_find_label(const cgasm_lab *labs, int n, int kind,
-			    const unsigned long ids[3], unsigned long *off)
+static int cgasm_label_key_order(const cgasm_lab *left, const cgasm_lab *right)
 {
 	int i;
 
-	for (i = 0; i < n; i++) {
-		if (labs[i].kind != kind)
-			continue;
-		if (labs[i].ids[0] != ids[0])
-			continue;
-		if (kind == 1 && (labs[i].ids[1] != ids[1]
-				  || labs[i].ids[2] != ids[2]))
-			continue;
-		*off = labs[i].off;
-		return 0;
+	if (left->kind != right->kind)
+		return left->kind < right->kind ? -1 : 1;
+	for (i = 0; i < (left->kind == 1 ? 3 : 1); i++) {
+		if (left->ids[i] != right->ids[i])
+			return left->ids[i] < right->ids[i] ? -1 : 1;
 	}
-	return -1;
+	return 0;
+}
+
+static int cgasm_label_order(const void *left, const void *right)
+{
+	const cgasm_lab *a = left;
+	const cgasm_lab *b = right;
+	int order = cgasm_label_key_order(a, b);
+
+	if (order != 0)
+		return order;
+	/* Measured offsets never decrease, so the lowest offset is the first mark. */
+	return a->off < b->off ? -1 : a->off > b->off;
+}
+
+static int cgasm_find_label(const cgasm_lab *labs, int n, int kind,
+			    const unsigned long ids[3], unsigned long *off)
+{
+	cgasm_lab key = { kind, { ids[0], ids[1], ids[2] }, 0 };
+	int lo = 0;
+	int hi = n;
+
+	while (lo < hi) {
+		int mid = lo + (hi - lo) / 2;
+
+		if (cgasm_label_key_order(&labs[mid], &key) < 0)
+			lo = mid + 1;
+		else
+			hi = mid;
+	}
+	if (lo == n || cgasm_label_key_order(&labs[lo], &key) != 0)
+		return -1;
+	*off = labs[lo].off;
+	return 0;
 }
 
 static ouro_v *cgasm_rel32(unsigned long at, unsigned long end,
@@ -2998,7 +3914,7 @@ static int cgasm_next_atom(ouro_v ***stack, int *sp, int *scap, ouro_v **cur,
 
 static ouro_v *cgasm_try(ouro_v *atoms, ouro_v *base_v, ouro_v *initial_v)
 {
-	cgasm_atom *items = 0;
+	cgasm_atom *pending = 0;
 	cgasm_lab *labs = 0;
 	ouro_v **fixups = 0;
 	ouro_v **calls = 0;
@@ -3013,14 +3929,17 @@ static ouro_v *cgasm_try(ouro_v *atoms, ouro_v *base_v, ouro_v *initial_v)
 	unsigned long offset;
 	unsigned long remain;
 	int natoms = 0;
-	int cap = 0;
+	int npending = 0;
+	int pcap = 0;
 	int nlab = 0;
 	int lcap = 0;
+	int labels_sorted = 0;
 	int nfix = 0;
 	int fcap = 0;
 	int ncall = 0;
 	int ccap = 0;
 	int nbytes = 0;
+	int bcap = 0;
 	int i;
 	int rc;
 	int sp = 0;
@@ -3042,7 +3961,7 @@ static ouro_v *cgasm_try(ouro_v *atoms, ouro_v *base_v, ouro_v *initial_v)
 			goto fallback;
 		if (cgasm_read_atom(atom, &a) != CGASM_OK)
 			goto fallback;
-		rc = cgasm_measure_atom(&a, &enc);
+		rc = cgasm_measure_atom(atom, &a, &enc);
 		if (rc == CGASM_FALLBACK)
 			goto fallback;
 		if (rc == CGASM_FAIL) {
@@ -3051,16 +3970,14 @@ static ouro_v *cgasm_try(ouro_v *atoms, ouro_v *base_v, ouro_v *initial_v)
 				goto fallback;
 			goto done;
 		}
-		if (cgasm_save(&enc, &a) != CGASM_OK)
+		if (enc.n < 0 || enc.n > CGASM_MAX_INS)
 			goto fallback;
+		a.n = enc.n;
 		remain = offset > PE_MAX_RVA ? 0UL : PE_MAX_RVA - offset;
 		if ((unsigned long)a.n > remain) {
 			out = cgasm_left(5, 0, 0);
 			goto done;
 		}
-		if (!cgasm_grow((void **)&items, &cap, natoms + 1,
-				sizeof *items))
-			goto fallback;
 		if (a.tag == 1) {
 			if (!cgasm_grow((void **)&labs, &lcap, nlab + 1,
 					sizeof *labs))
@@ -3071,26 +3988,28 @@ static ouro_v *cgasm_try(ouro_v *atoms, ouro_v *base_v, ouro_v *initial_v)
 			labs[nlab].ids[2] = a.lab[2];
 			labs[nlab].off = offset;
 			nlab++;
+		} else if (a.tag != 0) {
+			if (!cgasm_grow((void **)&pending, &pcap, npending + 1,
+					sizeof *pending))
+				goto fallback;
+			a.off = offset;
+			pending[npending++] = a;
 		}
+		if (a.n > 0) {
+			/* A single grow covers an instruction of at most 32 bytes. */
+			if (!cgasm_grow((void **)&bytes, &bcap, nbytes + a.n - 1, 1))
+				goto fallback;
+			memcpy(bytes + nbytes, enc.b, (size_t)a.n);
+			nbytes += a.n;
+		}
+		natoms++;
 		offset += (unsigned long)a.n;
-		items[natoms++] = a;
 	}
 
-	nbytes = 0;
-	for (i = 0; i < natoms; i++)
-		nbytes += items[i].n;
-	if (nbytes > 0) {
-		bytes = (unsigned char *)malloc((unsigned long)nbytes);
-		if (bytes == 0)
-			goto fallback;
-	}
-	nbytes = 0;
-	offset = initial;
-	for (i = 0; i < natoms; i++) {
-		cgasm_atom *a = &items[i];
-		unsigned long absv = base + offset;
-		const unsigned char *src = a->b;
-		int n = a->n;
+	/* Measurement errors take precedence over unresolved labels. */
+	for (i = 0; i < npending; i++) {
+		const cgasm_atom *a = &pending[i];
+		unsigned long absv = base + a->off;
 
 		if (a->tag == 2 || a->tag == 3) {
 			unsigned long target;
@@ -3098,12 +4017,16 @@ static ouro_v *cgasm_try(ouro_v *atoms, ouro_v *base_v, ouro_v *initial_v)
 			int back;
 			unsigned long origin;
 
+			if (nlab > 1 && !labels_sorted) {
+				qsort(labs, (size_t)nlab, sizeof *labs, cgasm_label_order);
+				labels_sorted = 1;
+			}
 			if (cgasm_find_label(labs, nlab, a->lab_kind, a->lab,
 					     &target) != 0) {
 				out = cgasm_left(4, ouro_nat(a->lab[0]), 1);
 				goto done;
 			}
-			origin = offset + (a->tag == 2 ? 5UL : 6UL);
+			origin = a->off + (a->tag == 2 ? 5UL : 6UL);
 			cgasm_relative(target, origin, disp, &back);
 			rc = cgasm_enc_rel(a->tag == 2 ? 18 : 19, a->cond, disp,
 					   back, &enc);
@@ -3117,12 +4040,7 @@ static ouro_v *cgasm_try(ouro_v *atoms, ouro_v *base_v, ouro_v *initial_v)
 			}
 			if (enc.n != a->n)
 				goto fallback;
-			src = enc.b;
-			n = enc.n;
-		}
-		if (n > 0) {
-			memcpy(bytes + nbytes, src, (unsigned long)n);
-			nbytes += n;
+			memcpy(bytes + (a->off - initial), enc.b, (size_t)enc.n);
 		}
 		if (a->tag == 4) {
 			if (!cgasm_grow((void **)&fixups, &fcap, nfix + 1,
@@ -3149,7 +4067,6 @@ static ouro_v *cgasm_try(ouro_v *atoms, ouro_v *base_v, ouro_v *initial_v)
 			calls[ncall++] = cgasm_call_at(a->id, a->site,
 						      PE_SECTION_ALIGN + absv);
 		}
-		offset += (unsigned long)n;
 	}
 
 	{
@@ -3175,7 +4092,7 @@ fallback:
 			g_asm_fallback);
 	out = 0;
 done:
-	free(items);
+	free(pending);
 	free(labs);
 	free(fixups);
 	free(calls);
@@ -3244,21 +4161,24 @@ static int host_list_next(ouro_v **stack, int *sp, ouro_v **cur, ouro_v **head)
 	}
 }
 
-static int host_list_collect(ouro_v *list, ouro_v ***out, int *n, int *cap)
+static int host_list_collect(ouro_v *list, ouro_v ***out, int *n, int *cons_list)
 {
 	ouro_v **stack = 0;
 	ouro_v *cur = list;
 	ouro_v *item;
 	int sp = 0;
 	int scap = 0;
+	int cap = 0;
 	int step;
 
 	*out = 0;
 	*n = 0;
-	*cap = 0;
 	for (;;) {
 		step = host_list_next_g(&stack, &sp, &scap, &cur, &item);
 		if (step == 0) {
+			/* A concat node allocates the stack even if its branches are empty. */
+			if (cons_list != 0)
+				*cons_list = stack == 0 && cur != 0 && cur->tag == 0 && cur->n == 0;
 			free(stack);
 			return 0;
 		}
@@ -3266,7 +4186,7 @@ static int host_list_collect(ouro_v *list, ouro_v ***out, int *n, int *cap)
 			free(stack);
 			return -1;
 		}
-		if (!cgasm_grow((void **)out, cap, *n + 1, sizeof(ouro_v *))) {
+		if (!cgasm_grow((void **)out, &cap, *n + 1, sizeof(ouro_v *))) {
 			free(stack);
 			return -1;
 		}
@@ -3611,40 +4531,101 @@ static int cgn_bits64(int ty)
 	return ty == 2 || ty >= 4;
 }
 
-static int cgn_slot(ouro_v *slots, unsigned long id, unsigned long *off, int *ty)
+typedef struct {
+	unsigned long id;
+	int position;
+	ouro_v *value;
+} cgn_slot_entry;
+
+typedef struct {
+	ouro_v *source;
+	cgn_slot_entry *entries;
+	int count;
+	enum { CGN_SLOTS_UNINDEXED, CGN_SLOTS_INDEXED, CGN_SLOTS_FAILED } state;
+	/* The immutable slot list is shared by the prologue and all epilogues. */
+	enum { CGN_ROOTS_UNKNOWN, CGN_ROOTS_ABSENT, CGN_ROOTS_PRESENT, CGN_ROOTS_SCALAR_FRAME } roots;
+} cgn_frame_slots;
+
+static int cgn_slot_order(const void *left, const void *right)
 {
-	ouro_v **items = 0;
-	int n = 0;
-	int cap = 0;
-	int i;
+	const cgn_slot_entry *a = left;
+	const cgn_slot_entry *b = right;
 
-	if (host_list_collect(slots, &items, &n, &cap) != 0) {
-		free(items);
-		return -1;
-	}
-	for (i = 0; i < n; i++) {
-		unsigned long sid;
-
-		if (items[i] == 0 || items[i]->tag != 0 || items[i]->n < 3)
-			continue;
-		if (x64enc_dec_nat(OURO_F(items[i], 0), &sid) != 0)
-			continue;
-		if (sid != id)
-			continue;
-		if (OURO_F(items[i], 1) == 0
-		    || x64enc_dec_nat(OURO_F(items[i], 2), off) != 0) {
-			free(items);
-			return -1;
-		}
-		*ty = OURO_F(items[i], 1)->tag;
-		free(items);
-		return 0;
-	}
-	free(items);
-	return -1;
+	if (a->id != b->id)
+		return a->id < b->id ? -1 : 1;
+	return a->position < b->position ? -1 : a->position > b->position;
 }
 
-static ouro_v *cgn_load_value(ouro_v *slots, int reg, ouro_v *value)
+static void cgn_index_slots(cgn_frame_slots *slots)
+{
+	ouro_v **stack = 0;
+	ouro_v *cur = slots->source;
+	ouro_v *item;
+	int sp = 0;
+	int scap = 0;
+	int cap = 0;
+	int ordered = 1;
+	int step;
+
+	while ((step = host_list_next_g(&stack, &sp, &scap, &cur, &item)) > 0) {
+		unsigned long id;
+		int position = slots->count;
+
+		if (item == 0 || item->tag != 0 || item->n < 3
+		    || x64enc_dec_nat(OURO_F(item, 0), &id) != 0)
+			continue;
+		if ((position + 1 >= cap
+		     && (cap > INT_MAX / 2 || (size_t)cap > ULONG_MAX / 2 / sizeof *slots->entries))
+		    || !cgasm_grow((void **)&slots->entries, &cap, position + 1, sizeof *slots->entries)) {
+			step = -1;
+			break;
+		}
+		if (position > 0 && slots->entries[position - 1].id > id)
+			ordered = 0;
+		slots->entries[position] = (cgn_slot_entry){ id, position, item };
+		slots->count++;
+	}
+	free(stack);
+	if (step < 0) {
+		slots->state = CGN_SLOTS_FAILED;
+		return;
+	}
+	if (!ordered)
+		qsort(slots->entries, (size_t)slots->count,
+		      sizeof *slots->entries, cgn_slot_order);
+	slots->state = CGN_SLOTS_INDEXED;
+}
+
+static int cgn_slot(cgn_frame_slots *slots, unsigned long id, unsigned long *off, int *ty)
+{
+	ouro_v *item;
+	int lo = 0;
+	int hi;
+
+	if (slots->state == CGN_SLOTS_UNINDEXED)
+		cgn_index_slots(slots);
+	if (slots->state == CGN_SLOTS_FAILED)
+		return -1;
+	hi = slots->count;
+	while (lo < hi) {
+		int mid = lo + (hi - lo) / 2;
+
+		if (slots->entries[mid].id < id)
+			lo = mid + 1;
+		else
+			hi = mid;
+	}
+	if (lo == slots->count || slots->entries[lo].id != id)
+		return -1;
+	item = slots->entries[lo].value;
+	/* An invalid first match still requires fallback, even if a later slot is valid. */
+	if (OURO_F(item, 1) == 0 || x64enc_dec_nat(OURO_F(item, 2), off) != 0)
+		return -1;
+	*ty = OURO_F(item, 1)->tag;
+	return 0;
+}
+
+static ouro_v *cgn_load_value(cgn_frame_slots *slots, int reg, ouro_v *value)
 {
 	unsigned long off;
 	int ty;
@@ -3691,7 +4672,7 @@ static ouro_v *cgn_save_off(int ty, unsigned long off, int reg)
 	return store;
 }
 
-static ouro_v *cgn_save(ouro_v *slots, unsigned long id, int reg)
+static ouro_v *cgn_save(cgn_frame_slots *slots, unsigned long id, int reg)
 {
 	unsigned long off;
 	int ty;
@@ -3705,10 +4686,9 @@ static int cgn_list_has_id(ouro_v *list, unsigned long want, int field)
 {
 	ouro_v **items = 0;
 	int n = 0;
-	int cap = 0;
 	int i;
 
-	if (host_list_collect(list, &items, &n, &cap) != 0) {
+	if (host_list_collect(list, &items, &n, 0) != 0) {
 		free(items);
 		return -1;
 	}
@@ -3728,8 +4708,36 @@ static int cgn_list_has_id(ouro_v *list, unsigned long want, int field)
 	return 0;
 }
 
+static int cgn_find_id_position(const cgn_id_position *positions, int count, unsigned long id)
+{
+	int low = 0;
+	int high = count;
+
+	while (low < high) {
+		int middle = low + (high - low) / 2;
+
+		if (positions[middle].id < id)
+			low = middle + 1;
+		else
+			high = middle;
+	}
+	return low < count && positions[low].id == id ? positions[low].ordinal : -1;
+}
+
+static int cgn_find_pinned_function(ouro_v *program, unsigned long id, int *position)
+{
+	if (program != g_perm_cg_program || !g_cgn_function_index_ready)
+		return 0;
+	*position = cgn_find_id_position(g_cgn_function_positions, g_cgn_function_count, id);
+	return 1;
+}
+
 static int cgn_has_function(ouro_v *program, unsigned long id)
 {
+	int position;
+
+	if (cgn_find_pinned_function(program, id, &position))
+		return position >= 0;
 	if (program == 0 || program->n < 1)
 		return -1;
 	return cgn_list_has_id(OURO_F(program, 0), id, 0);
@@ -3739,13 +4747,29 @@ static int cgn_has_extern(ouro_v *program, unsigned long id)
 {
 	ouro_v **libs = 0;
 	int n = 0;
-	int cap = 0;
 	int i;
 	int found = 0;
 
 	if (program == 0 || program->n < 3)
 		return -1;
-	if (host_list_collect(OURO_F(program, 2), &libs, &n, &cap) != 0) {
+	if (program == g_perm_cg_program && g_cgn_externs.available) {
+		int lo = 0;
+		int hi = g_cgn_externs.count;
+
+		while (lo < hi) {
+			int mid = lo + (hi - lo) / 2;
+			unsigned long current = g_cgn_externs.ids[mid];
+
+			if (current == id)
+				return 1;
+			if (current < id)
+				lo = mid + 1;
+			else
+				hi = mid;
+		}
+		return 0;
+	}
+	if (host_list_collect(OURO_F(program, 2), &libs, &n, 0) != 0) {
 		free(libs);
 		return -1;
 	}
@@ -3782,7 +4806,7 @@ static ouro_v *cgn_mem_store(int ty, ouro_v *addr)
 	return cgn_store(cgn_bits64(ty), addr, 0);
 }
 
-static ouro_v *cgn_value_ty(ouro_v *slots, ouro_v *value, int *ty)
+static ouro_v *cgn_value_ty(cgn_frame_slots *slots, ouro_v *value, int *ty)
 {
 	unsigned long off;
 
@@ -3804,34 +4828,40 @@ static ouro_v *cgn_value_ty(ouro_v *slots, ouro_v *value, int *ty)
 	return 0;
 }
 
-static ouro_v *cgn_args(ouro_v *slots, ouro_v *args)
+typedef struct {
+	ouro_v **items;
+	int count;
+} cgn_call_args;
+
+static ouro_v *cgn_emit_args(cgn_frame_slots *slots, ouro_v *const *items, int n)
 {
-	ouro_v **items = 0;
-	ouro_v *out;
-	int n = 0;
-	int cap = 0;
+	ouro_v *out = ouro_ctor(0, 0, 0);
 	int i;
 	static const int argreg[4] = { 1, 2, 8, 9 };
 
-	if (host_list_collect(args, &items, &n, &cap) != 0) {
-		free(items);
-		return 0;
-	}
-	out = ouro_ctor(0, 0, 0);
 	for (i = 0; i < n; i++) {
 		ouro_v *load = cgn_load_value(slots, 0, items[i]);
 		ouro_v *place;
 
-		if (load == 0) {
-			free(items);
+		if (load == 0)
 			return 0;
-		}
 		if (i < 4)
 			place = cgn_one(cgn_mov(1, argreg[i], 0));
 		else
 			place = cgn_one(cgn_store(1, cgn_base(4, (unsigned long)i * 8UL), 0));
 		out = cgn_cat(out, cgn_cat(load, place));
 	}
+	return out;
+}
+
+static ouro_v *cgn_args(cgn_frame_slots *slots, ouro_v *args)
+{
+	ouro_v **items = 0;
+	ouro_v *out = 0;
+	int n = 0;
+
+	if (host_list_collect(args, &items, &n, 0) == 0)
+		out = cgn_emit_args(slots, items, n);
 	free(items);
 	return out;
 }
@@ -3866,141 +4896,152 @@ static int cgn_cond(int ty, int cmp)
 	return -1;
 }
 
-static ouro_v *g_cgn_prog;
 static unsigned long g_cgn_runtime_id;
 static unsigned long g_cgn_budget_off;
 static unsigned long g_cgn_entry;
-static unsigned long *g_cgn_objects;
 static int g_cgn_nobj;
+static unsigned long g_cgn_max_object_id;
 static unsigned long *g_cgn_alldesc;
 static int g_cgn_nall;
-static int g_cgn_meta_ok;
 
 static int cgn_fn_has_roots(ouro_v *fn)
 {
-	ouro_v **items = 0;
-	int n = 0;
-	int cap = 0;
-	int i;
+	ouro_v **stack = 0;
+	int capacity = 0;
 	int field;
 	int roots = 0;
 
 	if (fn == 0 || fn->tag != 0 || fn->n != 7)
 		return -1;
 	for (field = 2; field <= 3; field++) {
-		if (host_list_collect(OURO_F(fn, field), &items, &n, &cap) != 0) {
-			free(items);
-			return -1;
-		}
-		for (i = 0; i < n; i++) {
+		ouro_v *cursor = OURO_F(fn, field);
+		ouro_v *item;
+		int depth = 0;
+		int step;
+
+		while ((step = host_list_next_g(&stack, &depth, &capacity, &cursor, &item)) > 0) {
 			ouro_v *type;
 
-			if (items[i] == 0 || items[i]->tag != 0 || items[i]->n != 2) {
-				free(items);
-				return -1;
-			}
-			type = OURO_F(items[i], 1);
-			if (type == 0 || type->n != 0 || type->tag < 0 || type->tag > 6) {
-				free(items);
-				return -1;
-			}
+			if (item == 0 || item->tag != 0 || item->n != 2)
+				goto fail;
+			type = OURO_F(item, 1);
+			if (type == 0 || type->n != 0 || type->tag < 0 || type->tag > 6)
+				goto fail;
 			if (type->tag == 6)
 				roots = 1;
 		}
-		free(items);
-		items = 0;
-		n = 0;
-		cap = 0;
+		if (step < 0)
+			goto fail;
 	}
+	free(stack);
 	return roots;
+
+fail:
+	free(stack);
+	return -1;
 }
 
-static int cgn_max_list_id(ouro_v *list, int field, unsigned long *max_id)
+static void cgn_record_extern_id(cgn_extern_index *index, unsigned long id)
 {
-	ouro_v **items = 0;
-	int n = 0;
-	int cap = 0;
-	int i;
-
-	if (host_list_collect(list, &items, &n, &cap) != 0) {
-		free(items);
-		return -1;
+	if (index == 0 || !index->available)
+		return;
+	if (index->count + 1 >= index->capacity &&
+	    (index->capacity > INT_MAX / 2 ||
+	     (unsigned long)index->capacity > ULONG_MAX / 2 / sizeof *index->ids ||
+	     !cgasm_grow((void **)&index->ids, &index->capacity, index->count + 1,
+			 sizeof *index->ids))) {
+		cgn_release_extern_index(index);
+		return;
 	}
-	for (i = 0; i < n; i++) {
+	index->ids[index->count++] = id;
+}
+
+static int cgn_decode_item_id(ouro_v *item, int field, unsigned long *id)
+{
+	if (item == 0 || item->tag != 0 || item->n <= field)
+		return -1;
+	return x64enc_dec_nat(OURO_F(item, field), id);
+}
+
+static int cgn_max_list_id(ouro_v *list, int field, unsigned long *max_id,
+			  cgn_extern_index *externs)
+{
+	ouro_v **stack = 0;
+	ouro_v *item;
+	int depth = 0;
+	int capacity = 0;
+	int step;
+
+	while ((step = host_list_next_g(&stack, &depth, &capacity, &list, &item)) > 0) {
 		unsigned long id;
 
-		if (items[i] == 0 || items[i]->tag != 0 || items[i]->n <= field
-		    || x64enc_dec_nat(OURO_F(items[i], field), &id) != 0) {
-			free(items);
-			return -1;
+		if (cgn_decode_item_id(item, field, &id) != 0) {
+			step = -1;
+			break;
 		}
 		if (id > *max_id)
 			*max_id = id;
+		cgn_record_extern_id(externs, id);
 	}
-	free(items);
-	return 0;
-}
-
-static int cgn_push_allocs(ouro_v *fn, unsigned long **ids, int *n, int *cap)
-{
-	ouro_v **blocks = 0;
-	int nb = 0;
-	int bcap = 0;
-	int b;
-
-	if (fn == 0 || fn->tag != 0 || fn->n != 7)
-		return -1;
-	if (host_list_collect(OURO_F(fn, 6), &blocks, &nb, &bcap) != 0) {
-		free(blocks);
-		return -1;
-	}
-	for (b = 0; b < nb; b++) {
-		ouro_v **insns = 0;
-		int ni = 0;
-		int icap = 0;
-		int k;
-
-		if (blocks[b] == 0 || blocks[b]->tag != 0 || blocks[b]->n != 3) {
-			free(blocks);
-			return -1;
-		}
-		if (host_list_collect(OURO_F(blocks[b], 1), &insns, &ni, &icap)
-		    != 0) {
-			free(insns);
-			free(blocks);
-			return -1;
-		}
-		for (k = 0; k < ni; k++) {
-			unsigned long desc;
-
-			if (insns[k] != 0 && insns[k]->tag != 11)
-				continue;
-			if (insns[k] == 0 || insns[k]->n != 5
-			    || x64enc_dec_nat(OURO_F(insns[k], 3), &desc) != 0
-			    || *n == INT_MAX
-			    || (*n + 1 >= *cap && *cap > INT_MAX / 2)) {
-				free(insns);
-				free(blocks);
-				return -1;
-			}
-			if (!cgasm_grow((void **)ids, cap, *n + 1,
-					sizeof(unsigned long))) {
-				free(insns);
-				free(blocks);
-				return -1;
-			}
-			(*ids)[(*n)++] = desc;
-		}
-		free(insns);
-	}
-	free(blocks);
-	return 0;
+	free(stack);
+	return step;
 }
 
 typedef struct {
 	unsigned long id;
 	int site;
 } cgn_descriptor;
+
+static int cgn_push_allocs(ouro_v *fn, cgn_descriptor **descs, int *n, int *cap)
+{
+	ouro_v **block_stack = 0;
+	ouro_v **instruction_stack = 0;
+	ouro_v *blocks;
+	ouro_v *block;
+	int block_depth = 0;
+	int block_capacity = 0;
+	int instruction_capacity = 0;
+	int block_step;
+	int result = -1;
+
+	if (fn == 0 || fn->tag != 0 || fn->n != 7)
+		return -1;
+	blocks = OURO_F(fn, 6);
+	while ((block_step = host_list_next_g(&block_stack, &block_depth, &block_capacity,
+					     &blocks, &block)) > 0) {
+		ouro_v *cursor;
+		ouro_v *instruction;
+		int depth = 0;
+		int step;
+
+		if (block == 0 || block->tag != 0 || block->n != 3)
+			goto done;
+		cursor = OURO_F(block, 1);
+		while ((step = host_list_next_g(&instruction_stack, &depth, &instruction_capacity,
+						&cursor, &instruction)) > 0) {
+			unsigned long desc;
+
+			if (instruction != 0 && instruction->tag != 11)
+				continue;
+			if (instruction == 0 || instruction->n != 5
+			    || x64enc_dec_nat(OURO_F(instruction, 3), &desc) != 0
+			    || *n == INT_MAX
+			    || (*n + 1 >= *cap && (*cap > INT_MAX / 2
+			        || (unsigned long)*cap > ULONG_MAX / 2 / sizeof **descs))
+			    || !cgasm_grow((void **)descs, cap, *n + 1, sizeof **descs))
+				goto done;
+			(*descs)[*n] = (cgn_descriptor){desc, *n};
+			(*n)++;
+		}
+		if (step < 0)
+			goto done;
+	}
+	result = block_step;
+done:
+	free(instruction_stack);
+	free(block_stack);
+	return result;
+}
 
 static int cgn_descriptor_id_order(const void *left, const void *right)
 {
@@ -4020,25 +5061,46 @@ static int cgn_descriptor_site_order(const void *left, const void *right)
 	return a->site < b->site ? -1 : a->site > b->site;
 }
 
+static int cgn_id_position_order(const void *left, const void *right)
+{
+	const cgn_id_position *a = (const cgn_id_position *)left;
+	const cgn_id_position *b = (const cgn_id_position *)right;
+
+	if (a->id != b->id)
+		return a->id < b->id ? -1 : 1;
+	return a->ordinal < b->ordinal ? -1 : a->ordinal > b->ordinal;
+}
+
+static int cgn_extern_id_order(const void *left, const void *right)
+{
+	unsigned long a = *(const unsigned long *)left;
+	unsigned long b = *(const unsigned long *)right;
+
+	return a < b ? -1 : a > b;
+}
+
 static int cgn_refresh_meta(ouro_v *program)
 {
 	ouro_v **fns = 0;
 	ouro_v **libs = 0;
-	unsigned long *allocs = 0;
 	cgn_descriptor *descs = 0;
-	unsigned long *objects = 0;
+	cgn_id_position *positions = 0;
 	unsigned long *all = 0;
+	unsigned char *function_roots = 0;
+	cgn_extern_index externs = {
+		.available = program != 0 && program == g_perm_cg_program && !g_cgn_externs.available
+	};
 	unsigned long max_id = 0;
+	unsigned long max_object_id = 0;
 	unsigned long entry;
 	int n = 0;
-	int cap = 0;
 	int nlib = 0;
-	int lcap = 0;
 	int nalloc = 0;
 	int acap = 0;
 	int nuniq = 0;
 	int nroot = 0;
 	int nall;
+	int index_functions = program == g_perm_cg_program && !g_cgn_function_index_ready;
 	int i;
 	int result = -1;
 
@@ -4048,41 +5110,48 @@ static int cgn_refresh_meta(ouro_v *program)
 	if (program == 0 || program->tag != 0 || program->n != 4
 	    || x64enc_dec_nat(OURO_F(program, 3), &entry) != 0)
 		return -1;
-	if (cgn_max_list_id(OURO_F(program, 0), 0, &max_id) != 0
-	    || cgn_max_list_id(OURO_F(program, 1), 0, &max_id) != 0)
-		return -1;
-	if (host_list_collect(OURO_F(program, 2), &libs, &nlib, &lcap) != 0)
+	if (host_list_collect(OURO_F(program, 0), &fns, &n, 0) != 0)
+		goto done;
+	if (index_functions && n > 0 && (size_t)n <= (size_t)-1 / sizeof *positions)
+		positions = (cgn_id_position *)malloc((size_t)n * sizeof *positions);
+	for (i = 0; i < n; i++) {
+		unsigned long id;
+
+		if (cgn_decode_item_id(fns[i], 0, &id) != 0)
+			goto done;
+		if (id > max_id)
+			max_id = id;
+		if (positions != 0)
+			positions[i] = (cgn_id_position){id, i};
+	}
+	if (cgn_max_list_id(OURO_F(program, 1), 0, &max_id, 0) != 0)
+		goto done;
+	if (host_list_collect(OURO_F(program, 2), &libs, &nlib, 0) != 0)
 		goto done;
 	for (i = 0; i < nlib; i++) {
 		if (libs[i] == 0 || libs[i]->tag != 0 || libs[i]->n != 2
-		    || cgn_max_list_id(OURO_F(libs[i], 1), 1, &max_id) != 0)
+		    || cgn_max_list_id(OURO_F(libs[i], 1), 1, &max_id, &externs) != 0)
 			goto done;
 	}
-	if (host_list_collect(OURO_F(program, 0), &fns, &n, &cap) != 0)
-		goto done;
 	if (max_id > ULONG_MAX - 2UL
 	    || (n > 0 && max_id > ULONG_MAX - 2UL - (unsigned long)n))
 		goto done;
+	if (n > 0)
+		function_roots = (unsigned char *)malloc((size_t)n);
 	for (i = 0; i < n; i++) {
 		int roots = cgn_fn_has_roots(fns[i]);
 
-		if (roots < 0 || cgn_push_allocs(fns[i], &allocs, &nalloc, &acap) != 0)
+		if (roots < 0 || cgn_push_allocs(fns[i], &descs, &nalloc, &acap) != 0)
 			goto done;
+		if (function_roots != 0)
+			function_roots[i] = (unsigned char)roots;
 		if (roots)
 			nroot++;
 	}
 	if (nalloc > 0) {
-		if ((size_t)nalloc > (size_t)-1 / sizeof *descs)
-			goto done;
-		descs = (cgn_descriptor *)malloc((size_t)nalloc * sizeof *descs);
-		if (descs == 0)
-			goto done;
-		for (i = 0; i < nalloc; i++) {
-			descs[i].id = allocs[i];
-			descs[i].site = i;
-		}
 		/* Ouro foldr/mir_add retains each ID at its last occurrence. */
 		qsort(descs, (size_t)nalloc, sizeof *descs, cgn_descriptor_id_order);
+		max_object_id = descs[nalloc - 1].id;
 		for (i = 0; i < nalloc; i++) {
 			if (nuniq == 0 || descs[i].id != descs[nuniq - 1].id)
 				descs[nuniq++] = descs[i];
@@ -4095,13 +5164,6 @@ static int cgn_refresh_meta(ouro_v *program)
 	if ((unsigned long)nall > (ULONG_MAX - 40UL) / 16UL
 	    || (size_t)nall > (size_t)-1 / sizeof *all)
 		goto done;
-	if (nuniq > 0) {
-		objects = (unsigned long *)malloc((size_t)nuniq * sizeof *objects);
-		if (objects == 0)
-			goto done;
-		for (i = 0; i < nuniq; i++)
-			objects[i] = descs[i].id;
-	}
 	if (nall > 0) {
 		int next = nuniq;
 
@@ -4109,9 +5171,9 @@ static int cgn_refresh_meta(ouro_v *program)
 		if (all == 0)
 			goto done;
 		for (i = 0; i < nuniq; i++)
-			all[i] = objects[i];
+			all[i] = descs[i].id;
 		for (i = 0; i < n; i++) {
-			int roots = cgn_fn_has_roots(fns[i]);
+			int roots = function_roots != 0 ? function_roots[i] : cgn_fn_has_roots(fns[i]);
 
 			if (roots < 0)
 				goto done;
@@ -4119,27 +5181,41 @@ static int cgn_refresh_meta(ouro_v *program)
 				all[next++] = max_id + 3UL + (unsigned long)i;
 		}
 	}
-	free(g_cgn_objects);
 	free(g_cgn_alldesc);
-	g_cgn_objects = objects;
 	g_cgn_alldesc = all;
-	objects = 0;
 	all = 0;
 	g_cgn_nobj = nuniq;
+	g_cgn_max_object_id = max_object_id;
 	g_cgn_nall = nall;
 	g_cgn_entry = entry;
 	g_cgn_prog = program;
 	g_cgn_runtime_id = max_id + 2UL;
 	g_cgn_budget_off = 40UL + 16UL * (unsigned long)nall;
 	g_cgn_meta_ok = 1;
+	if (index_functions && (n == 0 || positions != 0)) {
+		if (n > 1)
+			qsort(positions, (size_t)n, sizeof *positions, cgn_id_position_order);
+		g_cgn_function_positions = positions;
+		g_cgn_function_count = n;
+		g_cgn_function_index_ready = 1;
+		positions = 0;
+	}
+	if (externs.available) {
+		if (externs.count > 1)
+			qsort(externs.ids, (size_t)externs.count, sizeof *externs.ids,
+			      cgn_extern_id_order);
+		g_cgn_externs = externs;
+		externs.ids = 0;
+	}
 	result = 0;
 done:
 	free(fns);
 	free(libs);
-	free(allocs);
 	free(descs);
-	free(objects);
+	free(positions);
 	free(all);
+	free(function_roots);
+	cgn_release_extern_index(&externs);
 	return result;
 }
 
@@ -4220,8 +5296,8 @@ static ouro_v *cgn_division(int ty, int rem, unsigned long block,
 	return a;
 }
 
-static ouro_v *cgi_try(ouro_v *program, ouro_v *slots, ouro_v *blockv,
-		       ouro_v *sitev, ouro_v *ins)
+static ouro_v *cgi_try(ouro_v *program, cgn_frame_slots *slots, ouro_v *blockv,
+		       ouro_v *sitev, ouro_v *ins, const cgn_call_args *call_args)
 {
 	unsigned long block;
 	unsigned long site;
@@ -4415,7 +5491,8 @@ static ouro_v *cgi_try(ouro_v *program, ouro_v *slots, ouro_v *blockv,
 	case 10:
 		if (ins->n < 4)
 			return 0;
-		a = cgn_args(slots, OURO_F(ins, 3));
+		a = call_args != 0 ? cgn_emit_args(slots, call_args->items, call_args->count)
+			: cgn_args(slots, OURO_F(ins, 3));
 		if (a == 0 || OURO_F(ins, 2) == 0)
 			return 0;
 		{
@@ -4579,30 +5656,35 @@ static ouro_v *cgn_lea(int reg, ouro_v *addr)
 	return cgn_atom(ouro_ctor(9, 2, f));
 }
 
-static int cgb_slot_roots(ouro_v *slots)
+static int cgb_is_root_slot(ouro_v *slot)
 {
-	ouro_v **items = 0;
-	int n = 0;
-	int cap = 0;
-	int i;
+	return slot != 0 && slot->n >= 2 && OURO_F(slot, 1) != 0
+		&& OURO_F(slot, 1)->tag == 6;
+}
+
+static int cgb_slot_roots(cgn_frame_slots *slots)
+{
+	ouro_v **stack = 0;
+	ouro_v *cur = slots->source;
+	ouro_v *item;
+	int depth = 0;
+	int capacity = 0;
+	int step;
 	int roots = 0;
 
-	if (host_list_collect(slots, &items, &n, &cap) != 0) {
-		free(items);
+	if (slots->roots != CGN_ROOTS_UNKNOWN)
+		return slots->roots == CGN_ROOTS_PRESENT;
+	while ((step = host_list_next_g(&stack, &depth, &capacity, &cur, &item)) > 0)
+		roots |= cgb_is_root_slot(item);
+	free(stack);
+	if (step < 0)
 		return -1;
-	}
-	for (i = 0; i < n; i++) {
-		if (items[i] != 0 && items[i]->n >= 2
-		    && OURO_F(items[i], 1) != 0
-		    && OURO_F(items[i], 1)->tag == 6)
-			roots = 1;
-	}
-	free(items);
+	slots->roots = roots ? CGN_ROOTS_PRESENT : CGN_ROOTS_ABSENT;
 	return roots;
 }
 
 static ouro_v *cgb_shadow_leave(ouro_v *program, unsigned long allocation,
-				ouro_v *slots, unsigned long block,
+				cgn_frame_slots *slots, unsigned long block,
 				unsigned long site)
 {
 	int roots = cgb_slot_roots(slots);
@@ -4630,7 +5712,7 @@ static ouro_v *cgb_shadow_leave(ouro_v *program, unsigned long allocation,
 	return a;
 }
 
-static ouro_v *cgb_term(ouro_v *program, ouro_v *slots,
+static ouro_v *cgb_term(ouro_v *program, cgn_frame_slots *slots,
 			unsigned long allocation, unsigned long block,
 			unsigned long site, ouro_v *term)
 {
@@ -4697,75 +5779,133 @@ static int cgb_tail_move(ouro_v *ins, unsigned long *cur)
 	return 1;
 }
 
-static ouro_v *cgb_find_block(ouro_v **blocks, int nblocks, unsigned long id)
+typedef struct {
+	ouro_v *source;
+	ouro_v **entries;
+	int count;
+	cgn_id_position *positions;
+	int position_count;
+	size_t scanned;
+	int index_attempted;
+	/* The generated export getters retain these callbacks for the image lifetime. */
+	ouro_v *annotate;
+	ouro_v *clear_roots;
+} cgb_block_context;
+
+enum { CGB_BLOCK_INDEX_MIN = 16 };
+
+static int cgb_block_id(ouro_v *block, unsigned long *id)
+{
+	return block != 0 && block->n >= 1 && x64enc_dec_nat(OURO_F(block, 0), id) == 0;
+}
+
+static void cgb_index_blocks(cgb_block_context *blocks)
+{
+	cgn_id_position *positions;
+	int count = 0;
+	int ordered = 1;
+	int i;
+	blocks->index_attempted = 1;
+	if ((size_t)blocks->count > SIZE_MAX / sizeof *positions)
+		return;
+	positions = (cgn_id_position *)malloc((size_t)blocks->count * sizeof *positions);
+	if (positions == 0)
+		return;
+	for (i = 0; i < blocks->count; i++) {
+		ouro_v *block = blocks->entries[i];
+		ouro_v *id;
+
+		if (block == 0 || block->n < 1)
+			continue;
+		id = OURO_F(block, 0);
+		/* Leave unpacked Nat decoding to the original lookup. */
+		if (id == 0 || id->tag != OURO_TAG_NAT || id->n < 0) {
+			free(positions);
+			return;
+		}
+		if (count > 0 && positions[count - 1].id > (unsigned long)id->n)
+			ordered = 0;
+		positions[count++] = (cgn_id_position){(unsigned long)id->n, i};
+	}
+	if (!ordered)
+		qsort(positions, (size_t)count, sizeof *positions, cgn_id_position_order);
+	blocks->positions = positions;
+	blocks->position_count = count;
+}
+
+static ouro_v *cgb_find_block(cgb_block_context *blocks, unsigned long id)
 {
 	int i;
+	int can_index = blocks->count >= CGB_BLOCK_INDEX_MIN && !blocks->index_attempted;
 
-	for (i = 0; i < nblocks; i++) {
+	/* Defer allocation until linear lookups have visited at least count entries. */
+	if (can_index && blocks->scanned >= (size_t)blocks->count) {
+		cgb_index_blocks(blocks);
+		can_index = 0;
+	}
+	if (blocks->positions != 0) {
+		i = cgn_find_id_position(blocks->positions, blocks->position_count, id);
+		return i >= 0 ? blocks->entries[i] : 0;
+	}
+	for (i = 0; i < blocks->count; i++) {
 		unsigned long bid;
 
-		if (blocks[i] == 0 || blocks[i]->n < 1)
-			continue;
-		if (x64enc_dec_nat(OURO_F(blocks[i], 0), &bid) == 0 && bid == id)
-			return blocks[i];
+		if (cgb_block_id(blocks->entries[i], &bid) && bid == id)
+			break;
 	}
-	return 0;
+	if (can_index)
+		blocks->scanned += (size_t)i + (i < blocks->count);
+	return i < blocks->count ? blocks->entries[i] : 0;
 }
 
-static int cgb_tail_return(ouro_v **blocks, int nblocks, unsigned long fuel,
+static int cgb_tail_return(cgb_block_context *blocks, unsigned long fuel,
 			   unsigned long value, ouro_v *term)
 {
-	if (fuel == 0UL || term == 0)
-		return 0;
-	if (term->tag == 2) {
-		ouro_v *payload;
+	ouro_v **stack = 0;
+	int capacity = 0;
+	int matched = 0;
 
-		if (term->n < 1 || OURO_F(term, 0) == 0
-		    || OURO_F(term, 0)->tag != 1 || OURO_F(term, 0)->n < 1)
-			return 0;
-		payload = OURO_F(OURO_F(term, 0), 0);
-		if (payload == 0 || payload->tag != 0 || payload->n < 1)
-			return 0;
-		{
-			unsigned long id;
-
-			if (x64enc_dec_nat(OURO_F(payload, 0), &id) != 0)
-				return 0;
-			return id == value;
-		}
-	}
-	if (term->tag == 0) {
+	while (fuel > 0UL && term != 0) {
 		unsigned long target;
 		ouro_v *blk;
-		ouro_v **insns = 0;
-		int n = 0;
-		int cap = 0;
-		int i;
-		unsigned long cur = value;
+		ouro_v *instructions;
+		ouro_v *instruction;
+		int depth = 0;
+		int step;
 
-		if (term->n < 1 || x64enc_dec_nat(OURO_F(term, 0), &target) != 0)
-			return 0;
-		blk = cgb_find_block(blocks, nblocks, target);
+		if (term->tag == 2) {
+			ouro_v *payload;
+			unsigned long id;
+
+			if (term->n < 1 || OURO_F(term, 0) == 0
+			    || OURO_F(term, 0)->tag != 1 || OURO_F(term, 0)->n < 1)
+				break;
+			payload = OURO_F(OURO_F(term, 0), 0);
+			matched = payload != 0 && payload->tag == 0 && payload->n >= 1
+				&& x64enc_dec_nat(OURO_F(payload, 0), &id) == 0 && id == value;
+			break;
+		}
+		if (term->tag != 0 || term->n < 1
+		    || x64enc_dec_nat(OURO_F(term, 0), &target) != 0)
+			break;
+		blk = cgb_find_block(blocks, target);
 		if (blk == 0 || blk->n < 3)
-			return 0;
-		if (host_list_collect(OURO_F(blk, 1), &insns, &n, &cap) != 0) {
-			free(insns);
-			return 0;
-		}
-		for (i = 0; i < n; i++) {
-			if (!cgb_tail_move(insns[i], &cur)) {
-				free(insns);
-				return 0;
-			}
-		}
-		free(insns);
-		return cgb_tail_return(blocks, nblocks, fuel - 1UL, cur,
-				       OURO_F(blk, 2));
+			break;
+		instructions = OURO_F(blk, 1);
+		while ((step = host_list_next_g(&stack, &depth, &capacity,
+						&instructions, &instruction)) > 0)
+			if (!cgb_tail_move(instruction, &value))
+				break;
+		if (step != 0)
+			break;
+		term = OURO_F(blk, 2);
+		fuel--;
 	}
-	return 0;
+	free(stack);
+	return matched;
 }
 
-static int cgb_tail_result(ouro_v **blocks, int nblocks, ouro_v *term,
+static int cgb_tail_result(cgb_block_context *blocks, ouro_v *term,
 			   unsigned long value, ouro_v **insns, int from, int n)
 {
 	unsigned long cur = value;
@@ -4775,13 +5915,13 @@ static int cgb_tail_result(ouro_v **blocks, int nblocks, ouro_v *term,
 		if (!cgb_tail_move(insns[i], &cur))
 			return 0;
 	}
-	return cgb_tail_return(blocks, nblocks, (unsigned long)nblocks + 1UL,
+	return cgb_tail_return(blocks, (unsigned long)blocks->count + 1UL,
 			       cur, term);
 }
 
-static ouro_v *cgb_tail_call(ouro_v *program, ouro_v *slots,
+static ouro_v *cgb_tail_call(ouro_v *program, cgn_frame_slots *slots,
 			     unsigned long allocation, unsigned long block,
-			     unsigned long site, ouro_v *target, ouro_v *args)
+			     unsigned long site, ouro_v *target, ouro_v *const *args, int nargs)
 {
 	ouro_v *a;
 	ouro_v *b;
@@ -4808,7 +5948,7 @@ static ouro_v *cgb_tail_call(ouro_v *program, ouro_v *slots,
 		return 0;
 	}
 	a = cgn_cat(a, cgn_one(cgn_store(1, cgn_base(4, home), 0)));
-	b = cgn_args(slots, args);
+	b = cgn_emit_args(slots, args, nargs);
 	if (b == 0)
 		return 0;
 	a = cgn_cat(a, b);
@@ -4818,11 +5958,12 @@ static ouro_v *cgb_tail_call(ouro_v *program, ouro_v *slots,
 		cgn_base(11, 0) }))));
 }
 
-static ouro_v *cgb_ins_atoms(ouro_v *program, ouro_v *slots,
-			     unsigned long block, unsigned long site, ouro_v *ins)
+static ouro_v *cgb_ins_atoms(ouro_v *program, cgn_frame_slots *slots,
+			     unsigned long block, unsigned long site, ouro_v *ins,
+			     const cgn_call_args *call_args)
 {
 	ouro_v *fast = cgi_try(program, slots, ouro_nat(block),
-			       ouro_nat(site), ins);
+			       ouro_nat(site), ins, call_args);
 	ouro_v *raw;
 
 	if (fast != 0) {
@@ -4840,7 +5981,7 @@ static ouro_v *cgb_ins_atoms(ouro_v *program, ouro_v *slots,
 	if (g_raw_cgi == 0)
 		return 0;
 	raw = ouro_apply(ouro_apply(ouro_apply(ouro_apply(ouro_apply(
-		g_raw_cgi, program), slots), ouro_nat(block)),
+		g_raw_cgi, program), slots->source), ouro_nat(block)),
 		ouro_nat(site)), ins);
 	if (raw == 0 || raw->tag != 1 || raw->n < 1)
 		return 0;
@@ -4851,66 +5992,76 @@ static unsigned long g_cgb_count;
 static unsigned long g_cgb_fallback;
 static ouro_v *g_raw_cgb;
 
-static ouro_v *cgb_try(ouro_v *program, ouro_v *slots, ouro_v *allocv,
-		       ouro_v *facts, ouro_v *blocksv, ouro_v *block)
+static int cgb_collect_blocks(cgb_block_context *blocks)
+{
+	return host_list_collect(blocks->source, &blocks->entries, &blocks->count, 0);
+}
+
+static void cgb_release_blocks(cgb_block_context *blocks)
+{
+	free(blocks->positions);
+	free(blocks->entries);
+}
+
+static ouro_v *cgb_emit_block(ouro_v *program, cgn_frame_slots *slots, ouro_v *allocv,
+			      ouro_v *facts, cgb_block_context *blocks, ouro_v *block)
 {
 	unsigned long allocation;
 	unsigned long id;
 	unsigned long site;
 	ouro_v **insns = 0;
 	ouro_v **annotated = 0;
-	ouro_v **blocks = 0;
 	ouro_v *atoms;
 	ouro_v *part;
 	int n = 0;
-	int cap = 0;
-	int nblocks = 0;
-	int bcap = 0;
 	int nannotated = 0;
-	int acap = 0;
+	int cons_list;
+	int needs_annotations;
 	int i;
 
 	if (block == 0 || block->n < 3
 	    || x64enc_dec_nat(allocv, &allocation) != 0
 	    || x64enc_dec_nat(OURO_F(block, 0), &id) != 0)
 		return 0;
-	if (host_list_collect(OURO_F(block, 1), &insns, &n, &cap) != 0) {
+	if (host_list_collect(OURO_F(block, 1), &insns, &n, &cons_list) != 0) {
 		free(insns);
 		return 0;
 	}
-	if (host_list_collect(blocksv, &blocks, &nblocks, &bcap) != 0) {
+	if (blocks->entries == 0 && cgb_collect_blocks(blocks) != 0) {
 		free(insns);
-		free(blocks);
 		return 0;
 	}
-	part = ouro_apply(ouro_apply(ouro_apply(
-		FIND(lo, "codegen_live_instructions"), slots), facts), block);
-	if (part != 0 && part->tag == 0 && part->n == 1) {
-		free(insns);
-		free(blocks);
-		return part;
-	}
-	if (part == 0 || part->tag != 1 || part->n != 1
-	    || host_list_collect(OURO_F(part, 0), &annotated,
-				 &nannotated, &acap) != 0
-	    || nannotated != n) {
-		free(insns);
-		free(blocks);
-		free(annotated);
-		return 0;
+	/* Without roots the callback adds an empty live set to every instruction. */
+	needs_annotations = slots->roots != CGN_ROOTS_SCALAR_FRAME || block->tag != 0
+		|| block->n != 3 || !cons_list;
+	if (needs_annotations) {
+		if (blocks->annotate == 0)
+			blocks->annotate = FIND(lo, "codegen_live_instructions");
+		part = ouro_apply(ouro_apply(ouro_apply(blocks->annotate, slots->source),
+					     facts), block);
+		if (part != 0 && part->tag == 0 && part->n == 1) {
+			free(insns);
+			return part;
+		}
+		if (part == 0 || part->tag != 1 || part->n != 1
+		    || host_list_collect(OURO_F(part, 0), &annotated, &nannotated, 0) != 0
+		    || nannotated != n) {
+			free(insns);
+			free(annotated);
+			return 0;
+		}
 	}
 	atoms = cgn_one(cgn_mark_block(id));
 	for (i = 0; i < n; i++) {
 		ouro_v *ins = insns[i];
-		int nargs = 0;
-		int acap = 0;
-		ouro_v **args = 0;
+		cgn_call_args call_args = { 0 };
+		int args_ready = 0;
 		unsigned long dest;
-		ouro_v *annotation = annotated[i];
+		ouro_v *annotation = needs_annotations ? annotated[i] : 0;
 
-		if (annotation == 0 || annotation->tag != 0 || annotation->n != 2) {
+		if (needs_annotations && (annotation == 0 || annotation->tag != 0
+					  || annotation->n != 2)) {
 			free(insns);
-			free(blocks);
 			free(annotated);
 			return 0;
 		}
@@ -4919,40 +6070,43 @@ static ouro_v *cgb_try(ouro_v *program, ouro_v *slots, ouro_v *allocv,
 		if (ins != 0 && ins->tag == 10 && ins->n >= 4
 		    && OURO_F(ins, 1) != 0 && OURO_F(ins, 1)->tag == 1
 		    && OURO_F(ins, 1)->n >= 1
-		    && x64enc_dec_nat(OURO_F(OURO_F(ins, 1), 0), &dest) == 0
-		    && host_list_collect(OURO_F(ins, 3), &args, &nargs,
-					 &acap) == 0
-		    && nargs <= 4
-		    && cgb_tail_result(blocks, nblocks, OURO_F(block, 2),
+		    && x64enc_dec_nat(OURO_F(OURO_F(ins, 1), 0), &dest) == 0) {
+			args_ready = host_list_collect(OURO_F(ins, 3), &call_args.items,
+						       &call_args.count, 0) == 0;
+			if (!args_ready) {
+				free(call_args.items);
+				call_args.items = 0;
+			}
+		}
+		if (args_ready && call_args.count <= 4
+		    && cgb_tail_result(blocks, OURO_F(block, 2),
 				       dest, insns, i + 1, n)) {
-			free(args);
 			part = cgb_tail_call(program, slots, allocation, id,
-					     site, OURO_F(ins, 2),
-					     OURO_F(ins, 3));
+					     site, OURO_F(ins, 2), call_args.items, call_args.count);
+			free(call_args.items);
 			if (part == 0) {
 				free(insns);
-				free(blocks);
 				free(annotated);
 				return 0;
 			}
 			atoms = cgn_cat(atoms, part);
 			free(insns);
-			free(blocks);
 			free(annotated);
 			return cgn_right(atoms);
 		}
-		free(args);
-		if (ins != 0 && (ins->tag == 11
+		if (needs_annotations && ins != 0 && (ins->tag == 11
 		    || (ins->tag == 10 && ins->n >= 1
 			&& OURO_F(ins, 0) != 0 && OURO_F(ins, 0)->tag == 1))) {
-			part = ouro_apply(ouro_apply(FIND(lo, "codegen_clear_dead_roots"),
-				slots), OURO_F(annotation, 1));
+			if (blocks->clear_roots == 0)
+				blocks->clear_roots = FIND(lo, "codegen_clear_dead_roots");
+			part = ouro_apply(ouro_apply(blocks->clear_roots,
+				slots->source), OURO_F(annotation, 1));
 			atoms = cgn_cat(atoms, part);
 		}
-		part = cgb_ins_atoms(program, slots, id, site, ins);
+		part = cgb_ins_atoms(program, slots, id, site, ins, args_ready ? &call_args : 0);
+		free(call_args.items);
 		if (part == 0) {
 			free(insns);
-			free(blocks);
 			free(annotated);
 			return 0;
 		}
@@ -4961,11 +6115,22 @@ static ouro_v *cgb_try(ouro_v *program, ouro_v *slots, ouro_v *allocv,
 	part = cgb_term(program, slots, allocation, id, (unsigned long)n,
 			OURO_F(block, 2));
 	free(insns);
-	free(blocks);
 	free(annotated);
 	if (part == 0)
 		return 0;
 	return cgn_right(cgn_cat(atoms, part));
+}
+
+static ouro_v *cgb_try(ouro_v *program, ouro_v *slots, ouro_v *allocv,
+		       ouro_v *facts, ouro_v *blocksv, ouro_v *block)
+{
+	cgn_frame_slots frame = { .source = slots };
+	cgb_block_context blocks = { .source = blocksv };
+	ouro_v *result = cgb_emit_block(program, &frame, allocv, facts, &blocks, block);
+
+	cgb_release_blocks(&blocks);
+	free(frame.entries);
+	return result;
 }
 
 static ouro_v *cgb_block(ouro_env *env, ouro_v *block)
@@ -5031,36 +6196,42 @@ static ouro_v *cgn_movimm32(int reg, unsigned long imm)
 	return cgn_atom(ouro_ctor(0, 2, f));
 }
 
-static ouro_v *cgb_zero_roots(ouro_v *slots)
+static int cgb_is_scalar_slot(ouro_v *slot)
+{
+	ouro_v *type;
+
+	if (slot == 0 || slot->tag != 0 || slot->n != 3)
+		return 0;
+	type = OURO_F(slot, 1);
+	return type != 0 && type->n == 0 && type->tag >= 0 && type->tag < 6;
+}
+
+static ouro_v *cgb_zero_roots(cgn_frame_slots *slots)
 {
 	ouro_v **items = 0;
-	ouro_v *out;
+	ouro_v *out = 0;
 	int n = 0;
-	int cap = 0;
+	int cons_list;
 	int i;
 	int roots = 0;
+	int scalar_frame = 1;
 
-	if (host_list_collect(slots, &items, &n, &cap) != 0) {
+	if (host_list_collect(slots->source, &items, &n, &cons_list) != 0) {
 		free(items);
 		return 0;
 	}
 	for (i = 0; i < n; i++) {
-		if (items[i] != 0 && items[i]->n >= 2
-		    && OURO_F(items[i], 1) != 0
-		    && OURO_F(items[i], 1)->tag == 6)
-			roots = 1;
-	}
-	if (!roots) {
-		free(items);
-		return ouro_ctor(0, 0, 0);
-	}
-	out = cgn_one(cgn_movimm32(0, 0UL));
-	for (i = 0; i < n; i++) {
 		unsigned long off;
 
-		if (items[i] == 0 || items[i]->n < 3
-		    || OURO_F(items[i], 1) == 0
-		    || OURO_F(items[i], 1)->tag != 6)
+		if (!cgb_is_root_slot(items[i])) {
+			scalar_frame = scalar_frame && cgb_is_scalar_slot(items[i]);
+			continue;
+		}
+		if (!roots) {
+			out = cgn_one(cgn_movimm32(0, 0UL));
+			roots = 1;
+		}
+		if (items[i]->n < 3)
 			continue;
 		if (x64enc_dec_nat(OURO_F(items[i], 2), &off) != 0) {
 			free(items);
@@ -5069,19 +6240,23 @@ static ouro_v *cgb_zero_roots(ouro_v *slots)
 		out = cgn_cat(out, cgn_one(cgn_store(1, cgn_base(4, off), 0)));
 	}
 	free(items);
-	return out;
+	slots->roots = CGN_ROOTS_ABSENT;
+	if (roots)
+		slots->roots = CGN_ROOTS_PRESENT;
+	else if (scalar_frame && cons_list)
+		slots->roots = CGN_ROOTS_SCALAR_FRAME;
+	return roots ? out : ouro_ctor(0, 0, 0);
 }
 
-static ouro_v *cgb_spill(ouro_v *slots, unsigned long allocation, ouro_v *args)
+static ouro_v *cgb_spill(cgn_frame_slots *slots, unsigned long allocation, ouro_v *args)
 {
 	ouro_v **items = 0;
 	ouro_v *out;
 	int n = 0;
-	int cap = 0;
 	int i;
 	static const int argreg[4] = { 1, 2, 8, 9 };
 
-	if (host_list_collect(args, &items, &n, &cap) != 0) {
+	if (host_list_collect(args, &items, &n, 0) != 0) {
 		free(items);
 		return 0;
 	}
@@ -5111,15 +6286,21 @@ static ouro_v *cgb_spill(ouro_v *slots, unsigned long allocation, ouro_v *args)
 	return out;
 }
 
-static int cgb_object_kind(unsigned long id)
+static unsigned long cgb_descriptor_kind(int index)
 {
+	unsigned long id = g_cgn_alldesc[index];
 	int i;
 
+	if (index < g_cgn_nobj)
+		return 1UL;
+	if (id > g_cgn_max_object_id)
+		return 2UL;
+	/* Preserve object precedence if a frame ID also appears in the object prefix. */
 	for (i = 0; i < g_cgn_nobj; i++) {
-		if (g_cgn_objects[i] == id)
-			return 1;
+		if (g_cgn_alldesc[i] == id)
+			return 1UL;
 	}
-	return 2;
+	return 2UL;
 }
 
 static ouro_v *cgb_runtime_init(unsigned long id)
@@ -5137,8 +6318,7 @@ static ouro_v *cgb_runtime_init(unsigned long id)
 	for (i = 0; i < g_cgn_nall; i++) {
 		a = cgn_cat(a, cgn_one(cgn_sym(g_cgn_alldesc[i])));
 		a = cgn_cat(a, cgn_one(cgn_store(1, cgn_base(10, off), 0)));
-		a = cgn_cat(a, cgn_one(cgn_movimm32(0,
-			(unsigned long)cgb_object_kind(g_cgn_alldesc[i]))));
+		a = cgn_cat(a, cgn_one(cgn_movimm32(0, cgb_descriptor_kind(i))));
 		a = cgn_cat(a, cgn_one(cgn_store(1, cgn_base(10, off + 8UL), 0)));
 		off += 16UL;
 	}
@@ -5170,12 +6350,17 @@ static int cgb_fn_index(ouro_v *program, unsigned long id, unsigned long *index)
 {
 	ouro_v **fns = 0;
 	int n = 0;
-	int cap = 0;
 	int i;
 
+	if (cgn_find_pinned_function(program, id, &i)) {
+		if (i < 0)
+			return -1;
+		*index = (unsigned long)i;
+		return 0;
+	}
 	if (program == 0 || program->n < 1)
 		return -1;
-	if (host_list_collect(OURO_F(program, 0), &fns, &n, &cap) != 0) {
+	if (host_list_collect(OURO_F(program, 0), &fns, &n, 0) != 0) {
 		free(fns);
 		return -1;
 	}
@@ -5198,31 +6383,26 @@ static unsigned long g_cbody_count;
 static unsigned long g_cbody_fallback;
 static ouro_v *g_raw_cbody;
 
-static ouro_v *cgb_body_try(ouro_v *program, ouro_v *function, ouro_v *frame)
+static ouro_v *cgb_emit_body(ouro_v *program, ouro_v *function, ouro_v *frame,
+			     cgn_frame_slots *slots, cgb_block_context *blocks)
 {
 	unsigned long id;
 	unsigned long entry;
 	unsigned long allocation;
 	unsigned long index;
-	ouro_v *slots;
-	ouro_v *blocks;
-	ouro_v **blks = 0;
 	ouro_v *atoms;
 	ouro_v *part;
 	ouro_v *facts = ouro_ctor(0, 0, 0);
-	int n = 0;
-	int cap = 0;
 	int i;
 	int roots;
 
-	if (function == 0 || function->n < 7 || frame == 0 || frame->n < 2)
+	if (function == 0 || function->n < 7)
 		return 0;
 	if (x64enc_dec_nat(OURO_F(function, 0), &id) != 0
 	    || x64enc_dec_nat(OURO_F(function, 5), &entry) != 0
 	    || x64enc_dec_nat(OURO_F(frame, 0), &allocation) != 0)
 		return 0;
-	slots = OURO_F(frame, 1);
-	blocks = OURO_F(function, 6);
+	blocks->source = OURO_F(function, 6);
 	if (cgn_refresh_meta(program) != 0)
 		return 0;
 	roots = cgn_fn_has_roots(function);
@@ -5231,16 +6411,11 @@ static ouro_v *cgb_body_try(ouro_v *program, ouro_v *function, ouro_v *frame)
 	if (roots) {
 		ouro_v *analyzed;
 		ouro_v *root_ids;
-		if (host_list_collect(blocks, &blks, &n, &cap) != 0) {
-			free(blks);
+		if (cgb_collect_blocks(blocks) != 0)
 			return 0;
-		}
 		root_ids = ouro_apply(FIND(lo, "mir_live_roots"), function);
-		analyzed = live_exact(ouro_nat((unsigned long)n + 1UL), root_ids, blocks);
-		free(blks);
-		blks = 0;
-		n = 0;
-		cap = 0;
+		analyzed = live_exact(ouro_nat((unsigned long)blocks->count + 1UL),
+				      root_ids, blocks->source);
 		if (analyzed != 0 && analyzed->tag == 0 && analyzed->n == 1) {
 			ouro_v *error = OURO_F(analyzed, 0);
 			error = ouro_ctor(0, 1, &error); /* NativeMirError */
@@ -5268,21 +6443,31 @@ static ouro_v *cgb_body_try(ouro_v *program, ouro_v *function, ouro_v *frame)
 		atoms = cgn_cat(atoms, part);
 	}
 	atoms = cgn_cat(atoms, cgn_one(cgn_jump_block(entry)));
-	if (host_list_collect(blocks, &blks, &n, &cap) != 0) {
-		free(blks);
+	if (!roots && cgb_collect_blocks(blocks) != 0)
 		return 0;
-	}
-	for (i = 0; i < n; i++) {
-		part = cgb_try(program, slots, ouro_nat(allocation), facts, blocks,
-			       blks[i]);
-		if (part == 0 || part->tag != 1 || part->n < 1) {
-			free(blks);
+	for (i = 0; i < blocks->count; i++) {
+		part = cgb_emit_block(program, slots, ouro_nat(allocation), facts, blocks,
+				      blocks->entries[i]);
+		if (part == 0 || part->tag != 1 || part->n < 1)
 			return 0;
-		}
 		atoms = cgn_cat(atoms, OURO_F(part, 0));
 	}
-	free(blks);
 	return cgn_right(atoms);
+}
+
+static ouro_v *cgb_body_try(ouro_v *program, ouro_v *function, ouro_v *frame)
+{
+	cgn_frame_slots slots = { 0 };
+	cgb_block_context blocks = { 0 };
+	ouro_v *result;
+
+	if (frame == 0 || frame->n < 2)
+		return 0;
+	slots.source = OURO_F(frame, 1);
+	result = cgb_emit_body(program, function, frame, &slots, &blocks);
+	cgb_release_blocks(&blocks);
+	free(slots.entries);
+	return result;
 }
 
 static ouro_v *cbody_frame(ouro_env *env, ouro_v *frame)
@@ -5324,9 +6509,11 @@ ouro_v *ouro_wrap_codegen_body(ouro_v *raw)
 
 static ouro_v *cgi_ins(ouro_env *env, ouro_v *ins)
 {
-	ouro_v *fast = cgi_try(ouro_get(env, 3), ouro_get(env, 2),
-			       ouro_get(env, 1), ouro_get(env, 0), ins);
+	cgn_frame_slots slots = { .source = ouro_get(env, 2) };
+	ouro_v *fast = cgi_try(ouro_get(env, 3), &slots,
+			       ouro_get(env, 1), ouro_get(env, 0), ins, 0);
 
+	free(slots.entries);
 	if (fast != 0) {
 		g_cgi_count++;
 		if (g_cgi_count == 1UL || (g_cgi_count % 10000UL) == 0UL)
@@ -5567,7 +6754,6 @@ static ouro_v *gcinf_try(ouro_v *fuel, ouro_v *program)
 	int icap = 0;
 	unsigned char *collectors = 0;
 	unsigned char *cand = 0;
-	unsigned char *bodies = 0;
 	unsigned char *ext_seen = 0;
 	unsigned char *ext_nogc = 0;
 	unsigned char *keep = 0;
@@ -5590,11 +6776,10 @@ static ouro_v *gcinf_try(ouro_v *fuel, ouro_v *program)
 		return 0;
 	collectors = (unsigned char *)calloc(GCINF_ID_MAX, 1);
 	cand = (unsigned char *)calloc(GCINF_ID_MAX, 1);
-	bodies = (unsigned char *)calloc(GCINF_ID_MAX, 1);
 	ext_seen = (unsigned char *)calloc(GCINF_ID_MAX, 1);
 	ext_nogc = (unsigned char *)calloc(GCINF_ID_MAX, 1);
 	keep = (unsigned char *)calloc(GCINF_ID_MAX, 1);
-	if (collectors == 0 || cand == 0 || bodies == 0 || ext_seen == 0
+	if (collectors == 0 || cand == 0 || ext_seen == 0
 	    || ext_nogc == 0 || keep == 0)
 		goto fallback;
 	cur = OURO_F(program, 0);
@@ -5617,49 +6802,19 @@ static ouro_v *gcinf_try(ouro_v *fuel, ouro_v *program)
 		if (gcinf_walk_instr(item, gcinf_add_collector, collectors) != 0)
 			goto fallback;
 	}
-	cur = OURO_F(program, 2);
-	sp = 0;
-	for (;;) {
-		ouro_v *lib;
-		ouro_v *ex;
-		ouro_v *estack[64];
-		int esp = 0;
-
-		step = host_list_next(stack, &sp, &cur, &lib);
-		if (step == 0)
-			break;
-		if (step < 0 || lib == 0 || lib->tag != 0 || lib->n < 2)
-			goto fallback;
-		ex = OURO_F(lib, 1);
-		for (;;) {
-			step = host_list_next(estack, &esp, &ex, &item);
-			if (step == 0)
-				break;
-			if (step < 0 || item == 0 || item->tag != 0 || item->n < 2)
-				goto fallback;
-			if (x64enc_dec_nat(OURO_F(item, 1), &id) != 0
-			    || id >= GCINF_ID_MAX)
-				goto fallback;
-			if (!gcinf_set(ext_seen, id))
-				goto fallback;
-			if (OURO_F(item, 0) != 0 && OURO_F(item, 0)->tag == 0)
-				if (!gcinf_set(ext_nogc, id))
-					goto fallback;
-		}
-	}
+	if (gcinf_load_externs(program, ext_seen, ext_nogc) != 0)
+		goto fallback;
 
 	n_cand = n;
 	for (round = 0; round < fuel_n; round++) {
 		struct gcinf_body st;
+		unsigned char *previous;
 
-		memset(bodies, 0, GCINF_ID_MAX);
-		for (i = 0; i < n; i++)
-			if (gcinf_bit(cand, ids[i]))
-				bodies[ids[i]] = 1;
 		memset(keep, 0, GCINF_ID_MAX);
 		n_keep = 0;
 		st.collectors = collectors;
-		st.bodies = bodies;
+		/* Calls resolve against the same candidates for the entire round. */
+		st.bodies = cand;
 		st.ext_seen = ext_seen;
 		st.ext_nogc = ext_nogc;
 		for (i = 0; i < n; i++) {
@@ -5675,7 +6830,9 @@ static ouro_v *gcinf_try(ouro_v *fuel, ouro_v *program)
 		}
 		if (n_keep == n_cand)
 			goto done;
-		memcpy(cand, keep, GCINF_ID_MAX);
+		previous = cand;
+		cand = keep;
+		keep = previous;
 		n_cand = n_keep;
 	}
 	out = cgasm_left(0, 0, 0);
@@ -5708,7 +6865,6 @@ cleanup:
 	free(ids);
 	free(collectors);
 	free(cand);
-	free(bodies);
 	free(ext_seen);
 	free(ext_nogc);
 	free(keep);
@@ -5776,13 +6932,11 @@ static ouro_v *gcan_try(ouro_v *program, ouro_v *bodies)
 	unsigned char *ext_seen = 0;
 	unsigned char *ext_nogc = 0;
 	ouro_v **fns = 0;
-	ouro_v **new_fns = 0;
 	ouro_v **blocks = 0;
 	ouro_v **insns = 0;
 	ouro_v *out = 0;
 	struct gcinf_body st;
 	int nfn = 0;
-	int fcap = 0;
 	int i;
 	int b;
 	int k;
@@ -5799,7 +6953,7 @@ static ouro_v *gcan_try(ouro_v *program, ouro_v *bodies)
 		goto fallback;
 	if (gcinf_load_externs(program, ext_seen, ext_nogc) != 0)
 		goto fallback;
-	if (host_list_collect(OURO_F(program, 0), &fns, &nfn, &fcap) != 0)
+	if (host_list_collect(OURO_F(program, 0), &fns, &nfn, 0) != 0)
 		goto fallback;
 	for (i = 0; i < nfn; i++) {
 		if (fns[i] == 0 || fns[i]->tag != 0 || fns[i]->n < 7)
@@ -5813,32 +6967,21 @@ static ouro_v *gcan_try(ouro_v *program, ouro_v *bodies)
 	st.ext_seen = ext_seen;
 	st.ext_nogc = ext_nogc;
 	st.ok = 1;
-	new_fns = (ouro_v **)malloc((unsigned long)nfn * sizeof *new_fns);
-	if (nfn > 0 && new_fns == 0)
-		goto fallback;
 	for (i = 0; i < nfn; i++) {
 		ouro_v *fn = fns[i];
 		ouro_v *ff[7];
 		int nblk = 0;
-		int bcap = 0;
-		ouro_v **new_blocks = 0;
 
-		if (host_list_collect(OURO_F(fn, 6), &blocks, &nblk, &bcap) != 0)
-			goto fallback;
-		new_blocks = (ouro_v **)malloc((unsigned long)nblk
-			* sizeof *new_blocks);
-		if (nblk > 0 && new_blocks == 0)
+		if (host_list_collect(OURO_F(fn, 6), &blocks, &nblk, 0) != 0)
 			goto fallback;
 		for (b = 0; b < nblk; b++) {
 			ouro_v *block = blocks[b];
 			ouro_v *bf[3];
 			int nins = 0;
-			int icap = 0;
 
 			if (block == 0 || block->tag != 0 || block->n < 3)
 				goto fallback;
-			if (host_list_collect(OURO_F(block, 1), &insns, &nins,
-					      &icap) != 0)
+			if (host_list_collect(OURO_F(block, 1), &insns, &nins, 0) != 0)
 				goto fallback;
 			for (k = 0; k < nins; k++) {
 				ouro_v *ins = insns[k];
@@ -5864,22 +7007,21 @@ static ouro_v *gcan_try(ouro_v *program, ouro_v *bodies)
 			bf[0] = OURO_F(block, 0);
 			bf[1] = cgasm_list(insns, nins);
 			bf[2] = OURO_F(block, 2);
-			new_blocks[b] = ouro_ctor(0, 3, bf);
+			blocks[b] = ouro_ctor(0, 3, bf);
 			free(insns);
 			insns = 0;
 		}
 		for (k = 0; k < 6; k++)
 			ff[k] = OURO_F(fn, k);
-		ff[6] = cgasm_list(new_blocks, nblk);
-		new_fns[i] = ouro_ctor(0, 7, ff);
-		free(new_blocks);
+		ff[6] = cgasm_list(blocks, nblk);
+		fns[i] = ouro_ctor(0, 7, ff);
 		free(blocks);
 		blocks = 0;
 	}
 	{
 		ouro_v *pf[4];
 
-		pf[0] = cgasm_list(new_fns, nfn);
+		pf[0] = cgasm_list(fns, nfn);
 		pf[1] = OURO_F(program, 1);
 		pf[2] = OURO_F(program, 2);
 		pf[3] = OURO_F(program, 3);
@@ -5897,7 +7039,6 @@ cleanup:
 	free(ext_seen);
 	free(ext_nogc);
 	free(fns);
-	free(new_fns);
 	free(blocks);
 	free(insns);
 	return out;
@@ -5951,6 +7092,47 @@ static ouro_v *gchk_right(void)
 	return mir_right_unit();
 }
 
+typedef struct {
+	struct gcinf_body facts;
+	unsigned long caller;
+	ouro_v *error;
+} gchk_context;
+
+static int gchk_instruction(ouro_v *ins, void *context)
+{
+	gchk_context *check = (gchk_context *)context;
+	ouro_v *target;
+	unsigned long id = 0;
+	int nogc;
+
+	if (ins->tag == 11) {
+		unsigned long alloc_id;
+		unsigned long coll_id;
+
+		if (ins->n < 3 || x64enc_dec_nat(OURO_F(ins, 1), &alloc_id) != 0
+		    || x64enc_dec_nat(OURO_F(ins, 2), &coll_id) != 0)
+			return -1;
+		if (!gcinf_bit(check->facts.bodies, alloc_id))
+			check->error = gchk_left_unsafe(alloc_id);
+		else if (!gcinf_bit(check->facts.bodies, coll_id))
+			check->error = gchk_left_unsafe(coll_id);
+		return check->error != 0;
+	}
+	if (ins->tag != 10 || ins->n < 3
+	    || (OURO_F(ins, 0) != 0 && OURO_F(ins, 0)->tag != 0))
+		return 0;
+	nogc = gcan_call_nogc(ins, &check->facts);
+	if (nogc < 0)
+		return -1;
+	if (nogc)
+		return 0;
+	target = OURO_F(ins, 2);
+	if (target->tag == 0 && x64enc_dec_nat(OURO_F(target, 0), &id) != 0)
+		return -1;
+	check->error = gchk_left_mismatch(check->caller, id);
+	return 1;
+}
+
 static ouro_v *gchk_try(ouro_v *program, ouro_v *bodies)
 {
 	unsigned char *collectors = 0;
@@ -5959,12 +7141,9 @@ static ouro_v *gchk_try(ouro_v *program, ouro_v *bodies)
 	unsigned char *ext_nogc = 0;
 	ouro_v **fns = 0;
 	ouro_v *out = 0;
-	struct gcinf_body st;
+	gchk_context check;
 	int nfn = 0;
-	int fcap = 0;
 	int i;
-	int b;
-	int k;
 
 	if (program == 0 || program->tag != 0 || program->n < 3)
 		return 0;
@@ -5973,127 +7152,34 @@ static ouro_v *gchk_try(ouro_v *program, ouro_v *bodies)
 	ext_seen = (unsigned char *)calloc(GCINF_ID_MAX, 1);
 	ext_nogc = (unsigned char *)calloc(GCINF_ID_MAX, 1);
 	if (collectors == 0 || body_bits == 0 || ext_seen == 0 || ext_nogc == 0)
-		goto fallback;
+		goto cleanup;
 	if (gcinf_load_ids(bodies, body_bits) != 0)
-		goto fallback;
+		goto cleanup;
 	if (gcinf_load_externs(program, ext_seen, ext_nogc) != 0)
-		goto fallback;
-	if (host_list_collect(OURO_F(program, 0), &fns, &nfn, &fcap) != 0)
-		goto fallback;
+		goto cleanup;
+	if (host_list_collect(OURO_F(program, 0), &fns, &nfn, 0) != 0)
+		goto cleanup;
+	/* Validate all list spines before reporting the first instruction error. */
 	for (i = 0; i < nfn; i++) {
-		if (fns[i] == 0 || fns[i]->tag != 0 || fns[i]->n < 7)
-			goto fallback;
-		if (gcinf_walk_instr(fns[i], gcinf_add_collector, collectors)
-		    != 0)
-			goto fallback;
+		if (gcinf_walk_instr(fns[i], gcinf_add_collector, collectors) != 0)
+			goto cleanup;
 	}
-	st.collectors = collectors;
-	st.bodies = body_bits;
-	st.ext_seen = ext_seen;
-	st.ext_nogc = ext_nogc;
-	st.ok = 1;
+	check.facts = (struct gcinf_body){collectors, body_bits, ext_seen, ext_nogc, 1};
+	check.error = 0;
 	for (i = 0; i < nfn; i++) {
 		ouro_v *fn = fns[i];
-		ouro_v **blocks = 0;
-		int nblk = 0;
-		int bcap = 0;
-		unsigned long caller;
 
-		if (x64enc_dec_nat(OURO_F(fn, 0), &caller) != 0)
-			goto fallback;
-		if (host_list_collect(OURO_F(fn, 6), &blocks, &nblk, &bcap) != 0)
-			goto fallback;
-		for (b = 0; b < nblk; b++) {
-			ouro_v *block = blocks[b];
-			ouro_v **insns = 0;
-			int nins = 0;
-			int icap = 0;
-
-			if (block == 0 || block->tag != 0 || block->n < 2)
-				goto fallback;
-			if (host_list_collect(OURO_F(block, 1), &insns, &nins,
-					      &icap) != 0) {
-				free(insns);
-				free(blocks);
-				goto fallback;
-			}
-			for (k = 0; k < nins; k++) {
-				ouro_v *ins = insns[k];
-				unsigned long id;
-
-				if (ins == 0) {
-					free(insns);
-					free(blocks);
-					goto fallback;
-				}
-				if (ins->tag == 11) {
-					unsigned long alloc_id;
-					unsigned long coll_id;
-
-					if (ins->n < 3
-					    || x64enc_dec_nat(OURO_F(ins, 1),
-							      &alloc_id) != 0
-					    || x64enc_dec_nat(OURO_F(ins, 2),
-							      &coll_id) != 0) {
-						free(insns);
-						free(blocks);
-						goto fallback;
-					}
-					if (!gcinf_bit(body_bits, alloc_id)) {
-						out = gchk_left_unsafe(
-							alloc_id);
-						free(insns);
-						free(blocks);
-						goto cleanup;
-					}
-					if (!gcinf_bit(body_bits, coll_id)) {
-						out = gchk_left_unsafe(
-							coll_id);
-						free(insns);
-						free(blocks);
-						goto cleanup;
-					}
-					continue;
-				}
-				if (ins->tag != 10 || ins->n < 3)
-					continue;
-				if (OURO_F(ins, 0) != 0
-				    && OURO_F(ins, 0)->tag != 0)
-					continue;
-				{
-					int nogc = gcan_call_nogc(ins, &st);
-					ouro_v *target = OURO_F(ins, 2);
-
-					if (nogc < 0) {
-						free(insns);
-						free(blocks);
-						goto fallback;
-					}
-					if (nogc)
-						continue;
-					id = 0;
-					if (target != 0 && target->tag == 0
-					    && target->n >= 1)
-						(void)x64enc_dec_nat(
-							OURO_F(target, 0),
-							&id);
-					out = gchk_left_mismatch(caller, id);
-					free(insns);
-					free(blocks);
-					goto cleanup;
-				}
-			}
-			free(insns);
+		if (x64enc_dec_nat(OURO_F(fn, 0), &check.caller) != 0)
+			goto cleanup;
+		if (gcinf_walk_instr(fn, gchk_instruction, &check) != 0) {
+			out = check.error;
+			goto cleanup;
 		}
-		free(blocks);
 	}
 	out = gchk_right();
 	g_gchk_count++;
 	fe_progress("n1-host: gc-check-c functions=%d\n", nfn);
-	goto cleanup;
 
-fallback:
-	out = 0;
 cleanup:
 	free(collectors);
 	free(body_bits);
@@ -6176,7 +7262,52 @@ ouro_v *ouro_wrap_pe_plan_fixups(ouro_v *raw)
 	return ouro_clos(pe_plan_sections, ouro_cons(raw, 0));
 }
 #else
+ouro_v *ouro_wrap_check_environment_from_entries(ouro_v *raw)
+{
+	return raw;
+}
+
+ouro_v *ouro_wrap_managed_source_symbol_using(ouro_v *raw)
+{
+	return raw;
+}
+
+ouro_v *ouro_wrap_managed_source_spelling(ouro_v *raw)
+{
+	return raw;
+}
+
+ouro_v *ouro_wrap_managed_prepare_rechecked(ouro_v *raw)
+{
+	return raw;
+}
+
+ouro_v *ouro_wrap_lower_function_indexed(ouro_v *raw)
+{
+	return raw;
+}
+
+ouro_v *ouro_wrap_managed_finish_plan(ouro_v *raw)
+{
+	return raw;
+}
+
+ouro_v *ouro_wrap_check_module(ouro_v *raw)
+{
+	return raw;
+}
+
 ouro_v *ouro_wrap_lower_recheck_program(ouro_v *raw)
+{
+	return raw;
+}
+
+ouro_v *ouro_wrap_lower_normalize(ouro_v *raw)
+{
+	return raw;
+}
+
+ouro_v *ouro_wrap_lower_make_contract_indexed(ouro_v *raw)
 {
 	return raw;
 }

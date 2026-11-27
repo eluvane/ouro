@@ -1,5 +1,8 @@
 # Ouro documentation
 
+Start with a source build or look up the syntax, tools, or compiler behavior
+for a specific task.
+
 ## Getting started
 
 - [Getting started](getting_started.md)
@@ -11,7 +14,7 @@
 
 ## Language
 
-- [Syntax](syntax.md) and [ergonomic forms](language/ergonomic-syntax.md)
+- [Syntax](syntax.md) and [ergonomic syntax](language/ergonomic_syntax.md)
 - [Design goals](design.md) and [historical proposal](ouro.md)
 - [Effects and IO](effects_design.md)
 - [Stability](stability.md)
@@ -26,13 +29,14 @@
 ## Quality
 
 - [Quality tools and policy](quality.md)
+- [Code optimization and efficiency standard](code_optimization.md)
 - [Clippy-grade firewall](clippy_grade_firewall.md)
-- [Collection and string proofs](clippy-collections-performance.md)
+- [Collection and string composition diagnostics](clippy_collections_performance.md)
 - [Analyzer implementation](../tools/analyze/README.md)
 
 ## Compiler and trust
 
-- [Architecture](architecture.md)
+- [Architecture](architecture.md) and [feature → test → command map](architecture.md#from-a-feature-to-its-tests)
 - [Canonical source pipeline](canonical_source.md)
 - [Build and bootstrap](build.md)
 - [Compiler checking](kernel_design.md)
@@ -42,6 +46,8 @@
 ## Contributing and maintenance
 
 - [Contributing](../CONTRIBUTING.md)
+- [Contract-first development](contract_first.md), when the maintainer
+  requires it for automated work
 - [Parallel agent lanes](agent_parallel.md)
 - [Continuous integration](ci.md) and [native repository gates](native_repo_gates.md)
 - [OuroSmith](ouro_smith.md)

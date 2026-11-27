@@ -6,21 +6,17 @@ import "source.ouro",
   "../../std/fs_replace.ouro";
 
 def quality_source_read (path : String) : IO (Either FsError String) :=
-    do let! result := quality_read_file path;
-       match result with
-       | Left error => fs_err(String, FsOperationFailed(quality_input_message error, path))
-       | Right text => fs_ok String text
-       end
+    match! quality_read_file path with
+    | Left error => fs_err(String, FsOperationFailed(quality_input_message error, path))
+    | Right text => fs_ok String text
+    end
 
 def quality_source_matches (path : String) (expected : String) : IO (Either FsError Unit) :=
-    do let! loaded := quality_source_read path;
-       match loaded with
-       | Left error => fs_err Unit error
-       | Right actual => match prim_string_eq actual expected with
-         | True => fs_ok Unit MkUnit
-         | False => fs_err(Unit, FsOperationFailed "source bytes changed" path)
-         end
-       end
+    match! quality_source_read path with
+    | Left error => fs_err Unit error
+    | Right actual => if prim_string_eq actual expected then fs_ok Unit MkUnit
+      else fs_err(Unit, FsOperationFailed "source bytes changed" path)
+    end
 
 def quality_source_cleanup (stage : String) (backup : String) (result : Either FsError Unit)
     : IO (Either FsError Unit) :=
@@ -43,51 +39,42 @@ def quality_source_recovery_error (source : String) (stage : String) (backup : S
 def quality_source_restore (source : String) (stage : String) (backup : String)
     (expected : String) (reason : String)
     : IO (Either FsError Unit) :=
-    do let! original := quality_source_matches backup expected;
-       match original with
-       | Left error => quality_source_recovery_error source stage backup
-           (str_cat3 reason "; cannot verify recovery: " (fs_error_message error))
-       | Right _ =>
-           do let! restored := fs_rename_checked backup source;
-              match restored with
-              | Left error => quality_source_recovery_error source stage backup
-                  (str_cat3 reason "; restore: " (fs_error_message error))
-              | Right _ =>
-                  do let! verified := quality_source_matches source expected;
-                     match verified with
-                     | Left error => quality_source_recovery_error source stage backup
-                         (str_cat3 reason "; restore verification: " (fs_error_message error))
-                     | Right _ => quality_source_cleanup stage backup
-                         (Left FsError Unit (FsOperationFailed(str_concat reason "; original restored", source)))
-                     end
-              end
-       end
+    match! quality_source_matches backup expected with
+    | Left error => quality_source_recovery_error source stage backup
+        (str_cat3 reason "; cannot verify recovery: " (fs_error_message error))
+    | Right _ =>
+        match! fs_rename_checked backup source with
+        | Left error => quality_source_recovery_error source stage backup
+            (str_cat3 reason "; restore: " (fs_error_message error))
+        | Right _ =>
+            match! quality_source_matches source expected with
+            | Left error => quality_source_recovery_error source stage backup
+                (str_cat3 reason "; restore verification: " (fs_error_message error))
+            | Right _ => quality_source_cleanup stage backup
+                (Left FsError Unit (FsOperationFailed(str_concat reason "; original restored", source)))
+            end
+        end
+    end
 
 -- Only a reported commit, or Windows' documented move-to-backup partial
 -- failure, establishes that backup is the prior source. Preserve a concurrent
 -- new source instead of overwriting it during recovery.
 def quality_source_recover (source : String) (stage : String) (backup : String)
     (expected : String) (candidate : String) (status : Nat) (reason : String) : IO (Either FsError Unit) :=
-    do let! original := quality_source_matches source expected;
-       match original with
-       | Right _ => quality_source_cleanup stage backup (Left FsError Unit (FsOperationFailed reason source))
-       | Left _ =>
-           match orb(eq_nat status 0, eq_nat(status, add(mul 11 100, 77))) with
-           | False => quality_source_recovery_error source stage backup reason
-           | True =>
-               do let! exists := fs_exists source;
-                  match exists with
-                  | False => quality_source_restore source stage backup expected reason
-                  | True =>
-                      do let! installed := quality_source_matches source candidate;
-                         match installed with
-                         | Right _ => quality_source_restore source stage backup expected reason
-                         | Left _ => quality_source_recovery_error source stage backup
-                             (str_concat reason "; current source changed or is unreadable")
-                         end
-                  end
-           end
-       end
+    match! quality_source_matches source expected with
+    | Right _ => quality_source_cleanup stage backup (Left FsError Unit (FsOperationFailed reason source))
+    | Left _ =>
+        if orb(eq_nat status 0, eq_nat(status, add(mul 11 100, 77))) then
+          do let! exists := fs_exists source;
+             if exists then
+               match! quality_source_matches source candidate with
+               | Right _ => quality_source_restore source stage backup expected reason
+               | Left _ => quality_source_recovery_error source stage backup
+                   (str_concat reason "; current source changed or is unreadable")
+               end
+             else quality_source_restore source stage backup expected reason
+        else quality_source_recovery_error source stage backup reason
+    end
 
 def quality_source_committed (source : String) (stage : String) (backup : String)
     (expected : String) (candidate : String) : IO (Either FsError Unit) :=
@@ -100,24 +87,21 @@ def quality_source_committed (source : String) (stage : String) (backup : String
        | Left _ => failed
        | Right _ => match saved with
          | Left _ => failed
-         | Right _ => match stage_exists with
-           | False => quality_source_cleanup stage backup (Right FsError Unit MkUnit)
-           | True => failed end end
+         | Right _ => if stage_exists then failed
+           else quality_source_cleanup stage backup (Right FsError Unit MkUnit) end
        end
 
 def quality_source_commit (source : String) (stage : String) (backup : String)
     (expected : String) (candidate : String) : IO (Either FsError Unit) :=
-    do let! original := quality_source_matches source expected;
-       match original with
-       | Left error => quality_source_cleanup stage backup (Left FsError Unit error)
-       | Right _ =>
-           do let! result := fs_replace_file source stage backup;
-              match result with
-              | FsReplaced => quality_source_committed source stage backup expected candidate
-              | FsReplaceFailed status => quality_source_recover source stage backup expected candidate status
-                  (str_concat("replace status=", prim_string_of_nat status))
-              end
-       end
+    match! quality_source_matches source expected with
+    | Left error => quality_source_cleanup stage backup (Left FsError Unit error)
+    | Right _ =>
+        match! fs_replace_file source stage backup with
+        | FsReplaced => quality_source_committed source stage backup expected candidate
+        | FsReplaceFailed status => quality_source_recover source stage backup expected candidate status
+            (str_concat("replace status=", prim_string_of_nat status))
+        end
+    end
 
 def quality_source_stage (source : String) (stage : String) (backup : String)
     (expected : String) (candidate : String) : IO (Either FsError Unit) :=
@@ -130,40 +114,33 @@ def quality_source_stage (source : String) (stage : String) (backup : String)
        | Right _ => match recovery with
          | Left error => quality_source_cleanup stage backup (Left FsError Unit error)
          | Right _ =>
-           do let! wrote := fs_write_checked stage candidate;
-              match wrote with
-              | Left error => quality_source_cleanup stage backup (Left FsError Unit error)
-              | Right _ =>
-                  do let! verified := quality_source_matches stage candidate;
-                     match verified with
-                     | Left error => quality_source_cleanup stage backup (Left FsError Unit error)
-                     | Right _ => quality_source_commit source stage backup expected candidate
-                     end
-              end
+           match! fs_write_checked stage candidate with
+           | Left error => quality_source_cleanup stage backup (Left FsError Unit error)
+           | Right _ =>
+               match! quality_source_matches stage candidate with
+               | Left error => quality_source_cleanup stage backup (Left FsError Unit error)
+               | Right _ => quality_source_commit source stage backup expected candidate
+               end
+           end
          end
        end
 
 def quality_source_reserve_backup (source : String) (stage : String)
     (expected : String) (candidate : String) : IO (Either FsError Unit) :=
     do let! backup := prim_fs_temp_file_in (native_build_dirname source);
-       match prim_string_eq backup "" with
-       | True => native_build_output_cleanup(stage, FsOperationFailed "reserve source recovery" source)
-       | False => quality_source_stage source stage backup expected candidate
-       end
+       (if prim_string_eq backup "" then
+         native_build_output_cleanup(stage, FsOperationFailed "reserve source recovery" source)
+       else quality_source_stage source stage backup expected candidate)
 
 def quality_write_source_checked (source : String) (expected : String) (candidate : String)
     : IO (Either FsError Unit) :=
-    do let! original := quality_source_matches source expected;
-       match original with
-       | Left error => fs_err Unit error
-       | Right _ =>
-           match prim_string_eq expected candidate with
-           | True => fs_ok Unit MkUnit
-           | False =>
-               do let! stage := prim_fs_temp_file_in (native_build_dirname source);
-                  match prim_string_eq stage "" with
-                  | True => fs_err(Unit, FsOperationFailed "reserve source stage" source)
-                  | False => quality_source_reserve_backup source stage expected candidate
-                  end
-           end
-       end
+    match! quality_source_matches source expected with
+    | Left error => fs_err Unit error
+    | Right _ =>
+        if prim_string_eq expected candidate then fs_ok Unit MkUnit
+        else
+          do let! stage := prim_fs_temp_file_in (native_build_dirname source);
+             if prim_string_eq stage "" then
+               fs_err(Unit, FsOperationFailed "reserve source stage" source)
+             else quality_source_reserve_backup source stage expected candidate
+    end

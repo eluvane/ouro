@@ -1,7 +1,5 @@
-/* ouro_cli.c: native host driver for a translation unit emitted by
-   print_c.ouro. Resolves an export by name, applies the arguments given on
-   the command line, and prints the result in ouro_show format.
-   Argument marshalling only — no compiler algorithm here. */
+/* Apply a named export from generated C to the command-line arguments.
+   Print the result with ouro_show. */
 #include "ouro_rt.h"
 
 #include <stdio.h>
@@ -25,8 +23,7 @@ static ouro_v *find_export(const char *name)
 	return 0;
 }
 
-/* Raw bytes, so the C and JS hosts agree on CRLF instead of one of them
-   silently translating it. */
+/* Read binary input so CRLF reaches the export unchanged. */
 static ouro_v *file_codes(const char *path)
 {
 	FILE *f = fopen(path, "rb");

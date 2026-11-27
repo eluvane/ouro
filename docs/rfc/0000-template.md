@@ -8,7 +8,8 @@
 
 ## Summary
 
-State the decision in a few paragraphs.
+State the proposed decision and who it affects. Mark behavior as proposed
+until implementation evidence is available.
 
 ## Motivation
 
@@ -36,8 +37,8 @@ Record credible alternatives and why they were not selected.
 
 ## Validation
 
-List the tests, fixtures, examples, benchmarks, or replay checks needed to
-support the decision.
+Name the checks that would establish implementation and acceptance. Describe
+expected results and distinguish proposed checks from results already observed.
 
 ## Documentation
 

@@ -14,19 +14,20 @@ import "report.ouro",
   "../quality/json_surface.ouro";
 
 
+def repo_path_issues (root : String) (probe : String -> IO Bool)
+    (reject : Bool -> Bool) (message : String)
+    (paths : List String) (issues : List GateIssue) : IO (List GateIssue) :=
+    io_fold String (List GateIssue)
+      (fun (acc : List GateIssue) (relative : String) =>
+        do let! present := probe (repo_join root relative);
+           io_pure (List GateIssue)
+             (if reject present then issue_add message relative acc else acc))
+      issues paths;
+
+
 def require_files_go (root : String) (files : List String)
     (issues : List GateIssue) : IO (List GateIssue) :=
-  (fix go (remaining : List String) (acc : List GateIssue)
-      : IO (List GateIssue) :=
-    match remaining with
-    | Nil => io_pure(List GateIssue, acc)
-    | Cons rel rest =>
-      do let! present := fs_is_file (repo_join root rel);
-         match present with
-         | True => go rest acc
-         | False => go(rest, issue_add "missing required file" rel acc)
-         end
-    end) files issues;
+    repo_path_issues root fs_is_file notb "missing required file" files issues;
 
 
 def required_file_check (name : String) (root : String) (files : List String) : IO GateCheck :=
@@ -36,17 +37,8 @@ def required_file_check (name : String) (root : String) (files : List String) : 
 
 def retired_paths_go (root : String) (paths : List String)
     (issues : List GateIssue) : IO (List GateIssue) :=
-  (fix go (remaining : List String) (acc : List GateIssue)
-      : IO (List GateIssue) :=
-    match remaining with
-    | Nil => io_pure(List GateIssue, acc)
-    | Cons rel rest =>
-      do let! present := fs_exists (repo_join root rel);
-         match present with
-         | False => go rest acc
-         | True => go(rest, issue_add "retired path is present" rel acc)
-         end
-    end) paths issues;
+    repo_path_issues root fs_exists (fun (present : Bool) => present)
+      "retired path is present" paths issues;
 
 
 def retired_path_check (name : String) (root : String) (paths : List String) : IO GateCheck :=
@@ -56,24 +48,22 @@ def retired_path_check (name : String) (root : String) (paths : List String) : I
 
 def with_file_text_io (root : String) (rel : String) (issues : List GateIssue)
     (k : String -> IO (List GateIssue)) : IO (List GateIssue) :=
-    do let! loaded := fs_read_checked (repo_join root rel);
-       match loaded with
-       | Left e =>
-           io_pure (List GateIssue)
-             (issue_add (fs_error_message e) rel issues)
-       | Right text => k text
-       end
+    match! fs_read_checked (repo_join root rel) with
+    | Left e =>
+        io_pure (List GateIssue)
+          (issue_add (fs_error_message e) rel issues)
+    | Right text => k text
+    end
 
 def gate_from_file (name : String) (root : String) (rel : String)
     (k : String -> GateCheck) : IO GateCheck :=
-    do let! loaded := fs_read_checked (repo_join root rel);
-       match loaded with
-       | Left e =>
-           io_pure GateCheck
-             (gate_check name
-               ([ gate_issue(fs_error_message e, rel) ] : List GateIssue))
-       | Right text => io_pure(GateCheck, k text)
-       end
+    match! fs_read_checked (repo_join root rel) with
+    | Left e =>
+        io_pure GateCheck
+          (gate_check name
+            ([ gate_issue(fs_error_message e, rel) ] : List GateIssue))
+    | Right text => io_pure(GateCheck, k text)
+    end
 
 
 def link_marker (target : String) : String :=
@@ -106,17 +96,16 @@ def docs_index_check (root : String) (targets : List String) : IO GateCheck :=
         gate_check "docs-index-links" issues)
 
 
-def markdown_inventory_check (root : String) : IO GateCheck :=
-    do let! docs := markdown_paths root;
-       let maintained : Nat := count_if String maintained_markdown_path docs in
-       let generated : Nat := count_if String generated_api_markdown_path docs in
-       let metrics : List GateMetric :=
-         [ nat_metric("current_markdown", length String docs)
-         , nat_metric "maintained_markdown" maintained
-         , nat_metric "generated_api_markdown" generated
-         ] in
-       io_pure GateCheck
-         (gate_check_metrics "markdown-inventory" metrics (Nil GateIssue))
+private def markdown_inventory_from_paths (docs : List String) : GateCheck :=
+    let maintained : Nat := count_if String maintained_markdown_path docs in
+    let generated : Nat := count_if String generated_api_markdown_path docs in
+    let metrics : List GateMetric :=
+      [ nat_metric("current_markdown", length String docs)
+      , nat_metric "maintained_markdown" maintained
+      , nat_metric "generated_api_markdown" generated
+      ] in
+    gate_check_metrics "markdown-inventory" metrics (Nil GateIssue);
+
 
 
 def link_path_part (raw : String) : String :=
@@ -131,24 +120,19 @@ def link_external (target : String) : Bool :=
 
 
 def link_escapes_repo (rel : String) : Bool :=
-    orb (path_is_abs rel)
-      (orb(str_eq rel "..", str_starts rel "../"));
+    repo_path_escapes_root rel;
 
 
 def md_link_step (line : String) : Maybe (Pair String String) :=
     match str_split_first line "](" with
     | Nothing => Nothing (Pair String String)
     | Just p =>
-        match p with
-        | MkPair _ after_open =>
-            match str_split_first after_open ")" with
-            | Nothing => Nothing (Pair String String)
-            | Just q =>
-                match q with
-                | MkPair target rest =>
-                    Just(Pair String String, MkPair String String target rest)
-                end
-            end
+        let (MkPair _ after_open) := p in
+        match str_split_first after_open ")" with
+        | Nothing => Nothing (Pair String String)
+        | Just q =>
+            let (MkPair target rest) := q in
+            Just(Pair String String, MkPair String String target rest)
         end
     end;
 
@@ -164,32 +148,29 @@ def markdown_line_link_issues (root : String) (doc : String)
     match md_link_step line with
     | Nothing => io_pure(List GateIssue, issues)
     | Just pair =>
-        match pair with
-        | MkPair raw rest =>
-            let target : String := link_path_part raw in
-            match orb(str_null target, link_external target) with
-            | True => scan next rest issues
+        let (MkPair raw rest) := pair in
+        let target : String := link_path_part raw in
+        match orb(str_null target, link_external target) with
+        | True => scan next rest issues
+        | False =>
+            let candidate : String :=
+              match path_is_abs target with
+              | True => path_normalize target
+              | False =>
+                  path_join_normalized
+                    ([path_dirname doc, target] : List String)
+              end in
+            match link_escapes_repo candidate with
+            | True =>
+                scan next rest
+                  (issue_add (str_concat "relative Markdown link escapes repository: " target)
+                    doc issues)
             | False =>
-                let candidate : String :=
-                  match path_is_abs target with
-                  | True => path_normalize target
-                  | False =>
-                      path_join_normalized
-                        ([path_dirname doc, target] : List String)
-                  end in
-                match link_escapes_repo candidate with
-                | True =>
-                    scan next rest
-                      (issue_add (str_concat "relative Markdown link escapes repository: " target)
-                        doc issues)
+                match! fs_exists (repo_join root candidate) with
+                | True => scan next rest issues
                 | False =>
-                    do let! present := fs_exists (repo_join root candidate);
-                       match present with
-                       | True => scan next rest issues
-                       | False =>
-                           scan next rest
-                             (issue_add (str_concat "broken Markdown link: " target) doc issues)
-                       end
+                    scan next rest
+                      (issue_add (str_concat "broken Markdown link: " target) doc issues)
                 end
             end
         end
@@ -220,11 +201,6 @@ def markdown_docs_link_issues (root : String) (docs : List String)
       markdown_doc_link_issues root doc acc)
     issues docs;
 
-
-def markdown_links_check (root : String) : IO GateCheck :=
-    do let! docs := markdown_paths root;
-       let! issues := markdown_docs_link_issues root docs (Nil GateIssue);
-       io_pure(GateCheck, gate_check "markdown-relative-links" issues)
 
 
 def token_punct : List String :=
@@ -267,13 +243,12 @@ def documented_token_issue (root : String) (doc : String) (raw : String)
           (andb(token_has_repo_prefix token, token_has_file_ext token)) with
     | False => io_pure(List GateIssue, issues)
     | True =>
-        do let! present := fs_exists (repo_join root token);
-           match present with
-           | True => io_pure(List GateIssue, issues)
-           | False =>
-               io_pure (List GateIssue)
-                 (issue_add (str_concat "documented path does not exist: " token) doc issues)
-           end
+        match! fs_exists (repo_join root token) with
+        | True => io_pure(List GateIssue, issues)
+        | False =>
+            io_pure (List GateIssue)
+              (issue_add (str_concat "documented path does not exist: " token) doc issues)
+        end
     end;
 
 
@@ -320,10 +295,31 @@ def documented_docs_issues (root : String) (docs : List String)
     issues docs;
 
 
-def documented_paths_check (root : String) : IO GateCheck :=
-    do let! docs := markdown_paths root;
-       let! issues := documented_docs_issues root docs (Nil GateIssue);
-       io_pure(GateCheck, gate_check "documented-paths" issues)
+
+def markdown_path_checks (root : String) (docs : List String)
+    : IO (Pair GateCheck GateCheck) :=
+    do let! issues :=
+         io_fold String (Pair (List GateIssue) (List GateIssue))
+           (fun (acc : Pair (List GateIssue) (List GateIssue)) (doc : String) =>
+             let (MkPair links paths) := acc in
+             match! fs_read_checked (repo_join root doc) with
+             | Left error =>
+                 let reason : String := fs_error_message error in
+                 io_pure (Pair (List GateIssue) (List GateIssue))
+                   (MkPair (List GateIssue) (List GateIssue)
+                     (issue_add reason doc links) (issue_add reason doc paths))
+             | Right text =>
+                 let lines : List String := str_lines text in
+                 do let! next_links := markdown_lines_link_issues root doc lines links;
+                    let! next_paths := documented_lines_issues root doc lines paths;
+                    io_pure (Pair (List GateIssue) (List GateIssue))
+                      (MkPair (List GateIssue) (List GateIssue) next_links next_paths)
+             end)
+           (MkPair (List GateIssue) (List GateIssue) [] []) docs;
+       (let (MkPair links paths) := issues in
+       io_pure (Pair GateCheck GateCheck)
+         (MkPair GateCheck GateCheck (gate_check "markdown-relative-links" links)
+           (gate_check "documented-paths" paths)));
 
 
 def readme_source_from_marker (text : String) : Maybe String :=
@@ -335,9 +331,8 @@ def readme_source_from_marker (text : String) : Maybe String :=
             match str_split_first rest "-->" with
             | Nothing => Nothing String
             | Just p =>
-                match p with
-                | MkPair source _ => Just(String, str_trim source)
-                end
+                let (MkPair source _) := p in
+                Just(String, str_trim source)
             end
         end
     end;
@@ -348,48 +343,45 @@ def readme_block (text : String) : Maybe String :=
 
 
 def readme_example_check (root : String) : IO GateCheck :=
-    do let! loaded := fs_read_checked (repo_join root "README.md");
-       match loaded with
-       | Left e =>
-           io_pure GateCheck
-             (gate_check "readme-example-marker"
-               ([ gate_issue(fs_error_message e, "README.md") ] : List GateIssue))
-       | Right text =>
-       match readme_source_from_marker text with
-       | Nothing =>
-           io_pure GateCheck
-             (gate_check "readme-example-marker"
-               ([ gate_issue "README has no synchronized Ouro example marker" "README.md" ] : List GateIssue))
-       | Just source =>
-           do let! present := fs_is_file (repo_join root source);
-              match present with
-              | False =>
-                  io_pure GateCheck
-                    (gate_check "readme-example-marker"
-                      ([ gate_issue(str_concat "README example source does not exist: " source, "README.md") ] : List GateIssue))
-              | True =>
-                  do let! canonical := fs_read_checked (repo_join root source);
-                     match canonical with
-                     | Left e =>
-                         io_pure GateCheck
-                           (gate_check "readme-example-marker"
-                             ([ gate_issue(fs_error_message e, source) ] : List GateIssue))
-                     | Right source_text =>
-                         let issues : List GateIssue :=
-                           match readme_block text with
-                           | Nothing =>
-                               [ gate_issue "README Ouro example block is missing" "README.md" ]
-                           | Just block =>
-                               match str_eq(str_trim block, str_trim source_text) with
-                               | True => Nil GateIssue
-                               | False => [ gate_issue(str_concat "README example drifted from " source, "README.md") ]
-                               end
-                           end in
-                         io_pure(GateCheck, gate_check "readme-example-marker" issues)
-                     end
-              end
-       end
-       end
+    match! fs_read_checked (repo_join root "README.md") with
+    | Left e =>
+        io_pure GateCheck
+          (gate_check "readme-example-marker"
+            ([ gate_issue(fs_error_message e, "README.md") ] : List GateIssue))
+    | Right text =>
+    match readme_source_from_marker text with
+    | Nothing =>
+        io_pure GateCheck
+          (gate_check "readme-example-marker"
+            ([ gate_issue "README has no synchronized Ouro example marker" "README.md" ] : List GateIssue))
+    | Just source =>
+        match! fs_is_file (repo_join root source) with
+        | False =>
+            io_pure GateCheck
+              (gate_check "readme-example-marker"
+                ([ gate_issue(str_concat "README example source does not exist: " source, "README.md") ] : List GateIssue))
+        | True =>
+            match! fs_read_checked (repo_join root source) with
+            | Left e =>
+                io_pure GateCheck
+                  (gate_check "readme-example-marker"
+                    ([ gate_issue(fs_error_message e, source) ] : List GateIssue))
+            | Right source_text =>
+                let issues : List GateIssue :=
+                  match readme_block text with
+                  | Nothing =>
+                      [ gate_issue "README Ouro example block is missing" "README.md" ]
+                  | Just block =>
+                      match str_eq(str_trim block, str_trim source_text) with
+                      | True => Nil GateIssue
+                      | False => [ gate_issue(str_concat "README example drifted from " source, "README.md") ]
+                      end
+                  end in
+                io_pure(GateCheck, gate_check "readme-example-marker" issues)
+            end
+        end
+    end
+    end
 
 
 def active_syntax_token_issues (text : String) (tokens : List String)
@@ -464,14 +456,13 @@ def sample_pair_source (rel : String) : String :=
 def sample_pair_path_issues (root : String) (rel : String) (issues : List GateIssue)
     : IO (List GateIssue) :=
     let source : String := sample_pair_source rel in
-    do let! present := fs_is_file (repo_join root source);
-       match present with
-       | True => io_pure(List GateIssue, issues)
-       | False =>
-           io_pure (List GateIssue)
-             (issue_add (str_concat "sample companion has no matching .ouro source: " source)
-               rel issues)
-       end
+    match! fs_is_file (repo_join root source) with
+    | True => io_pure(List GateIssue, issues)
+    | False =>
+        io_pure (List GateIssue)
+          (issue_add (str_concat "sample companion has no matching .ouro source: " source)
+            rel issues)
+    end
 
 
 def sample_pair_paths_issues (root : String) (rels : List String)
@@ -483,14 +474,13 @@ def sample_pair_paths_issues (root : String) (rels : List String)
 
 
 def sample_root_paths (root : String) (sample_root : String) : IO (List String) :=
-    do let! exists := fs_is_dir (repo_join root sample_root);
-       match exists with
-       | False => io_pure(List String, Nil String)
-       | True =>
-           do let! files := fs_walk (repo_join root sample_root);
-              io_pure (List String)
-                (map String String (path_relative root) files)
-       end
+    match! fs_is_dir (repo_join root sample_root) with
+    | False => io_pure(List String, Nil String)
+    | True =>
+        do let! files := fs_walk (repo_join root sample_root);
+           io_pure (List String)
+             (map String String (path_relative root) files)
+    end
 
 
 def sample_roots_paths (root : String) (roots : List String)
@@ -601,22 +591,18 @@ def required_phrase_list_issues (doc : String) (text : String)
 
 def required_phrase_row_issues (root : String) (row : Pair String (List String))
     (issues : List GateIssue) : IO (List GateIssue) :=
-    match row with
-    | MkPair doc phrases =>
-        do let! present := fs_is_file (repo_join root doc);
-           match present with
-           | False => io_pure(List GateIssue, issues)
-           | True =>
-               do let! text := fs_read_checked (repo_join root doc);
-                  match text with
-                  | Left e =>
-                      io_pure (List GateIssue)
-                        (issue_add (fs_error_message e) doc issues)
-                  | Right body =>
-                      io_pure (List GateIssue)
-                        (required_phrase_list_issues doc body phrases issues)
-                  end
-           end
+    let (MkPair doc phrases) := row in
+    match! fs_is_file (repo_join root doc) with
+    | False => io_pure(List GateIssue, issues)
+    | True =>
+        match! fs_read_checked (repo_join root doc) with
+        | Left e =>
+            io_pure (List GateIssue)
+              (issue_add (fs_error_message e) doc issues)
+        | Right body =>
+            io_pure (List GateIssue)
+              (required_phrase_list_issues doc body phrases issues)
+        end
     end;
 
 
@@ -635,34 +621,33 @@ def public_required_phrases_check (root : String) : IO GateCheck :=
 
 
 def readme_shape_check (root : String) : IO GateCheck :=
-    do let! loaded := fs_read_checked (repo_join root "README.md");
-       match loaded with
-       | Left e =>
-           io_pure GateCheck
-             (gate_check "readme-shape"
-               ([ gate_issue(fs_error_message e, "README.md") ] : List GateIssue))
-       | Right text =>
-       let lines : List String := str_lines text in
-       let line_count : Nat := length String lines in
-       let heading_count : Nat := count_if String (fun (line : String) => str_starts line "#") lines in
-       let issues0 : List GateIssue := Nil GateIssue in
-       let issues1 : List GateIssue :=
-         match gtb_nat line_count 180 with
-         | True =>
-             [ gate_issue
-                 (str_concat("root README is too long for a landing page: ", prim_string_of_nat line_count))
-                 "README.md" ]
-         | False => issues0
-         end in
-       let issues2 : List GateIssue :=
-         match gtb_nat heading_count 14 with
-         | True => issue_add "root README has too many headings" "README.md" issues1
-         | False => issues1
-         end in
-       io_pure GateCheck
-         (gate_check_metrics "readme-shape"
-           ([ nat_metric "lines" line_count, nat_metric "headings" heading_count ] : List GateMetric) issues2)
-       end
+    match! fs_read_checked (repo_join root "README.md") with
+    | Left e =>
+        io_pure GateCheck
+          (gate_check "readme-shape"
+            ([ gate_issue(fs_error_message e, "README.md") ] : List GateIssue))
+    | Right text =>
+    let lines : List String := str_lines text in
+    let line_count : Nat := length String lines in
+    let heading_count : Nat := count_if String (fun (line : String) => str_starts line "#") lines in
+    let issues0 : List GateIssue := Nil GateIssue in
+    let issues1 : List GateIssue :=
+      match gtb_nat line_count 180 with
+      | True =>
+          [ gate_issue
+              (str_concat("root README is too long for a landing page: ", prim_string_of_nat line_count))
+              "README.md" ]
+      | False => issues0
+      end in
+    let issues2 : List GateIssue :=
+      match gtb_nat heading_count 14 with
+      | True => issue_add "root README has too many headings" "README.md" issues1
+      | False => issues1
+      end in
+    io_pure GateCheck
+      (gate_check_metrics "readme-shape"
+        ([ nat_metric "lines" line_count, nat_metric "headings" heading_count ] : List GateMetric) issues2)
+    end
 
 
 def checkbox_count (lines : List String) : Nat :=
@@ -670,37 +655,35 @@ def checkbox_count (lines : List String) : Nat :=
 
 
 def pull_request_template_check (root : String) : IO GateCheck :=
-    do let! loaded :=
-         fs_read_checked (repo_join root ".github/pull_request_template.md");
-       match loaded with
-       | Left e =>
-           io_pure GateCheck
-             (gate_check "pull-request-template-shape"
-               ([ gate_issue (fs_error_message e)
-                   ".github/pull_request_template.md" ] : List GateIssue))
-       | Right text =>
-           let lines : List String := str_lines text in
-           let boxes : Nat := checkbox_count lines in
-           let issues0 : List GateIssue :=
-             required_phrase_list_issues ".github/pull_request_template.md" text
-               ([ "## Summary" ] : List String)
-               (Nil GateIssue) in
-           let issues1 : List GateIssue :=
-             match gtb_nat(length String lines, 45) with
-             | True => issue_add "pull request template is too long" ".github/pull_request_template.md" issues0
-             | False => issues0
-             end in
-           let issues2 : List GateIssue :=
-             match gtb_nat boxes 5 with
-             | True =>
-                 issue_add "pull request template has too many mandatory checkboxes"
-                   ".github/pull_request_template.md" issues1
-             | False => issues1
-             end in
-           io_pure GateCheck
-             (gate_check_metrics "pull-request-template-shape"
-               ([ nat_metric("lines", length String lines), nat_metric "checkboxes" boxes ] : List GateMetric) issues2)
-       end
+    match! fs_read_checked (repo_join root ".github/pull_request_template.md") with
+    | Left e =>
+        io_pure GateCheck
+          (gate_check "pull-request-template-shape"
+            ([ gate_issue (fs_error_message e)
+                ".github/pull_request_template.md" ] : List GateIssue))
+    | Right text =>
+        let lines : List String := str_lines text in
+        let boxes : Nat := checkbox_count lines in
+        let issues0 : List GateIssue :=
+          required_phrase_list_issues ".github/pull_request_template.md" text
+            ([ "## Summary" ] : List String)
+            (Nil GateIssue) in
+        let issues1 : List GateIssue :=
+          match gtb_nat(length String lines, 45) with
+          | True => issue_add "pull request template is too long" ".github/pull_request_template.md" issues0
+          | False => issues0
+          end in
+        let issues2 : List GateIssue :=
+          match gtb_nat boxes 5 with
+          | True =>
+              issue_add "pull request template has too many mandatory checkboxes"
+                ".github/pull_request_template.md" issues1
+          | False => issues1
+          end in
+        io_pure GateCheck
+          (gate_check_metrics "pull-request-template-shape"
+            ([ nat_metric("lines", length String lines), nat_metric "checkboxes" boxes ] : List GateMetric) issues2)
+    end
 
 
 def issue_form_issues (root : String) (form : String) (issues : List GateIssue)
@@ -737,17 +720,18 @@ def issue_forms_check (root : String) : IO GateCheck :=
 
 def run_docs_profile (root : String) : IO (List GateCheck) :=
     do let! required := required_file_check "canonical-docs" root docs_required_files;
-       let! inventory := markdown_inventory_check root;
+       let! docs := markdown_paths root;
        let! index := docs_index_check root docs_index_targets;
-       let! links := markdown_links_check root;
-       let! docpaths := documented_paths_check root;
+       let! paths := markdown_path_checks root docs;
        let! example := readme_example_check root;
        let! syntax := active_syntax_docs_check root;
        let! manifest := smith_strategy_check root;
        let! samples := sample_pairs_check root;
        let! api := generated_api_presence_check root;
+       (let (MkPair links docpaths) := paths in
        io_pure (List GateCheck)
-         ([required, inventory, index, links, docpaths, example, syntax, manifest, samples, api] : List GateCheck)
+         ([required, markdown_inventory_from_paths docs, index, links, docpaths,
+           example, syntax, manifest, samples, api] : List GateCheck))
 
 
 def run_project_profile (root : String) : IO (List GateCheck) :=
@@ -763,31 +747,26 @@ def run_project_profile (root : String) : IO (List GateCheck) :=
 
 def run_workflow_profile (root : String) : IO (List GateCheck) :=
     do let! required := required_file_check "workflow-required-files" root workflow_required_files;
-       let! danger := wf_dangerous_patterns_check root;
-       let! perms := wf_permissions_check root;
-       io_pure(List GateCheck, [required, danger, perms] : List GateCheck)
+       let! policy := wf_policy_checks root;
+       (let (MkPair danger perms) := policy in
+       io_pure(List GateCheck, [required, danger, perms] : List GateCheck))
 
 
 def run_fixture_profile (root : String) : IO (List GateCheck) :=
     do let! required := required_file_check "fixture-required-files" root fixture_required_files;
        let! index := docs_index_check root fixture_index_targets;
-       let! links := markdown_links_check root;
-       let! docpaths := documented_paths_check root;
+       let! docs := markdown_paths root;
+       let! paths := markdown_path_checks root docs;
        let! retired := retired_path_check "fixture-retired-paths" root fixture_retired_paths;
        let! phrases :=
          required_phrase_rows_issues root fixture_required_phrase_rows (Nil GateIssue);
-       let! danger := wf_dangerous_patterns_check root;
-       let! perms := wf_permissions_check root;
+       let! policy := wf_policy_checks root;
+       (let (MkPair links docpaths) := paths in
+       let (MkPair danger perms) := policy in
        io_pure (List GateCheck)
-         ([ required
-         , index
-         , links
-         , docpaths
-         , retired
-         , gate_check "fixture-required-phrases" phrases
-         , danger
-         , perms
-         ] : List GateCheck)
+         ([ required, index, links, docpaths, retired
+          , gate_check "fixture-required-phrases" phrases, danger, perms
+          ] : List GateCheck))
 
 
 def run_repo_profile (root : String) : IO (List GateCheck) :=

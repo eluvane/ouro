@@ -44,6 +44,27 @@ if [ -z "${PYTHON:-}" ]; then
 	echo "LINT_SUITE: FAIL no working Python" >&2
 	exit 127
 fi
+if [ "$phase" != production ]; then
+	unset OURO_CI_PREPARED_LINT
+fi
+lint_stage=${OURO_CI_LINT_STAGE:-}
+case "$lint_stage" in
+'') ;;
+setup|worker)
+	if [ "$phase" != production ] || [ -z "$shard" ] || [ "${OURO_CI_PREPARED_LINT:-}" != 1 ]; then
+		echo "LINT_SUITE: FAIL local production stage requires a prepared production shard" >&2
+		exit 2
+	fi
+	if [ "$lint_stage" = worker ] && [ -z "${OURO_CI_LINT_SUBSHARD:-}" ]; then
+		echo "LINT_SUITE: FAIL local production worker requires a subshard" >&2
+		exit 2
+	fi
+	;;
+*)
+	echo "LINT_SUITE: FAIL invalid local production stage $lint_stage" >&2
+	exit 2
+	;;
+esac
 
 if [ "$phase" = all ] || [ "$phase" = fixtures ]; then
 	"$PYTHON" "$ROOT/scripts/tool_preparation_suite.py"
@@ -54,22 +75,28 @@ fi
 BIN="${OURO_C_BUILD_DIR:-_build/c}/ouro-lint"
 # The builder checks the complete source/compiler/build receipt. A short mtime
 # list misses changes to imports and build-owned Windows process metadata.
-OURO_BUILD_TOOL_MODE=native sh "$ROOT/scripts/build_tool.sh" tools/lint.ouro "$BIN"
+if [ "$phase" = clippy ]; then
+	OURO_BUILD_TOOL_MODE=native sh "$ROOT/scripts/build_tool.sh" tools/clippy/main.ouro \
+		"${OURO_C_BUILD_DIR:-_build/c}/ouro-clippy-grade-firewall"
+elif [ "${OURO_CI_PREPARED_LINT:-}" != 1 ]; then
+	OURO_BUILD_TOOL_MODE=native sh "$ROOT/scripts/build_tool.sh" tools/lint.ouro "$BIN"
+fi
 
 out="${LINT_SUITE_OUT:-$ROOT/_build/tmp/lint_suite}"
-mkdir -p "$out"
+if [ "$lint_stage" != worker ]; then
+	mkdir -p "$out"
+fi
 out=$(CDPATH='' cd "$out" && pwd)
 quality_inputs="$out/quality-input-tests"
 quality_diagnostics="$out/quality-diagnostic-tests"
 semantic_perf="$out/clippy-semantic-performance"
 semantic_session="$out/clippy-session-laws"
 semantic_wire="$out/clippy-session-wire-laws"
-session_worker="$out/ouro-clippy-session"
+session_worker="${BIN%/*}/ouro-clippy-structural"
 pkg="$out/ouro-pkg"
 if [ "$phase" = all ] || [ "$phase" = fixtures ]; then
-# Bootstrap above remains the compiler owner. Prepare independent fixture
-# tools in one host process; every binary retains its full content check.
-# Execution/assertion order and writable fixture isolation stay unchanged.
+# Batch tool preparation uses the bootstrap compiler and validates each
+# binary against its complete content receipt.
 set --
 if [ "$phase" = all ]; then
 	set -- --tool tools/pkg/main.ouro "$pkg"
@@ -84,11 +111,16 @@ fi
 	--tool tests/clippy_semantic/session_wire.ouro "$semantic_wire" \
 	--tool tools/clippy/structural_main.ouro "$session_worker" \
 	"$@"
-elif [ "$phase" = production ]; then
+elif [ "$phase" = production ] && [ "$lint_stage" != worker ]; then
+	set --
+	if [ "${OURO_CI_PREPARED_LINT:-}" = 1 ]; then
+		set -- --verify-published
+	fi
 	"$PYTHON" "$ROOT/scripts/native_tool_build.py" \
 		--compiler "${OURO_C_BUILD_DIR:-_build/c}/ouro1" \
 		--batch-report "$out/tool-preparation.json" \
-		--tool tools/pkg/main.ouro "$pkg"
+		--tool tools/pkg/main.ouro "$pkg" \
+		"$@"
 fi
 
 if [ "$phase" = all ] || [ "$phase" = fixtures ]; then
@@ -96,7 +128,7 @@ if [ ! -x "$quality_inputs" ] && [ -x "${quality_inputs}.exe" ]; then
 	quality_inputs="${quality_inputs}.exe"
 fi
 "$quality_inputs" "$out/input-fixtures" >"$out/quality-input-tests.out"
-tr -d '\r' <"$out/quality-input-tests.out" | grep -Fx 'QUALITY_INPUT_TESTS rows=29 failures=0' >/dev/null
+tr -d '\r' <"$out/quality-input-tests.out" | grep -Fx 'QUALITY_INPUT_TESTS rows=30 failures=0' >/dev/null
 
 "$quality_diagnostics" >"$out/quality-diagnostic-tests.out" 2>"$out/quality-diagnostic-tests.err"
 test ! -s "$out/quality-diagnostic-tests.err"
@@ -251,7 +283,7 @@ fi
 "$semantic_perf" >"$out/semantic-performance.out" 2>"$out/semantic-performance.err"
 cat "$out/semantic-performance.out"
 test ! -s "$out/semantic-performance.err"
-test "$(grep -c '^PASS ' "$out/semantic-performance.out")" -eq 11
+test "$(grep -c '^PASS ' "$out/semantic-performance.out")" -eq 19
 if grep -q '^FAIL ' "$out/semantic-performance.out"; then
 	exit 1
 fi
@@ -260,8 +292,11 @@ echo "=== bounded Clippy session transport and scheduling ==="
 if [ -x "${semantic_session}.exe" ]; then
 	semantic_session="${semantic_session}.exe"
 fi
-if [ -x "${session_worker}.exe" ]; then
-	session_worker="${session_worker}.exe"
+session_suffix=$("$PYTHON" -c 'import os, sys; sys.stdout.write(".exe" if os.name == "nt" else "")')
+session_worker="$session_worker$session_suffix"
+if [ ! -x "$session_worker" ]; then
+	printf 'LINT_SUITE: FAIL prepared Clippy worker unavailable: %s\n' "$session_worker" >&2
+	exit 1
 fi
 session_lifetime=$(mktemp -d "$out/session-lifetime.XXXXXX")
 "$semantic_session" "$session_lifetime" >"$out/session-laws.out" 2>"$out/session-laws.err"
@@ -275,7 +310,7 @@ if [ -x "${semantic_wire}.exe" ]; then
 fi
 "$semantic_wire" >"$out/session-wire-laws.out" 2>"$out/session-wire-laws.err"
 test ! -s "$out/session-wire-laws.err"
-test "$(grep -c '^PASS ' "$out/session-wire-laws.out")" -eq 25
+test "$(grep -c '^PASS ' "$out/session-wire-laws.out")" -eq 28
 if grep -q '^FAIL ' "$out/session-wire-laws.out"; then
 	exit 1
 fi
@@ -372,15 +407,34 @@ echo "=== native lint production sources ==="
 # ../../../../std/io.ouro is resolved through a directory symlink. Semantic
 # harvest of std/runtime.ouro then needs ../runtime/native_types.ouro beside
 # that symlink, so runtime is linked the same way.
-production=$(mktemp -d "$out/production.XXXXXX")
-mkdir -p "$production/samples"
-cp -R samples/pkg "$production/samples/"
-ln -s "$ROOT/std" "$production/std"
-ln -s "$ROOT/runtime" "$production/runtime"
-(
-	cd "$production/samples/pkg/app"
-	"$pkg" install
-) >"$out/production-package.log" 2>&1
+case "$lint_stage" in
+setup)
+	production="$out/production"
+	mkdir "$production"
+	;;
+worker)
+	production="$out/production"
+	if [ ! -f "$production/.ready" ]; then
+		echo "LINT_SUITE: FAIL local production package snapshot is incomplete" >&2
+		exit 1
+	fi
+	;;
+*) production=$(mktemp -d "$out/production.XXXXXX") ;;
+esac
+if [ "$lint_stage" != worker ]; then
+	mkdir -p "$production/samples"
+	cp -R samples/pkg "$production/samples/"
+	ln -s "$ROOT/std" "$production/std"
+	ln -s "$ROOT/runtime" "$production/runtime"
+	(
+		cd "$production/samples/pkg/app"
+		"$pkg" install
+	) >"$out/production-package.log" 2>&1
+fi
+if [ "$lint_stage" = setup ]; then
+	touch "$production/.ready"
+	exit 0
+fi
 set --
 for entry in samples/*; do
 	[ -d "$entry" ] || continue

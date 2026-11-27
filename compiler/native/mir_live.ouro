@@ -27,13 +27,113 @@ def mir_live_before (roots : List Nat) (instructions : List MirInstruction) (aft
     foldr MirInstruction (List Nat) (fun (instruction : MirInstruction) (live : List Nat) =>
       mir_live_instruction roots live instruction) after instructions;
 
-def mir_live_successors (facts : List MirBlockFact)
+-- This derived lookup retains the first original fact. It never changes the
+-- ordered frontier or supplies authority for accepting a partial fixed point.
+private inductive MirFactIndex : Type :=
+  | MirFactIndexEmpty : MirFactIndex
+  | MirFactIndexNode : Nat -> Nat -> MirBlockFact -> MirFactIndex -> MirFactIndex -> MirFactIndex;
+
+private def mir_fact_index_height (tree : MirFactIndex) : Nat :=
+    match tree with | MirFactIndexEmpty => Z | MirFactIndexNode height _ _ _ _ => height end;
+
+private def mir_fact_index_node (key : Nat) (value : MirBlockFact) (left : MirFactIndex) (right : MirFactIndex)
+    : MirFactIndex :=
+    MirFactIndexNode (S (maxNat(mir_fact_index_height left, mir_fact_index_height right))) key value left right;
+
+private def mir_fact_index_left_heavy (key : Nat) (value : MirBlockFact)
+    (left : MirFactIndex) (right : MirFactIndex) : MirFactIndex :=
+    match left with
+    | MirFactIndexEmpty => mir_fact_index_node key value left right
+    | MirFactIndexNode _ first first_value outer inner =>
+        match leb_nat(mir_fact_index_height inner, mir_fact_index_height outer) with
+        | True => mir_fact_index_node first first_value outer (mir_fact_index_node key value inner right)
+        | False => match inner with
+            | MirFactIndexEmpty => mir_fact_index_node first first_value outer (mir_fact_index_node key value inner right)
+            | MirFactIndexNode _ middle middle_value inner_left inner_right =>
+                mir_fact_index_node middle middle_value
+                  (mir_fact_index_node first first_value outer inner_left)
+                  (mir_fact_index_node key value inner_right right)
+            end
+        end
+    end;
+
+private def mir_fact_index_right_heavy (key : Nat) (value : MirBlockFact)
+    (left : MirFactIndex) (right : MirFactIndex) : MirFactIndex :=
+    match right with
+    | MirFactIndexEmpty => mir_fact_index_node key value left right
+    | MirFactIndexNode _ last last_value inner outer =>
+        match leb_nat(mir_fact_index_height inner, mir_fact_index_height outer) with
+        | True => mir_fact_index_node last last_value (mir_fact_index_node key value left inner) outer
+        | False => match inner with
+            | MirFactIndexEmpty => mir_fact_index_node last last_value (mir_fact_index_node key value left inner) outer
+            | MirFactIndexNode _ middle middle_value inner_left inner_right =>
+                mir_fact_index_node middle middle_value
+                  (mir_fact_index_node key value left inner_left)
+                  (mir_fact_index_node last last_value inner_right outer)
+            end
+        end
+    end;
+
+private def mir_fact_index_balance (key : Nat) (value : MirBlockFact)
+    (left : MirFactIndex) (right : MirFactIndex) : MirFactIndex :=
+    match ltb_nat(S (mir_fact_index_height right), mir_fact_index_height left) with
+    | True => mir_fact_index_left_heavy key value left right
+    | False => match ltb_nat(S (mir_fact_index_height left), mir_fact_index_height right) with
+        | True => mir_fact_index_right_heavy key value left right
+        | False => mir_fact_index_node key value left right
+        end
+    end;
+
+private def mir_fact_index_insert (key : Nat) (value : MirBlockFact) : MirFactIndex -> MirFactIndex :=
+    let canonical_key : Nat := add key Z in
+  fix insert (tree : MirFactIndex) : MirFactIndex :=
+    match tree with
+    | MirFactIndexEmpty => mir_fact_index_node canonical_key value MirFactIndexEmpty MirFactIndexEmpty
+    | MirFactIndexNode _ current stored left right =>
+        match compareNat canonical_key current with
+        | EQ => tree
+        | LT => mir_fact_index_balance current stored (insert left) right
+        | GT => mir_fact_index_balance current stored left (insert right)
+        end
+    end;
+
+private def mir_fact_index_lookup (key : Nat) : MirFactIndex -> Maybe MirBlockFact :=
+    let canonical_key : Nat := add key Z in
+  fix lookup (tree : MirFactIndex) : Maybe MirBlockFact :=
+    match tree with
+    | MirFactIndexEmpty => Nothing MirBlockFact
+    | MirFactIndexNode _ current value left right =>
+        match compareNat canonical_key current with
+        | EQ => Just MirBlockFact value
+        | LT => lookup left
+        | GT => lookup right
+        end
+    end;
+
+private def mir_fact_index_from_facts (facts : List MirBlockFact) : MirFactIndex :=
+    (fix collect (remaining : List MirBlockFact) (tree : MirFactIndex) : MirFactIndex :=
+      match remaining with
+      | Nil => tree
+      | Cons fact rest => match fact with | MirFact id _ =>
+          collect rest (mir_fact_index_insert id fact tree) end
+      end) facts MirFactIndexEmpty;
+
+private def mir_fact_index_at (index : MirFactIndex) (id : Nat) : Either MirError (List Nat) :=
+    match mir_fact_index_lookup id index with
+    | Nothing => Left MirError (List Nat) (MirUnknownBlock id)
+    | Just fact => match fact with | MirFact _ values => Right MirError (List Nat) values end
+    end;
+
+private def mir_live_successors_with (lookup : Nat -> Either MirError (List Nat))
     : List Nat -> Either MirError (List Nat) :=
   fix collect (successors : List Nat) : Either MirError (List Nat) :=
     match successors with | Nil => Right(MirError, List Nat, [] : List Nat)
-    | Cons id rest => match mir_fact_at id facts with
+    | Cons id rest => match lookup id with
       | Left err => Left MirError (List Nat) err | Right values =>
         mapRight(MirError, List Nat, List Nat, mir_union values, collect rest) end end;
+
+def mir_live_successors (facts : List MirBlockFact) : List Nat -> Either MirError (List Nat) :=
+    mir_live_successors_with (fun (id : Nat) => mir_fact_at id facts);
 
 def mir_live_after (roots : List Nat) (facts : List MirBlockFact) (block : MirBlock)
     : Either MirError (List Nat) :=
@@ -65,17 +165,30 @@ def mir_live_summary (roots : List Nat) (block : MirBlock) : MirLiveSummary :=
 
 def mir_live_summary_step (facts : List MirBlockFact)
     : List MirLiveSummary -> Either MirError (List MirBlockFact) :=
-  fix step (summaries : List MirLiveSummary) : Either MirError (List MirBlockFact) :=
-    match summaries with | Nil => Right(MirError, List MirBlockFact, [] : List MirBlockFact)
+  fun (summaries : List MirLiveSummary) =>
+    (fix step (pending : List MirLiveSummary) (prepared : Maybe MirFactIndex)
+        : Either MirError (List MirBlockFact) :=
+    match pending with | Nil => Right(MirError, List MirBlockFact, [] : List MirBlockFact)
     | Cons summary rest => match summary with | MirLiveTransfer id generated killed successors =>
-      match mir_live_successors facts successors with
+      -- Empty edge lists do not need an index; later blocks reuse this round's
+      -- frozen lookup without publishing any just-updated fact into it.
+      let incoming : Pair (Maybe MirFactIndex) (Either MirError (List Nat)) :=
+        match successors with
+        | Nil => MkPair (Maybe MirFactIndex) (Either MirError (List Nat)) prepared
+            (Right MirError (List Nat) ([] : List Nat))
+        | Cons _ _ => let index : MirFactIndex := match prepared with
+            | Nothing => mir_fact_index_from_facts facts | Just ready => ready end in
+            MkPair (Maybe MirFactIndex) (Either MirError (List Nat)) (Just MirFactIndex index)
+              (mir_live_successors_with (mir_fact_index_at index) successors)
+        end in
+      match incoming with | MkPair ready result => match result with
       | Left err => Left MirError (List MirBlockFact) err
       | Right after =>
         let before : List Nat := mir_union generated
           (filter Nat (fun (value : Nat) => notb (mir_has value killed)) after) in
         mapRight MirError (List MirBlockFact) (List MirBlockFact)
           (fun (tail : List MirBlockFact) => Cons MirBlockFact (MirFact id before) tail)
-          (step rest) end end end;
+          (step rest ready) end end end end) summaries (Nothing MirFactIndex);
 
 -- A live use reaches its predecessors along a simple path: a repeated block
 -- adds no new use of the same local. N blocks therefore need at most N growth

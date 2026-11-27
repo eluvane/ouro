@@ -1,0 +1,472 @@
+-- @entry main
+import "../compiler/native/source_debug.ouro", "compiler_program_lookup.ouro",
+  "compiler_startup_test_support.ouro", "native_lower_fixtures.ouro";
+
+def native_origin_map_prefix : String := "inductive Token : Type := | Here : Token; ";
+def native_origin_map_source : String := prim_string_concat native_origin_map_prefix "def value : Token := Here;";
+
+def native_origin_map_span : Pair Nat Nat :=
+    MkPair Nat Nat (length Nat (prim_string_to_char_codes native_origin_map_prefix))
+      (length Nat (prim_string_to_char_codes native_origin_map_source));
+
+def native_origin_map_probe (work : CheckedSourcePacket -> InternState -> SourceOriginMetadata -> Nat -> Bool) : Bool :=
+    let compiled : SourceOriginCompilation := compile_checked_units_with_source_origins 5000
+      (prim_string_to_char_codes "main.ouro") [compiler_test_unit "main.ouro" native_origin_map_source] in
+    match source_origin_compilation_original compiled with | MkPair result state => match result with
+      | SourceErr _ => False
+      | SourceOk packet => match compiler_test_name (checked_source_packet_program packet) "value" with
+        | Nothing => False
+        | Just source => match source_origin_compilation_metadata compiled with
+          | Left _ => False
+          | Right metadata => work packet state metadata source
+          end
+        end
+      end end;
+
+-- Synthetic metadata exercises transport validation, not image acceptance.
+def native_origin_map_image : NativeImage :=
+    NativeImageOf (PeImageFile ([] : List Nat)
+      [PeFunctionAt 800 100 110 [102], PeFunctionAt 801 110 120 [102], PeFunctionAt 900 120 130 [102]])
+      ([] : List NativeFrameInfo);
+
+def native_origin_map_rows (source : Nat) : List NativeFunctionOrigin :=
+    [NativeFunctionOriginOf 800 (NativeFunctionSource source False),
+     NativeFunctionOriginOf 801 (NativeFunctionSource source True),
+     NativeFunctionOriginOf 900 NativeFunctionUnknown];
+
+def native_origin_map_known_span (mapping : NativeSourceMap) (rva : Nat) (symbol : Nat) (generated : Bool)
+    (path : String) (expected : Pair Nat Nat) : Bool :=
+    match native_debug_locate_rva mapping rva with
+    | Left _ => False
+    | Right found => if let NativePcKnown id location := (found : NativePcSource) then
+        match location with | NativeSourceLocationOf bytes span inherited =>
+        andb (eqNat id symbol) (andb (pe_bytes_equal bytes (prim_string_to_char_codes path))
+          (andb (source_slot_equal expected span)
+            (match generated with | True => inherited | False => notb inherited end)))
+        end
+      else False
+    end;
+
+def native_origin_map_known (mapping : NativeSourceMap) (rva : Nat) (symbol : Nat) (generated : Bool)
+    (path : String) : Bool :=
+    native_origin_map_known_span mapping rva symbol generated path native_origin_map_span;
+
+def native_origin_map_boundaries : Bool := native_origin_map_probe
+    (fun (packet : CheckedSourcePacket) (state : InternState) (metadata : SourceOriginMetadata) (source : Nat) =>
+      match native_debug_build_map packet state metadata native_origin_map_image (native_origin_map_rows source) [] with
+      | Left _ => False
+      | Right mapping => andb (native_origin_map_known mapping 100 800 False "main.ouro")
+          (andb (native_origin_map_known mapping 109 800 False "main.ouro")
+            (andb (native_origin_map_known mapping 110 801 True "main.ouro")
+              (andb (match native_debug_locate_rva mapping 120 with | Right found => match found with | NativePcUnknown id => eqNat id 900 | NativePcOutside => False | NativePcKnown _ _ => False end | Left _ => False end)
+                (andb (match native_debug_locate_rva mapping 130 with | Right found => match found with | NativePcOutside => True | NativePcUnknown _ => False | NativePcKnown _ _ => False end | Left _ => False end)
+                  (match native_debug_locate_pc mapping 8192 8293 with
+                   | Right found => match found with | NativePcKnown id _ => eqNat id 800 | NativePcOutside => False | NativePcUnknown _ => False end | Left _ => False end)))))
+      end);
+
+def native_origin_map_paths : Bool := native_origin_map_probe
+    (fun (packet : CheckedSourcePacket) (state : InternState) (metadata : SourceOriginMetadata) (source : Nat) =>
+      match native_debug_build_map packet state metadata native_origin_map_image (native_origin_map_rows source)
+          [MkPair (List Nat) (List Nat) (prim_string_to_char_codes "main.ouro") (prim_string_to_char_codes "mapped/main.ouro")] with
+      | Left _ => False
+      | Right mapping => andb (native_origin_map_known mapping 100 800 False "mapped/main.ouro")
+          (native_origin_map_known mapping 110 801 True "mapped/main.ouro")
+      end);
+
+def native_origin_map_bad_trace (mode : Nat) : Bool := native_origin_map_probe
+    (fun (packet : CheckedSourcePacket) (state : InternState) (metadata : SourceOriginMetadata) (source : Nat) =>
+      let rows : List NativeFunctionOrigin := match mode with
+        | Z => Cons NativeFunctionOrigin (NativeFunctionOriginOf 800 NativeFunctionUnknown) (native_origin_map_rows source)
+        | S prior => match prior with
+          | Z => [NativeFunctionOriginOf 801 (NativeFunctionSource source True), NativeFunctionOriginOf 900 NativeFunctionUnknown]
+          | S _ => Cons NativeFunctionOrigin (NativeFunctionOriginOf 999 NativeFunctionUnknown) (native_origin_map_rows source)
+          end
+        end in
+      match native_debug_build_map packet state metadata native_origin_map_image rows [] with
+      | Right _ => False
+      | Left error => match mode with
+        | Z => if let NativeDebugDuplicateFunction id := (error : NativeDebugError) then eqNat id 800 else False
+        | S prior => match prior with
+          | Z => if let NativeDebugMissingFunction id := (error : NativeDebugError) then eqNat id 800 else False
+          | S _ => if let NativeDebugUnexpectedFunction id := (error : NativeDebugError) then eqNat id 999 else False
+          end
+        end
+      end);
+
+def native_origin_map_bad_paths : Bool := native_origin_map_probe
+    (fun (packet : CheckedSourcePacket) (state : InternState) (metadata : SourceOriginMetadata) (source : Nat) =>
+      match native_debug_build_map packet state metadata native_origin_map_image (native_origin_map_rows source)
+          [MkPair (List Nat) (List Nat) (prim_string_to_char_codes "main.ouro") [97], MkPair (List Nat) (List Nat) (prim_string_to_char_codes "main.ouro") [98]] with
+      | Left error => if let NativeDebugInvalidPathMap := (error : NativeDebugError) then True else False
+      | Right _ => False
+      end);
+
+def native_origin_map_ambiguous : Bool := native_origin_map_probe
+    (fun (packet : CheckedSourcePacket) (state : InternState) (metadata : SourceOriginMetadata) (source : Nat) =>
+      let owners : List SourceCheckedOwner := checked_source_packet_owners packet in
+      let duplicate : List SourceCheckedOwner := filter SourceCheckedOwner (fun (row : SourceCheckedOwner) =>
+        match row with | SourceCheckedOwnerOf entry _ => source_slot_equal (source_checked_entry_slot entry) (MkPair Nat Nat 0 source) end) owners in
+      let repeated : CheckedSourcePacket := CheckedSourcePacketOf (checked_source_packet_program packet)
+        (MkPair (List SourceModuleSlot) (List SourceCheckedOwner) (checked_source_packet_slots packet) (append SourceCheckedOwner duplicate owners)) in
+      match native_debug_build_map repeated state metadata native_origin_map_image (native_origin_map_rows source) [] with
+      | Left _ => False
+      | Right mapping => match native_debug_locate_rva mapping 100 with
+        | Right found => match found with | NativePcUnknown id => eqNat id 800 | NativePcOutside => False | NativePcKnown _ _ => False end | Left _ => False
+        end
+      end);
+
+def native_origin_map_bad_ranges : Bool :=
+    match native_debug_locate_rva (NativeSourceMapOf
+      [NativeFunctionSourceAt 1 100 110 (Nothing NativeSourceLocation),
+       NativeFunctionSourceAt 2 109 120 (Nothing NativeSourceLocation)]) 109 with
+    | Left error => if let NativeDebugInvalidRange id := (error : NativeDebugError) then eqNat id 2 else False
+    | Right _ => False
+    end;
+
+def native_origin_map_invalid_bounds : Bool :=
+    andb (match native_debug_locate_rva (NativeSourceMapOf
+        [NativeFunctionSourceAt 1 100 100 (Nothing NativeSourceLocation)]) 100 with
+      | Left error => if let NativeDebugInvalidRange id := (error : NativeDebugError) then eqNat id 1 else False
+      | Right _ => False end)
+      (andb (match native_debug_locate_rva (NativeSourceMapOf
+          [NativeFunctionSourceAt 2 pe_max_rva (S pe_max_rva) (Nothing NativeSourceLocation)]) pe_max_rva with
+        | Left error => if let NativeDebugInvalidRange id := (error : NativeDebugError) then eqNat id 2 else False
+        | Right _ => False end)
+        (match native_debug_locate_pc (NativeSourceMapOf
+            [NativeFunctionSourceAt 3 10 10 (Nothing NativeSourceLocation)]) 100 99 with
+          | Left error => if let NativeDebugInvalidRange id := (error : NativeDebugError) then eqNat id 3 else False
+          | Right _ => False end));
+
+def native_origin_map_resolved (packet : CheckedSourcePacket) (state : InternState)
+    (path : String) (local : String) : Maybe Nat :=
+    match pipeline_literal_id state (prim_string_to_char_codes path) with
+    | Nothing => Nothing Nat
+    | Just unit => match state with | MkIntern names _ _ _ =>
+      match source_lookup_id names (prim_string_to_char_codes local) with
+      | Nothing => Nothing Nat
+      | Just name => match filter SourceCheckedOwner (fun (row : SourceCheckedOwner) => match row with
+          | SourceCheckedOwnerOf _ owner => match owner with
+            | Nothing => False
+            | Just location => match location with | MkPair ident slot =>
+              andb (eqNat unit ident) (source_slot_equal slot (MkPair Nat Nat 0 name)) end
+            end end) (checked_source_packet_owners packet) with
+        | Nil => Nothing Nat
+        | Cons row rest => match rest with
+          | Cons _ _ => Nothing Nat
+          | Nil => match row with | SourceCheckedOwnerOf entry _ =>
+            match source_checked_entry_slot entry with | MkPair _ resolved => Just Nat resolved end end
+          end
+        end
+      end end
+    end;
+
+def native_origin_map_collision : Bool :=
+    let prefix : String := "import \"dep.ouro\" as D exposing (Token, value as chosen); " in
+    let root : String := prim_string_concat prefix "def value : Token := chosen;" in
+    let dependency : String := "inductive Token : Type := | Hit : Token; def value : Token := Hit;" in
+    let compiled : SourceOriginCompilation := compile_checked_units_with_source_origins 5000
+      (prim_string_to_char_codes "main.ouro")
+      [compiler_test_unit "main.ouro" root, compiler_test_unit "dep.ouro" dependency] in
+    match source_origin_compilation_original compiled with | MkPair result state => match result with
+      | SourceErr _ => False
+      | SourceOk packet => match source_origin_compilation_metadata compiled with
+        | Left _ => False
+        | Right metadata => match native_origin_map_resolved packet state "main.ouro" "value",
+            native_origin_map_resolved packet state "dep.ouro" "value" with
+          | Just local, Just imported => andb (notb (eqNat local imported))
+              (match native_debug_build_map packet state metadata native_origin_map_image
+                  [NativeFunctionOriginOf 800 (NativeFunctionSource local True),
+                   NativeFunctionOriginOf 801 (NativeFunctionSource imported True),
+                   NativeFunctionOriginOf 900 NativeFunctionUnknown] [] with
+                | Left _ => False
+                | Right mapping => andb (native_origin_map_known_span mapping 100 800 True "main.ouro"
+                    (MkPair Nat Nat (length Nat (prim_string_to_char_codes prefix)) (length Nat (prim_string_to_char_codes root))))
+                    (native_origin_map_known_span mapping 110 801 True "dep.ouro" (MkPair Nat Nat 41 66))
+                end)
+          | Just _, Nothing => False
+          | Nothing, Just _ => False
+          | Nothing, Nothing => False
+          end
+        end
+      end end;
+
+def native_origin_map_record : Bool :=
+    let record_text : String := "record Box : Type where value : Token; end;" in
+    let source : String := prim_string_concat native_origin_map_prefix record_text in
+    let compiled : SourceOriginCompilation := compile_checked_units_with_source_origins 5000
+      (prim_string_to_char_codes "main.ouro") [compiler_test_unit "main.ouro" source] in
+    match source_origin_compilation_original compiled with | MkPair result state => match result with
+      | SourceErr _ => False
+      | SourceOk packet => match compiler_test_name (checked_source_packet_program packet) "Box_value" with
+        | Nothing => False
+        | Just accessor => match source_origin_compilation_metadata compiled with
+          | Left _ => False
+          | Right metadata => match native_debug_build_map packet state metadata native_origin_map_image
+              [NativeFunctionOriginOf 800 (NativeFunctionSource accessor False),
+               NativeFunctionOriginOf 801 (NativeFunctionSource accessor True),
+               NativeFunctionOriginOf 900 NativeFunctionUnknown] [] with
+            | Left _ => False
+            | Right mapping => let expected : Pair Nat Nat := MkPair Nat Nat
+                (length Nat (prim_string_to_char_codes native_origin_map_prefix))
+                (length Nat (prim_string_to_char_codes source)) in
+                andb (native_origin_map_known_span mapping 100 800 True "main.ouro" expected)
+                  (native_origin_map_known_span mapping 110 801 True "main.ouro" expected)
+            end
+          end
+        end
+      end end;
+
+def native_origin_map_pe_only : Bool :=
+    let checked : CheckedProgram := CheckedProgramOf empty_intern ([] : List Entry) ([] : List (Pair Nat CoreTerm)) in
+    let mir : MirProgram := MirProgramDef
+      [MirFunctionDef 800 [102] ([] : List MirLocal) ([] : List MirLocal) (Nothing MirType) 0
+        [MirBlockDef 0 ([] : List MirInstruction) MirTrap]]
+      ([] : List MirData) ([] : List MirLibrary) 800 in
+    let lowered : NativeLoweredProgram := NativeLoweredOf checked ([] : List LowerContract) mir in
+    let rows : List NativeFunctionOrigin := native_debug_image_origins lowered native_origin_map_image
+      [NativeFunctionOriginOf 800 (NativeFunctionSource 7 True)] in
+    andb (eqNat (length NativeFunctionOrigin rows) 3)
+      (andb (match native_debug_origin 801 rows with
+        | Right owner => match owner with | NativeFunctionUnknown => True | NativeFunctionSource _ _ => False end | Left _ => False end)
+        (andb (match native_debug_origin 900 rows with
+          | Right owner => match owner with | NativeFunctionUnknown => True | NativeFunctionSource _ _ => False end | Left _ => False end)
+          (match native_debug_origin 800 (native_debug_image_origins lowered native_origin_map_image []) with
+            | Left error => if let NativeDebugMissingFunction id := (error : NativeDebugError) then eqNat id 800 else False
+            | Right _ => False end)));
+
+def native_origin_map_metadata_failure : Bool :=
+    let compiled : SourceOriginCompilation := compile_checked_units_with_source_origins 5000
+      (prim_string_to_char_codes "main.ouro") [compiler_test_unit "main.ouro" native_origin_map_source] in
+    let broken : SourceOriginCompilation := SourceOriginCompilationOf (source_origin_compilation_original compiled)
+      (Left SourceOriginError SourceOriginMetadata SourceOriginOccurrence) in
+    let result : NativeDebugCompilation := native_debug_finish broken
+      (Right NativeSourceError (Pair NativeImage (List NativeFunctionOrigin))
+        (MkPair NativeImage (List NativeFunctionOrigin) native_origin_map_image ([] : List NativeFunctionOrigin))) [] in
+    match native_debug_compilation_image result, native_debug_compilation_map result with
+    | Right _, Left error => if let NativeDebugSourceMetadata cause := (error : NativeDebugError) then
+        if let SourceOriginOccurrence := (cause : SourceOriginError) then True else False
+      else False
+    | Left _, Left _ => False
+    | Left _, Right _ => False
+    | Right _, Right _ => False
+    end;
+
+def native_origin_map_image_bytes (image : NativeImage) : List Nat :=
+    match image with | NativeImageOf pe _ => match pe with | PeImageFile bytes _ => bytes end end;
+
+def native_origin_map_unsigned_image : Bool :=
+    let root : List Nat := prim_string_to_char_codes "main.ouro" in
+    let files : List (Pair (List Nat) (List Nat)) := [compiler_test_unit "main.ouro" lower_fixture_pid] in
+    let bare : Either NativeSourceError NativeImage := native_compile_units_auto 6000 mir_default_limits lower_fixture_main root files in
+    let observed : NativeDebugCompilation := native_compile_units_auto_with_source_origins 6000 mir_default_limits
+      lower_fixture_main root files [] in
+    let mapped : NativeDebugCompilation := native_compile_units_auto_with_source_origins 6000 mir_default_limits
+      lower_fixture_main root files [MkPair (List Nat) (List Nat) root (prim_string_to_char_codes "mapped/main.ouro")] in
+    match bare, native_debug_compilation_image observed, native_debug_compilation_image mapped with
+    | Right first, Right second, Right third => andb (pe_bytes_equal (native_origin_map_image_bytes first) (native_origin_map_image_bytes second))
+        (andb (pe_bytes_equal (native_origin_map_image_bytes first) (native_origin_map_image_bytes third))
+          (match native_debug_compilation_map observed, native_debug_compilation_map mapped with
+           | Right first_map, Right second_map => match first_map with | NativeSourceMapOf rows =>
+               match second_map with | NativeSourceMapOf _ =>
+                 andb (any NativeFunctionSourceRange (fun (row : NativeFunctionSourceRange) => match row with
+                   | NativeFunctionSourceAt _ _ _ source => match source with | Nothing => False | Just _ => True end end) rows)
+                   (any NativeFunctionSourceRange (fun (row : NativeFunctionSourceRange) => match row with
+                     | NativeFunctionSourceAt _ _ _ source => match source with | Nothing => True | Just _ => False end end) rows)
+               end end
+           | Left _, Right _ => False
+           | Right _, Left _ => False
+           | Left _, Left _ => False
+           end))
+    | Left _, Left _, Left _ => False
+    | Left _, Left _, Right _ => False
+    | Left _, Right _, Left _ => False
+    | Left _, Right _, Right _ => False
+    | Right _, Left _, Left _ => False
+    | Right _, Left _, Right _ => False
+    | Right _, Right _, Left _ => False
+    end;
+
+def native_origin_map_bad_import : Bool :=
+    let root : List Nat := prim_string_to_char_codes "main.ouro" in
+    let files : List (Pair (List Nat) (List Nat)) :=
+      [compiler_test_unit "main.ouro" (prim_string_concat "import \"dep.ouro\"; " lower_fixture_pid),
+       compiler_test_unit "dep.ouro" "inductive Token : Type := | Here : Token; def broken : Token := Type;"] in
+    let ordinary : Either NativeSourceError NativeImage := native_compile_units_auto 6000 mir_default_limits lower_fixture_main root files in
+    let observed : NativeDebugCompilation := native_compile_units_auto_with_source_origins 6000 mir_default_limits
+      lower_fixture_main root files [] in
+    match ordinary, native_debug_compilation_image observed, native_debug_compilation_map observed with
+    | Left ordinary_error, Left observed_error, Left map_error => match ordinary_error with
+      | NativeSourceLowerError _ => False
+      | NativeSourceCheckError first_error => match observed_error with
+        | NativeSourceLowerError _ => False
+        | NativeSourceCheckError second_error => match first_error with | ErrCode first detail =>
+          match second_error with | ErrCode second other =>
+            if let NativeDebugNoImage := (map_error : NativeDebugError) then
+              andb (eqNat first second) (eqNat detail other)
+            else False
+          end end
+        end
+      end
+    | Left _, Left _, Right _ => False
+    | Left _, Right _, Left _ => False
+    | Left _, Right _, Right _ => False
+    | Right _, Left _, Left _ => False
+    | Right _, Left _, Right _ => False
+    | Right _, Right _, Left _ => False
+    | Right _, Right _, Right _ => False
+    end;
+
+def native_origin_map_order (mapping : NativeSourceMap) (expected : List Nat) : Bool :=
+    match mapping with | NativeSourceMapOf rows =>
+      (fix compare (remaining : List NativeFunctionSourceRange) (symbols : List Nat) : Bool :=
+        match remaining, symbols with
+        | Nil, Nil => True
+        | Cons row rest, Cons symbol more => match row with | NativeFunctionSourceAt id _ _ _ =>
+            andb (eqNat id symbol) (compare rest more) end
+        | Nil, Cons _ _ => False
+        | Cons _ _, Nil => False
+        end) rows expected
+    end;
+
+def native_origin_map_indexed_order : Bool := native_origin_map_probe
+    (fun (packet : CheckedSourcePacket) (state : InternState) (metadata : SourceOriginMetadata) (source : Nat) =>
+      let reordered : CheckedSourcePacket := CheckedSourcePacketOf (checked_source_packet_program packet)
+        (MkPair (List SourceModuleSlot) (List SourceCheckedOwner) (checked_source_packet_slots packet) (reverse SourceCheckedOwner (checked_source_packet_owners packet))) in
+      let reversed_state : InternState := match state with | MkIntern names next strings next_string =>
+        MkIntern names next (reverse (Pair (List Nat) Nat) strings) next_string end in
+      let reversed_metadata : SourceOriginMetadata := match metadata with | SourceOriginMetadataOf locations entries =>
+        match locations with | MkPair slots occurrences =>
+          SourceOriginMetadataOf (MkPair (List SourceModuleSlot) (List OwnedSourceOccurrence) slots (reverse OwnedSourceOccurrence occurrences)) entries end end in
+      let image : NativeImage := NativeImageOf (PeImageFile ([] : List Nat)
+        [PeFunctionAt 4000 100 110 [102], PeFunctionAt 7 110 120 [102], PeFunctionAt 2001 120 130 [102],
+         PeFunctionAt 3 130 140 [102], PeFunctionAt 800 140 150 [102], PeFunctionAt 900 150 160 [102]]) [] in
+      let origins : List NativeFunctionOrigin :=
+        [NativeFunctionOriginOf 3 (NativeFunctionSource source True), NativeFunctionOriginOf 900 NativeFunctionUnknown,
+         NativeFunctionOriginOf 2001 (NativeFunctionSource source False), NativeFunctionOriginOf 4000 NativeFunctionUnknown,
+         NativeFunctionOriginOf 800 (NativeFunctionSource source False), NativeFunctionOriginOf 7 (NativeFunctionSource source True)] in
+      match native_debug_build_map reordered reversed_state reversed_metadata image origins [] with
+      | Left _ => False
+      | Right mapping => andb (native_origin_map_order mapping [4000, 7, 2001, 3, 800, 900])
+          (andb (native_origin_map_known mapping 110 7 True "main.ouro")
+            (andb (native_origin_map_known mapping 120 2001 False "main.ouro")
+              (andb (native_origin_map_known mapping 139 3 True "main.ouro")
+                (andb (native_origin_map_known mapping 140 800 False "main.ouro")
+                  (andb (match native_debug_locate_rva mapping 100 with
+                    | Right found => match found with | NativePcUnknown id => eqNat id 4000 | NativePcOutside => False | NativePcKnown _ _ => False end | Left _ => False end)
+                    (match native_debug_locate_rva mapping 159 with
+                      | Right found => match found with | NativePcUnknown id => eqNat id 900 | NativePcOutside => False | NativePcKnown _ _ => False end | Left _ => False end))))))
+      end);
+
+def native_origin_map_late_duplicate : Bool :=
+    let mapping : NativeSourceMap := NativeSourceMapOf
+      [NativeFunctionSourceAt 7 100 110 (Nothing NativeSourceLocation),
+       NativeFunctionSourceAt 4000 110 120 (Nothing NativeSourceLocation),
+       NativeFunctionSourceAt 7 120 130 (Nothing NativeSourceLocation)] in
+    andb (match native_debug_locate_rva mapping 100 with
+      | Left error => if let NativeDebugDuplicateFunction id := (error : NativeDebugError) then eqNat id 7 else False
+      | Right _ => False end)
+      (match native_debug_locate_pc mapping 100 99 with
+        | Left error => if let NativeDebugDuplicateFunction id := (error : NativeDebugError) then eqNat id 7 else False
+        | Right _ => False end);
+
+def native_origin_map_unit_ambiguity : Bool := native_origin_map_probe
+    (fun (packet : CheckedSourcePacket) (state : InternState) (metadata : SourceOriginMetadata) (source : Nat) =>
+      match native_debug_source_owner source packet with
+      | Nothing => False
+      | Just owner => match owner with | MkPair unit _ => match state with | MkIntern names next strings next_string =>
+        let duplicated : InternState := MkIntern names next
+          (Cons (Pair (List Nat) Nat) (MkPair (List Nat) Nat (prim_string_to_char_codes "other.ouro") unit) strings) next_string in
+        let missing : InternState := MkIntern names next
+          (filter (Pair (List Nat) Nat) (fun (row : Pair (List Nat) Nat) =>
+            match row with | MkPair _ id => notb (eqNat unit id) end) strings) next_string in
+        andb (match native_debug_build_map packet duplicated metadata native_origin_map_image (native_origin_map_rows source) [] with
+          | Left error => if let NativeDebugUnknownUnit id := (error : NativeDebugError) then eqNat id unit else False
+          | Right _ => False end)
+          (match native_debug_build_map packet missing metadata native_origin_map_image (native_origin_map_rows source) [] with
+            | Left error => if let NativeDebugUnknownUnit id := (error : NativeDebugError) then eqNat id unit else False
+            | Right _ => False end)
+        end end
+      end);
+
+def native_origin_map_occurrence_ambiguity : Bool := native_origin_map_probe
+    (fun (packet : CheckedSourcePacket) (state : InternState) (metadata : SourceOriginMetadata) (source : Nat) =>
+      match native_debug_source_owner source packet with
+      | Nothing => False
+      | Just owner => match owner with | MkPair unit slot => match metadata with
+        | SourceOriginMetadataOf locations entries => match locations with | MkPair slots occurrences =>
+          let repeated : List OwnedSourceOccurrence := filter OwnedSourceOccurrence
+            (fun (row : OwnedSourceOccurrence) => match row with | OwnedSourceOccurrenceOf candidate captured =>
+              match captured with | MkPair occurrence _ => match occurrence with | ParsedSourceOccurrenceOf decl _ =>
+                andb (eqNat unit candidate) (source_slot_equal slot (source_decl_slot decl)) end end end) occurrences in
+          match repeated with
+          | Nil => False
+          | Cons _ _ => let ambiguous : SourceOriginMetadata := SourceOriginMetadataOf
+              (MkPair (List SourceModuleSlot) (List OwnedSourceOccurrence) slots (append OwnedSourceOccurrence occurrences repeated)) entries in
+            match native_debug_build_map packet state ambiguous native_origin_map_image (native_origin_map_rows source) [] with
+            | Left _ => False
+            | Right mapping => andb (match native_debug_locate_rva mapping 100 with
+              | Right found => match found with | NativePcUnknown id => eqNat id 800 | NativePcOutside => False | NativePcKnown _ _ => False end | Left _ => False end)
+              (match native_debug_locate_rva mapping 110 with
+                | Right found => match found with | NativePcUnknown id => eqNat id 801 | NativePcOutside => False | NativePcKnown _ _ => False end | Left _ => False end)
+            end
+          end
+        end end end
+      end);
+
+def native_origin_map_scalar_index : Bool :=
+    let checked : CheckedProgram := CheckedProgramOf empty_intern ([] : List Entry) ([] : List (Pair Nat CoreTerm)) in
+    let typ : LowerType := LowerTypeOf (CSort 0) (Just MirType MirU32) False in
+    let body : Nat -> LowerContract := fun (id : Nat) =>
+      LowerContractOf id (CSort 0) ([] : List LowerType) typ (Nothing PrimitiveBinding) in
+    let foreign : Nat -> LowerContract := fun (id : Nat) => LowerContractOf id (CSort 0) ([] : List LowerType) typ
+      (Just PrimitiveBinding (PrimitiveIntrinsicBinding PrimitiveProcessExit PrimitiveRuntimeAction PrimitiveNoGc (Nothing CoreTerm))) in
+    let functions : List MirFunction := map Nat MirFunction (fun (id : Nat) =>
+      MirFunctionDef id [102] ([] : List MirLocal) ([] : List MirLocal) (Nothing MirType) 0
+        [MirBlockDef 0 ([] : List MirInstruction) MirTrap]) [7, 4000, 900, 2001] in
+    let rows : List NativeFunctionOrigin := native_debug_scalar_rows (NativeLoweredOf checked
+      [body 4000, foreign 2001, body 7, foreign 7, body 4000]
+      (MirProgramDef functions ([] : List MirData) ([] : List MirLibrary) 900)) in
+    andb (eqNat (length NativeFunctionOrigin rows) 4)
+      (andb (match native_debug_origin 7 rows with
+        | Right owner => match owner with | NativeFunctionSource source generated => match generated with | False => eqNat source 7 | True => False end | NativeFunctionUnknown => False end | Left _ => False end)
+        (andb (match native_debug_origin 4000 rows with | Right owner => match owner with | NativeFunctionUnknown => True | NativeFunctionSource _ _ => False end | Left _ => False end)
+          (andb (match native_debug_origin 900 rows with | Right owner => match owner with | NativeFunctionUnknown => True | NativeFunctionSource _ _ => False end | Left _ => False end)
+            (match native_debug_origin 2001 rows with | Right owner => match owner with | NativeFunctionUnknown => True | NativeFunctionSource _ _ => False end | Left _ => False end))));
+
+def native_origin_map_refusal_order : Bool := native_origin_map_probe
+    (fun (packet : CheckedSourcePacket) (state : InternState) (metadata : SourceOriginMetadata) (source : Nat) =>
+      let incomplete : List NativeFunctionOrigin :=
+        [NativeFunctionOriginOf 801 (NativeFunctionSource source True), NativeFunctionOriginOf 900 NativeFunctionUnknown,
+         NativeFunctionOriginOf 801 NativeFunctionUnknown] in
+      andb (match native_debug_build_map packet state metadata native_origin_map_image incomplete [] with
+        | Left error => if let NativeDebugMissingFunction id := (error : NativeDebugError) then eqNat id 800 else False
+        | Right _ => False end)
+        (match native_debug_build_map packet state metadata native_origin_map_image
+            (append NativeFunctionOrigin incomplete [NativeFunctionOriginOf 999 NativeFunctionUnknown]) [] with
+          | Left error => if let NativeDebugUnexpectedFunction id := (error : NativeDebugError) then eqNat id 999 else False
+          | Right _ => False end));
+
+def native_source_debug_tests : List StartupTest :=
+    [startup_test_assert "RVA intervals keep original envelopes and explicit startup unknown" native_origin_map_boundaries,
+     startup_test_assert "path mapping uses exact source paths" native_origin_map_paths,
+     startup_test_assert "duplicate function transport refuses mapping" (native_origin_map_bad_trace 0),
+     startup_test_assert "missing function transport refuses mapping" (native_origin_map_bad_trace 1),
+     startup_test_assert "foreign function transport refuses mapping" (native_origin_map_bad_trace 2),
+     startup_test_assert "duplicate path mapping refuses metadata" native_origin_map_bad_paths,
+     startup_test_assert "ambiguous source owners stay unknown" native_origin_map_ambiguous,
+     startup_test_assert "overlapping intervals refuse PC lookup" native_origin_map_bad_ranges,
+     startup_test_assert "empty and out-of-PE intervals refuse every PC lookup" native_origin_map_invalid_bounds,
+     startup_test_assert "resolved colliding names retain distinct source-unit envelopes" native_origin_map_collision,
+     startup_test_assert "record-generated functions inherit the original record envelope" native_origin_map_record,
+     startup_test_assert "PE-only functions stay unknown without hiding missing MIR origins" native_origin_map_pe_only,
+     startup_test_assert "source metadata refusal preserves successful image" native_origin_map_metadata_failure,
+     startup_test_assert "source maps and path mapping preserve complete unsigned image bytes" native_origin_map_unsigned_image,
+     startup_test_assert "invalid imported body preserves compiler refusal" native_origin_map_bad_import,
+     startup_test_assert "indexed joins retain sparse PE order and original source IDs" native_origin_map_indexed_order,
+     startup_test_assert "PC lookups validate duplicate rows after an earlier hit" native_origin_map_late_duplicate,
+     startup_test_assert "indexed unit paths refuse missing or duplicate unit IDs" native_origin_map_unit_ambiguity,
+     startup_test_assert "duplicate indexed occurrences retain explicit unknown ownership" native_origin_map_occurrence_ambiguity,
+     startup_test_assert "scalar origin indexing retains unique body IDs and unknown startup" native_origin_map_scalar_index,
+     startup_test_assert "indexed origin validation retains refusal order" native_origin_map_refusal_order];
+
+def main : IO Unit := startup_test_run native_source_debug_tests;

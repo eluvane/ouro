@@ -1,0 +1,117 @@
+-- Concrete scalar SysV calls; no Windows home area or tail-call epilog.
+-- https://gitlab.com/x86-psABIs/x86-64-ABI/-/tree/master
+import "codegen_model.ouro";
+
+inductive SysvCallError : Type :=
+  | SysvFrameTooLarge : Nat -> SysvCallError
+  | SysvArgumentOutOfRange : Nat -> SysvCallError
+  | SysvOffsetOutOfRange : Nat -> SysvCallError
+  | SysvUnknownFunction : Nat -> SysvCallError
+  | SysvCodegenRejected : NativeCodegenError -> SysvCallError;
+
+def sysv_from_codegen (A : Type) (result : Either NativeCodegenError A) : Either SysvCallError A :=
+    mapLeft NativeCodegenError A SysvCallError SysvCodegenRejected result;
+
+def sysv_frame_allocation_limit : Nat := 4096;
+
+def sysv_argument_register (index : Nat) : Maybe X64Register :=
+    match index with
+    | Z => Just X64Register X64Rdi
+    | S a => match a with | Z => Just X64Register X64Rsi
+      | S b => match b with | Z => Just X64Register X64Rdx
+        | S c => match c with | Z => Just X64Register X64Rcx
+          | S d => match d with | Z => Just X64Register X64R8
+            | S e => match e with | Z => Just X64Register X64R9
+              | S _ => Nothing X64Register end end end end end end;
+
+def sysv_stack_offset (index : Nat) (base : Nat) : Either SysvCallError X64Displacement :=
+    match leb_nat 6 index with
+    | False => Left SysvCallError X64Displacement (SysvArgumentOutOfRange index)
+    | True => let offset : Nat := add base (mul (sub index 6) 8) in
+      match leb_nat offset pe_max_rva with
+      | False => Left SysvCallError X64Displacement (SysvOffsetOutOfRange offset)
+      | True => Right SysvCallError X64Displacement (codegen_disp offset) end end;
+
+def sysv_frame (function : MirFunction) : Either SysvCallError CodegenFrame :=
+    match function with | MirFunctionDef _ _ args locals _ _ blocks =>
+      let count : Nat := foldr MirBlock Nat (fun (block : MirBlock) (other : Nat) =>
+        match block with | MirBlockDef _ instructions _ =>
+          maxNat other (foldr MirInstruction Nat (fun (instruction : MirInstruction) (n : Nat) =>
+            maxNat n (codegen_call_arity instruction)) 0 instructions) end) 0 blocks in
+      let outgoing : Nat := mul (sub count 6) 8 in
+      let all_locals : List MirLocal := append MirLocal args locals in
+      let occupied : Nat := add outgoing (mul 8 (length MirLocal all_locals)) in
+      -- CALL enters at 8 mod 16; the allocation aligns RSP before nested calls.
+      let allocation : Nat := sub (pe_align 16 (add occupied 8)) 8 in
+      match ltb_nat allocation sysv_frame_allocation_limit with
+      | False => Left SysvCallError CodegenFrame (SysvFrameTooLarge allocation)
+      | True => Right SysvCallError CodegenFrame
+          (CodegenFrameOf allocation (codegen_slots all_locals outgoing)) end end;
+
+def sysv_argument_place (index : Nat) : Either SysvCallError X64Instruction :=
+    match ltb_nat index 6 with
+    | True => match sysv_argument_register index with
+      | Nothing => Left SysvCallError X64Instruction (SysvArgumentOutOfRange index)
+      | Just reg => Right SysvCallError X64Instruction (X64Mov X64Bits64 reg X64Rax) end
+    | False => mapRight SysvCallError X64Displacement X64Instruction
+        (fun (disp : X64Displacement) => X64Store X64Bits64 (X64Base X64Rsp disp) X64Rax)
+        (sysv_stack_offset index 0) end;
+
+-- Each value is read from its stable slot before the corresponding ABI write.
+def sysv_arguments (slots : List CodegenSlot) : List MirValue -> Nat -> Either SysvCallError (List CodegenAtom) :=
+  fix sysv_arguments (args : List MirValue) (index : Nat) : Either SysvCallError (List CodegenAtom) :=
+    match args with
+    | Nil => Right SysvCallError (List CodegenAtom) []
+    | Cons value rest => let? (Left, Right) : Either SysvCallError (List CodegenAtom) do
+        let load : List CodegenAtom := sysv_from_codegen (List CodegenAtom)
+          (codegen_load_value slots X64Rax value)?;
+        let place : X64Instruction := sysv_argument_place index?;
+        let tail : List CodegenAtom := sysv_arguments rest (S index)?;
+        append CodegenAtom load (Cons CodegenAtom (CodegenInstruction place) tail)
+      end end;
+
+def sysv_incoming_argument (allocation : Nat) (index : Nat) : Either SysvCallError X64Instruction :=
+    match ltb_nat index 6 with
+    | True => match sysv_argument_register index with
+      | Nothing => Left SysvCallError X64Instruction (SysvArgumentOutOfRange index)
+      | Just reg => Right SysvCallError X64Instruction (X64Mov X64Bits64 X64Rax reg) end
+    | False => mapRight SysvCallError X64Displacement X64Instruction
+        (fun (disp : X64Displacement) => X64Load X64Bits64 X64Rax (X64Base X64Rsp disp))
+        (sysv_stack_offset index (add allocation 8)) end;
+
+def sysv_spill_args (slots : List CodegenSlot) (allocation : Nat)
+    : List MirLocal -> Nat -> Either SysvCallError (List CodegenAtom) :=
+  fix sysv_spill_args (args : List MirLocal) (index : Nat) : Either SysvCallError (List CodegenAtom) :=
+    match args with
+    | Nil => Right SysvCallError (List CodegenAtom) []
+    | Cons argument rest => let? (Left, Right) : Either SysvCallError (List CodegenAtom) do
+        let load : X64Instruction := sysv_incoming_argument allocation index?;
+        let save : List CodegenAtom := sysv_from_codegen (List CodegenAtom)
+          (codegen_save slots (mir_local_id argument) X64Rax)?;
+        let tail : List CodegenAtom := sysv_spill_args rest (S index)?;
+        Cons CodegenAtom (CodegenInstruction load) (append CodegenAtom save tail)
+      end end;
+
+def sysv_call_target (program : MirProgram) (slots : List CodegenSlot)
+    (target : MirCallTarget) : Either SysvCallError (List CodegenAtom) :=
+    match target with
+    | MirDirect id => match program with | MirProgramDef functions _ _ _ =>
+      match mir_find_function id functions with
+      | Nothing => Left SysvCallError (List CodegenAtom) (SysvUnknownFunction id)
+      | Just _ => Right SysvCallError (List CodegenAtom) [CodegenDirectCall id] end end
+    | MirIndirect _ address => mapRight SysvCallError (List CodegenAtom) (List CodegenAtom)
+        (fun (load : List CodegenAtom) => append CodegenAtom load
+          [CodegenInstruction (X64CallIndirect (X64RegisterOperand X64R11))])
+        (sysv_from_codegen (List CodegenAtom) (codegen_load_value slots X64R11 address)) end;
+
+def sysv_call (program : MirProgram) (slots : List CodegenSlot) (block : Nat) (site : Nat)
+    (dest : Maybe Nat) (target : MirCallTarget) (args : List MirValue) : Either SysvCallError (List CodegenAtom) :=
+    let? (Left, Right) : Either SysvCallError (List CodegenAtom) do
+      let before : List CodegenAtom := sysv_arguments slots args 0?;
+      let call : List CodegenAtom := sysv_call_target program slots target?;
+      let after : List CodegenAtom := match dest with
+        | Nothing => Right SysvCallError (List CodegenAtom) []
+        | Just id => sysv_from_codegen (List CodegenAtom) (codegen_save slots id X64Rax) end?;
+      append CodegenAtom before
+        (append CodegenAtom call (Cons CodegenAtom (CodegenBoundary block site) after))
+    end;

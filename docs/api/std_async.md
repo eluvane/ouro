@@ -6,7 +6,7 @@ Declarations: 2.
 
 ## def sleep_s
 
-```
+```ouro
 def sleep_s (n : Nat) : IO Unit
 ```
 
@@ -14,7 +14,7 @@ Wait for n one-second Windows intervals when the action runs. Zero makes no OS w
 
 ## def delay_then
 
-```
+```ouro
 def delay_then (A : Type) (n : Nat) (act : IO A) : IO A
 ```
 

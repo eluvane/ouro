@@ -2,12 +2,14 @@
 from __future__ import annotations
 
 import hashlib
+import shutil
 import sys
 import time
 from pathlib import Path
 
 from ourosmith import ROOT
-from ourosmith.host import environment, shell
+from local_scheduler import Allocation, available_memory_mib
+from ourosmith.host import BUILD_MEMORY_MB, environment, job_count, shell
 from ourosmith.limits import run_limited
 from ourosmith.provenance import begin, source_state
 from repo_support import write_json_atomic
@@ -67,21 +69,54 @@ def reuse_ci_pr(out, rows):
             "seconds": round(time.perf_counter() - started, 3), "log": str(log)}
 
 
+def ci_pr_repeat(receipt):
+    workspace = ROOT / receipt["workspace"]
+    repeat_out = workspace / "_build/ci/smith-pr-repeat"
+    argv = list(receipt["command"])
+    argv[argv.index("--out") + 1] = repeat_out.relative_to(workspace).as_posix()
+    return workspace, repeat_out, argv, Allocation(receipt["jobs"], receipt["memory_mib"])
+
+
 def run(args):
     out = Path(args.out).resolve() if args.out else ROOT / "_build/smith/validation"
     out.mkdir(parents=True, exist_ok=True)
     provenance = begin()
     rows = []
-    for name, argv in commands(out):
+    allocation = Allocation(job_count(), available_memory_mib() or BUILD_MEMORY_MB)
+    repeat = None
+    for name, command in commands(out):
         print(f"OURO_SMITH: validation START {name}", flush=True)
         row = reuse_ci_pr(out, rows) if name == "pr" else None
+        if row is not None and "workspace" in row["receipt"]:
+            repeat = ci_pr_repeat(row["receipt"])
         if row is None:
-            result = run_limited(argv, cwd=ROOT, env=environment(build=True), timeout_s=3600, memory_mb=3072)
+            argv = command
+            cwd, lease, extra = ROOT, allocation, {}
+            repeated = name == "pr2" and repeat is not None
+            env = environment(build=True)
+            if repeated:
+                from ci_gate import Gate, env_for
+
+                cwd, repeat_out, argv, lease = repeat
+                (repeat_out / "report.json").unlink(missing_ok=True)
+                extra = {"execution": "ci-workspace", "workspace": cwd.relative_to(ROOT).as_posix()}
+                env = {**env_for(Gate("ouro-smith", argv, ("pr",)), out / "ci", cwd, lease), "PATH": env["PATH"]}
+            env.update(lease.environment())
+            result = run_limited(argv, cwd=cwd, env=env, timeout_s=3600, memory_mb=lease.memory_mib)
             log = out / (name + ".log")
-            log.write_text(result.stdout + result.stderr, encoding="utf-8")
+            output = result.stdout + result.stderr
             status = "PASS" if result.ok else "TIMEOUT" if result.status == "timeout" else "FAIL"
+            if repeated and result.ok:
+                target = out / "pr2/report.json"
+                try:
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copyfile(repeat_out / "report.json", target)
+                except OSError as exc:
+                    output += f"\nOURO_SMITH: missing isolated repeat report: {exc}\n"
+                    status = "FAIL"
+            log.write_text(output, encoding="utf-8")
             row = {"name": name, "command": argv, "exit_code": result.returncode, "status": status,
-                   "resource": result.classify(), "seconds": round(result.elapsed_s, 3), "log": str(log)}
+                   "resource": result.classify(), "seconds": round(result.elapsed_s, 3), "log": str(log), **extra}
         rows.append(row)
         print(f"OURO_SMITH: validation {name} {row['status']} exit={row['exit_code']} log={row['log']}", flush=True)
         write_json_atomic(out / "commands.json", {"kind": KIND, "pass": False, "complete": False,

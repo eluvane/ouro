@@ -1,0 +1,332 @@
+-- Original-byte provenance is diagnostic data, never declaration acceptance.
+import "ast.ouro", "../std/natx.ouro";
+
+inductive SourceOriginError : Type :=
+  | SourceOriginBounds : SourceOriginError
+  | SourceOriginCoverage : SourceOriginError
+  | SourceOriginCopyWidth : SourceOriginError
+  | SourceOriginOccurrence : SourceOriginError
+  | SourceOriginUnit : SourceOriginError;
+
+inductive OriginalEnvelope : Type :=
+  | OriginalEnvelopeOf : Pair Nat Nat -> Bool -> OriginalEnvelope;
+
+inductive OriginalRegionSource : Type :=
+  | OriginalCopy : Pair Nat Nat -> OriginalRegionSource
+  | OriginalParent : OriginalEnvelope -> OriginalRegionSource
+  | OriginalUnknown : OriginalRegionSource;
+
+inductive OriginalRegion : Type :=
+  | OriginalRegionOf : Pair Nat Nat -> OriginalRegionSource -> OriginalRegion;
+
+inductive OriginalSourceMap : Type :=
+  | OriginalSourceMapOf : Pair Nat Nat -> List OriginalRegion -> OriginalSourceMap;
+
+inductive OriginalChange : Type :=
+  | OriginalChangeOf : Pair (List Nat) (List Nat) ->
+      Pair (Pair (List Nat) (List Nat)) Bool -> OriginalChange;
+
+inductive OriginalCapture : Type :=
+  | OriginalCaptureDisabled : OriginalCapture
+  | OriginalCaptureChanges : List OriginalChange -> OriginalCapture;
+
+inductive ParsedSourceOccurrence : Type :=
+  | ParsedSourceOccurrenceOf : Decl -> Pair Nat (Pair Nat Nat) -> ParsedSourceOccurrence;
+
+inductive OwnedSourceOccurrence : Type :=
+  | OwnedSourceOccurrenceOf : Nat ->
+      Pair ParsedSourceOccurrence (Maybe OriginalEnvelope) -> OwnedSourceOccurrence;
+
+def original_capture_start (retain : Bool) : OriginalCapture :=
+  match retain with
+  | False => OriginalCaptureDisabled
+  | True => OriginalCaptureChanges []
+  end;
+
+def original_capture_change (capture : OriginalCapture)
+    (before : List Nat) (after : List Nat) (output_before : List Nat)
+    (output_after : List Nat) (generated : Bool) : OriginalCapture :=
+  match capture with
+  | OriginalCaptureDisabled => OriginalCaptureDisabled
+  | OriginalCaptureChanges changes => OriginalCaptureChanges
+      (Cons OriginalChange
+        (OriginalChangeOf (MkPair (List Nat) (List Nat) before after)
+          (MkPair (Pair (List Nat) (List Nat)) Bool
+            (MkPair (List Nat) (List Nat) output_before output_after) generated)) changes)
+  end;
+
+def original_interval_valid (total : Nat) (interval : Pair Nat Nat) : Bool :=
+  match interval with | MkPair first past =>
+    andb(ltb_nat first past, leb_nat past total)
+  end;
+
+def original_map_validate (mapping : OriginalSourceMap)
+    : Either SourceOriginError OriginalSourceMap :=
+  match mapping with | OriginalSourceMapOf totals regions => match totals with
+  | MkPair input_total output_total =>
+      (fix go (remaining : List OriginalRegion) (position : Nat) (original_start : Nat)
+          : Either SourceOriginError OriginalSourceMap :=
+        match remaining with
+        | Nil => match eqNat position output_total with
+          | True => Right SourceOriginError OriginalSourceMap mapping
+          | False => Left SourceOriginError OriginalSourceMap SourceOriginCoverage
+          end
+        | Cons region rest => match region with | OriginalRegionOf output source =>
+          match output with | MkPair first past =>
+            match original_interval_valid output_total output with
+            | False => Left SourceOriginError OriginalSourceMap SourceOriginBounds
+            | True => match eqNat first position with
+              | False => Left SourceOriginError OriginalSourceMap SourceOriginCoverage
+              | True => match source with
+                | OriginalUnknown => go rest past original_start
+                | OriginalCopy input => match input with | MkPair start finish =>
+                  match andb(original_interval_valid input_total input, leb_nat original_start start) with
+                  | False => Left SourceOriginError OriginalSourceMap SourceOriginBounds
+                  | True => match eqNat (sub finish start) (sub past first) with
+                    | False => Left SourceOriginError OriginalSourceMap SourceOriginCopyWidth
+                    | True => go rest past start
+                    end
+                  end end
+                | OriginalParent envelope => match envelope with | OriginalEnvelopeOf input _ =>
+                  match input with | MkPair start _ =>
+                  match andb(original_interval_valid input_total input, leb_nat original_start start) with
+                  | False => Left SourceOriginError OriginalSourceMap SourceOriginBounds
+                  | True => go rest past start
+                  end end end
+                end
+              end
+            end
+          end end
+        end) regions 0 0
+  end end;
+
+def original_identity (total : Nat) : OriginalSourceMap :=
+  OriginalSourceMapOf (MkPair Nat Nat total total)
+    (match total with
+     | Z => []
+     | S _ => [OriginalRegionOf (MkPair Nat Nat 0 total)
+         (OriginalCopy (MkPair Nat Nat 0 total))]
+     end);
+
+-- Only replacement boundaries retained by the real emitter become parents.
+-- Other emitter branches copy bytes; their gaps must have the same width.
+def original_capture_finish (capture : OriginalCapture) (input : List Nat)
+    (output : List Nat) : Either SourceOriginError (Maybe OriginalSourceMap) :=
+  match capture with
+  | OriginalCaptureDisabled => Right SourceOriginError (Maybe OriginalSourceMap)
+      (Nothing OriginalSourceMap)
+  | OriginalCaptureChanges changes =>
+      let input_total : Nat := length Nat input in
+      let output_total : Nat := length Nat output in
+      (fix go (remaining : List OriginalChange) (input_position : Nat)
+          (output_position : Nat) (regions : List OriginalRegion)
+          : Either SourceOriginError (Maybe OriginalSourceMap) :=
+        match remaining with
+        | Nil => match eqNat (sub input_total input_position)
+              (sub output_total output_position) with
+          | False => Left SourceOriginError (Maybe OriginalSourceMap) SourceOriginCopyWidth
+          | True =>
+              let complete : List OriginalRegion := match eqNat output_position output_total with
+                | True => regions
+                | False => Cons OriginalRegion
+                    (OriginalRegionOf (MkPair Nat Nat output_position output_total)
+                      (OriginalCopy (MkPair Nat Nat input_position input_total))) regions
+                end in
+              match original_map_validate
+                  (OriginalSourceMapOf (MkPair Nat Nat input_total output_total)
+                    (reverse OriginalRegion complete)) with
+              | Left error => Left SourceOriginError (Maybe OriginalSourceMap) error
+              | Right mapping => Right SourceOriginError (Maybe OriginalSourceMap)
+                  (Just OriginalSourceMap mapping)
+              end
+          end
+        | Cons change rest => match change with | OriginalChangeOf inputs tagged =>
+          match inputs with | MkPair before after => match tagged with | MkPair outputs generated =>
+            match outputs with | MkPair output_before output_after =>
+              let before_length : Nat := length Nat before in
+              let after_length : Nat := length Nat after in
+              let start : Nat := sub input_total before_length in
+              let finish : Nat := sub input_total after_length in
+              let emitted_start : Nat := length Nat output_before in
+              let emitted_finish : Nat := length Nat output_after in
+              match andb(leb_nat before_length input_total,
+                    andb(leb_nat after_length before_length,
+                      andb(leb_nat input_position start,
+                        andb(leb_nat output_position emitted_start,
+                          andb(leb_nat emitted_finish output_total,
+                            andb(ltb_nat start finish, ltb_nat emitted_start emitted_finish)))))) with
+              | False => Left SourceOriginError (Maybe OriginalSourceMap) SourceOriginBounds
+              | True => match eqNat (sub start input_position) (sub emitted_start output_position) with
+                | False => Left SourceOriginError (Maybe OriginalSourceMap) SourceOriginCopyWidth
+                | True =>
+                    let copied : List OriginalRegion := match eqNat output_position emitted_start with
+                      | True => regions
+                      | False => Cons OriginalRegion
+                          (OriginalRegionOf (MkPair Nat Nat output_position emitted_start)
+                            (OriginalCopy (MkPair Nat Nat input_position start))) regions
+                      end in
+                    go rest finish emitted_finish
+                      (Cons OriginalRegion
+                        (OriginalRegionOf (MkPair Nat Nat emitted_start emitted_finish)
+                          (OriginalParent (OriginalEnvelopeOf (MkPair Nat Nat start finish) generated))) copied)
+                end
+              end
+            end end end end
+        end) (reverse OriginalChange changes) 0 0 []
+  end;
+
+def original_envelope_merge (left : Maybe OriginalEnvelope) (right : OriginalEnvelope)
+    : Maybe OriginalEnvelope :=
+  match left with
+  | Nothing => Just OriginalEnvelope right
+  | Just prior => match prior with | OriginalEnvelopeOf first generated_first =>
+    match right with | OriginalEnvelopeOf second generated_second =>
+      match first with | MkPair start past => match second with | MkPair next finish =>
+        match andb(leb_nat start next, leb_nat next past) with
+        | False => Nothing OriginalEnvelope
+        | True => Just OriginalEnvelope
+            (OriginalEnvelopeOf (MkPair Nat Nat start (maxNat past finish))
+              (orb generated_first generated_second))
+        end
+      end end end end
+  end;
+
+def original_region_part (region : OriginalRegion) (start : Nat) (past : Nat)
+    : Maybe OriginalEnvelope :=
+  match region with | OriginalRegionOf output source => match output with | MkPair first _ =>
+    match source with
+    | OriginalUnknown => Nothing OriginalEnvelope
+    | OriginalParent envelope => Just OriginalEnvelope envelope
+    | OriginalCopy input => match input with | MkPair origin _ =>
+      Just OriginalEnvelope
+        (OriginalEnvelopeOf
+          (MkPair Nat Nat (add origin (sub start first)) (add origin (sub past first))) False)
+      end
+    end
+  end end;
+
+-- Missing ownership is valid absence; an invalid map is a separate refusal.
+def original_map_cover (mapping : OriginalSourceMap) (interval : Pair Nat Nat)
+    : Either SourceOriginError (Maybe OriginalEnvelope) :=
+  match original_map_validate mapping with
+  | Left error => Left SourceOriginError (Maybe OriginalEnvelope) error
+  | Right checked => match checked with | OriginalSourceMapOf totals regions =>
+    match totals with | MkPair _ total =>
+      match original_interval_valid total interval with
+      | False => Left SourceOriginError (Maybe OriginalEnvelope) SourceOriginBounds
+      | True => match interval with | MkPair start past =>
+        (fix go (remaining : List OriginalRegion) (position : Nat)
+            (envelope : Maybe OriginalEnvelope) : Either SourceOriginError (Maybe OriginalEnvelope) :=
+          match eqNat position past with
+          | True => Right SourceOriginError (Maybe OriginalEnvelope) envelope
+          | False => match remaining with
+            | Nil => Left SourceOriginError (Maybe OriginalEnvelope) SourceOriginCoverage
+            | Cons region rest => match region with | OriginalRegionOf output _ =>
+              match output with | MkPair first finish =>
+                match leb_nat finish position with
+                | True => go rest position envelope
+                | False => match leb_nat first position with
+                  | False => Left SourceOriginError (Maybe OriginalEnvelope) SourceOriginCoverage
+                  | True =>
+                      let next : Nat := minNat finish past in
+                      match original_region_part region position next with
+                      | Nothing => Right SourceOriginError (Maybe OriginalEnvelope) (Nothing OriginalEnvelope)
+                      | Just part => match original_envelope_merge envelope part with
+                        | Nothing => Right SourceOriginError (Maybe OriginalEnvelope) (Nothing OriginalEnvelope)
+                        | Just merged => go rest next (Just OriginalEnvelope merged)
+                        end
+                      end
+                  end
+                end
+              end end
+            end
+          end) regions start (Nothing OriginalEnvelope)
+        end
+      end
+    end end
+  end;
+
+def original_map_compose (before : OriginalSourceMap) (after : OriginalSourceMap)
+    : Either SourceOriginError OriginalSourceMap :=
+  match original_map_validate before with
+  | Left error => Left SourceOriginError OriginalSourceMap error
+  | Right prior => match original_map_validate after with
+    | Left error => Left SourceOriginError OriginalSourceMap error
+    | Right later => match prior with | OriginalSourceMapOf first_totals first_regions =>
+      match later with | OriginalSourceMapOf second_totals second_regions =>
+        match first_totals with | MkPair original_total intermediate =>
+          match second_totals with | MkPair expected final_total =>
+            match eqNat intermediate expected with
+            | False => Left SourceOriginError OriginalSourceMap SourceOriginCoverage
+            | True =>
+                (fix go (remaining : List OriginalRegion) (result : List OriginalRegion)
+                    : Either SourceOriginError OriginalSourceMap :=
+                  match remaining with
+                  | Nil => original_map_validate
+                      (OriginalSourceMapOf (MkPair Nat Nat original_total final_total)
+                        (reverse OriginalRegion result))
+                  | Cons region rest => match region with | OriginalRegionOf output source =>
+                    match source with
+                    | OriginalUnknown => go rest (Cons OriginalRegion region result)
+                    | OriginalParent envelope => match envelope with | OriginalEnvelopeOf input generated =>
+                      match original_map_cover prior input with
+                      | Left error => Left SourceOriginError OriginalSourceMap error
+                      | Right origin =>
+                          let composed : OriginalRegionSource := match origin with
+                            | Nothing => OriginalUnknown
+                            | Just parent => match parent with | OriginalEnvelopeOf span inherited =>
+                              OriginalParent (OriginalEnvelopeOf span (orb generated inherited))
+                              end
+                            end in
+                          go rest (Cons OriginalRegion (OriginalRegionOf output composed) result)
+                      end end
+                    | OriginalCopy input => match input with | MkPair start past =>
+                      match output with | MkPair first _ =>
+                        let pieces : List OriginalRegion :=
+                          (fix split (regions : List OriginalRegion) : List OriginalRegion :=
+                            match regions with
+                            | Nil => []
+                            | Cons previous tail => match previous with | OriginalRegionOf extent origin =>
+                              match extent with | MkPair left right =>
+                                let opening : Nat := maxNat start left in
+                                let closing : Nat := minNat past right in
+                                match ltb_nat opening closing with
+                                | False => split tail
+                                | True =>
+                                    let target : Pair Nat Nat := MkPair Nat Nat
+                                      (add first (sub opening start)) (add first (sub closing start)) in
+                                    let mapped : OriginalRegionSource := match origin with
+                                      | OriginalUnknown => OriginalUnknown
+                                      | OriginalParent parent => OriginalParent parent
+                                      | OriginalCopy original => match original with | MkPair base _ =>
+                                        OriginalCopy (MkPair Nat Nat
+                                          (add base (sub opening left)) (add base (sub closing left)))
+                                        end
+                                      end in
+                                    Cons OriginalRegion (OriginalRegionOf target mapped) (split tail)
+                                end
+                              end end
+                            end) first_regions in
+                        go rest (append OriginalRegion (reverse OriginalRegion pieces) result)
+                      end end
+                    end
+                  end
+                end) second_regions []
+            end
+          end end
+        end end
+    end
+  end;
+
+def parsed_source_group (ordinal : Nat) (first : Nat) (past : Nat) (decls : List Decl)
+    : List ParsedSourceOccurrence :=
+  (fix go (remaining : List Decl) (index : Nat) : List ParsedSourceOccurrence :=
+    match remaining with
+    | Nil => []
+    | Cons decl rest => Cons ParsedSourceOccurrence
+        (ParsedSourceOccurrenceOf decl (MkPair Nat (Pair Nat Nat) index (MkPair Nat Nat first past)))
+        (go rest (S index))
+    end) decls ordinal;
+
+def original_envelope_span (envelope : OriginalEnvelope) : Pair Nat Nat :=
+  match envelope with | OriginalEnvelopeOf span _ => span end;

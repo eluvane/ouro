@@ -1,5 +1,5 @@
 -- Analysis unit on the real frontend: preprocess_imports_reg -> preprocess_records_reg
--- -> lex_all_import -> parse_file -> expr_adapt. Cores see one shared Ast per
+-- -> import-aware lexer -> parse_file -> expr_adapt. Cores see one shared Ast per
 -- definition plus the lexer intern table, capability ids, constructor/owner
 -- pairs, definition lines, the comment block above each definition, and the
 -- comment-derived marks (public names, taint policy, loose blocks). Imports
@@ -13,16 +13,20 @@
 -- @entry layer_of_path
 
 import "../../std/data.ouro",
+  "../../std/collections.ouro",
   "../../std/listx.ouro",
   "../../std/string_prims.ouro",
   "../../compiler/pipeline_abi.ouro",
   "../../compiler/base.ouro",
   "../../compiler/lexer.ouro",
+  "../../compiler/lexer_intern.ouro",
+  "../../compiler/source_name_index.ouro",
   "../../compiler/parser.ouro",
   "../../compiler/parser_file.ouro",
   "../../compiler/parser_parse.ouro",
   "../../compiler/preprocess_import.ouro",
   "../../compiler/preprocess_record.ouro",
+  "../quality/order.ouro",
   "ast.ouro",
   "policy_ids.ouro",
   "expr_adapt.ouro";
@@ -109,23 +113,15 @@ def types_lines (t : UnitTypes) : List (Pair Nat Nat) :=
 
 -- Source line of an inductive; Z when unknown.
 def types_line_of (t : UnitTypes) (ind : Nat) : Nat :=
-    match lookup Nat Nat eqNat ind (types_lines t) with
-    | Just line => line
-    | Nothing => Z
-    end;
+    lookup Nat Nat eqNat ind (types_lines t) ?? Z;
 
 def unit_name_codes (st : InternState) (id : Nat) : List Nat :=
   (fix go (xs : List (Pair (List Nat) Nat)) : List Nat :=
     match xs with
     | Nil => Nil Nat
     | Cons p rest =>
-        match p with
-        | MkPair codes n =>
-            match eqNat n id with
-            | True => codes
-            | False => go rest
-            end
-        end
+        let (MkPair codes n) := p in
+        if eqNat n id then codes else go rest
     end) (unit_intern_ids st);
 
 def unit_name (st : InternState) (id : Nat) : String :=
@@ -133,20 +129,23 @@ def unit_name (st : InternState) (id : Nat) : String :=
 
 -- Z when the name never occurs in the unit; lexer ids start at 1, so Z
 -- matches no variable.
-def unit_id_of (st : InternState) (name : String) : Nat :=
-    match source_lookup_id(unit_intern_ids st, prim_string_to_char_codes name) with
-    | Just n => n
-    | Nothing => Z
-    end;
+def unit_id_of_with (lookup_name : List Nat -> Maybe Nat) (name : String) : Nat :=
+    lookup_name (prim_string_to_char_codes name) ?? Z;
 
-def unit_ids_of (st : InternState) (names : List String) : List Nat :=
+def unit_id_of (st : InternState) (name : String) : Nat :=
+    unit_id_of_with (source_lookup_id (unit_intern_ids st)) name;
+
+def unit_ids_of_with (lookup_name : List Nat -> Maybe Nat) (names : List String) : List Nat :=
   foldl String (List Nat)
     (fun (acc : List Nat) (name : String) =>
-      match source_lookup_id(unit_intern_ids st, prim_string_to_char_codes name) with
+      match lookup_name (prim_string_to_char_codes name) with
       | Nothing => acc
       | Just n => Cons Nat n acc
       end)
     (Nil Nat) names;
+
+def unit_ids_of (st : InternState) (names : List String) : List Nat :=
+    unit_ids_of_with (source_lookup_id (unit_intern_ids st)) names;
 
 def fs_prim_names : List String :=
   [ "prim_fs_read_file", "prim_fs_write_file", "prim_fs_exists",
@@ -155,17 +154,17 @@ def fs_prim_names : List String :=
     "prim_fs_is_dir", "prim_fs_list_dir", "prim_fs_mkdir", "prim_fs_remove",
     "prim_fs_copy_file", "prim_fs_rename", "prim_fs_replace_file" ];
 
-def proc_prim_names : List String := [ "prim_proc_exec", "prim_process_capture", "prim_process_capture_bounded", "prim_process_inherit" ];
+def proc_prim_names : List String := [ "prim_proc_exec", "prim_process_capture", "prim_process_capture_bounded", "prim_process_capture_bounded_at", "prim_process_inherit" ];
 
 def http_prim_names : List String := [ "prim_http_post", "prim_http_request" ];
 
 -- Runtime sources and sinks supplement each unit's source/sink annotations.
 def taint_source_prims : List String :=
   [ "prim_argv", "prim_env_get", "prim_stdin_read_line", "prim_stdin_read_bytes"
-  , "prim_fs_read_file", "prim_process_capture", "prim_process_capture_bounded", "prim_process_inherit", "prim_http_request" ];
+  , "prim_fs_read_file", "prim_process_capture", "prim_process_capture_bounded", "prim_process_capture_bounded_at", "prim_process_inherit", "prim_http_request" ];
 
 def taint_sink_prims : List String :=
-  [ "prim_proc_exec", "prim_process_capture", "prim_process_capture_bounded", "prim_process_inherit", "prim_http_post", "prim_http_request"
+  [ "prim_proc_exec", "prim_process_capture", "prim_process_capture_bounded", "prim_process_capture_bounded_at", "prim_process_inherit", "prim_http_post", "prim_http_request"
   , "prim_fs_write_file", "prim_fs_remove", "prim_fs_mkdir", "prim_fs_copy_file"
   , "prim_fs_rename", "prim_fs_replace_file" ];
 
@@ -183,16 +182,11 @@ def unit_is_upper (c : Nat) : Bool :=
 def unit_ctor_like_ids (st : InternState) : List Nat :=
   foldl (Pair(List Nat, Nat)) (List Nat)
     (fun (acc : List Nat) (p : Pair (List Nat) Nat) =>
-      match p with
-      | MkPair codes n =>
-          match codes with
-          | Nil => acc
-          | Cons c _ =>
-              match unit_is_upper c with
-              | True => Cons Nat n acc
-              | False => acc
-              end
-          end
+      let (MkPair codes n) := p in
+      match codes with
+      | Nil => acc
+      | Cons c _ =>
+          if unit_is_upper c then Cons Nat n acc else acc
       end)
     (Nil Nat) (unit_intern_ids st);
 
@@ -202,122 +196,74 @@ def unit_ch_underscore : Nat := 95;
 def unit_discard_ids (st : InternState) : List Nat :=
   foldl (Pair(List Nat, Nat)) (List Nat)
     (fun (acc : List Nat) (p : Pair (List Nat) Nat) =>
-      match p with
-      | MkPair codes n =>
-          match codes with
-          | Nil => acc
-          | Cons c _ =>
-              match eqNat c unit_ch_underscore with
-              | True => Cons Nat n acc
-              | False => acc
-              end
-          end
+      let (MkPair codes n) := p in
+      match codes with
+      | Nil => acc
+      | Cons c _ =>
+          if eqNat c unit_ch_underscore then Cons Nat n acc else acc
       end)
     (Nil Nat) (unit_intern_ids st);
 
 -- Anonymous `_` binders are id Z in the parser, so the underscore slot is Z.
-def unit_cap_ids (st : InternState) : CapIds :=
-    MkCap Z (unit_id_of st "pure") (unit_ids_of st proc_prim_names)
-      (unit_ids_of st http_prim_names) (unit_ids_of st fs_prim_names)
-      (unit_ids_of st host_fast_names) (unit_id_of st "IO")
-      (unit_ids_of st kernel_names);
+def unit_cap_ids_with (lookup_name : List Nat -> Maybe Nat) : CapIds :=
+    MkCap Z (unit_id_of_with lookup_name "pure") (unit_ids_of_with lookup_name proc_prim_names)
+      (unit_ids_of_with lookup_name http_prim_names) (unit_ids_of_with lookup_name fs_prim_names)
+      (unit_ids_of_with lookup_name host_fast_names) (unit_id_of_with lookup_name "IO")
+      (unit_ids_of_with lookup_name kernel_names);
 
 def unit_ctor_pairs (ds : List Decl) : List (Pair Nat Nat) :=
   concat_map Decl (Pair Nat Nat)
     (fun (d : Decl) =>
-      match d with
-      | DInductive ind _ _ cs _ =>
-          map (Pair Nat Expr) (Pair Nat Nat)
-            (fun (c : Pair Nat Expr) =>
-              match c with
-              | MkPair ctor _ => MkPair Nat Nat ctor ind
-              end) cs
-      | DDef _ _ _ _ _ => Nil (Pair Nat Nat)
-      | DAxiom _ _ => Nil (Pair Nat Nat)
-      | DEffect _ _ _ => Nil (Pair Nat Nat)
-      | DImport _ => Nil (Pair Nat Nat)
-      | DIntrinsic _ _ _ _ => Nil (Pair Nat Nat)
-      | DExtern _ _ _ => Nil (Pair Nat Nat)
-      | DRepresentation _ _ => Nil (Pair Nat Nat)
-      end) ds;
+      if let DInductive ind _ _ cs _ := d then
+        map (Pair Nat Expr) (Pair Nat Nat)
+          (fun (c : Pair Nat Expr) =>
+            let (MkPair ctor _) := c in
+            MkPair Nat Nat ctor ind) cs
+      else Nil (Pair Nat Nat)) ds;
 
 -- Constructors of inductives whose arity after the parameters is a Pi: the
 -- indices are what a match on them refines.
 def unit_dependent_ctors (ds : List Decl) : List Nat :=
   concat_map Decl Nat
     (fun (d : Decl) =>
-      match d with
-      | DInductive _ _ arity cs _ =>
-          match ast_is(tag_pi, adapt arity) with
-          | False => Nil Nat
-          | True =>
-              map (Pair Nat Expr) Nat
-                (fun (c : Pair Nat Expr) => match c with | MkPair ctor _ => ctor end)
-                cs
-          end
-      | DDef _ _ _ _ _ => Nil Nat
-      | DAxiom _ _ => Nil Nat
-      | DEffect _ _ _ => Nil Nat
-      | DImport _ => Nil Nat
-      | DIntrinsic _ _ _ _ => Nil Nat
-      | DExtern _ _ _ => Nil Nat
-      | DRepresentation _ _ => Nil Nat
-      end) ds;
+      if let DInductive _ _ arity cs _ := d then
+        if ast_is(tag_pi, adapt arity) then
+          map (Pair Nat Expr) Nat
+            (fun (c : Pair Nat Expr) => match c with | MkPair ctor _ => ctor end)
+            cs
+        else Nil Nat
+      else Nil Nat) ds;
 
 def unit_uninhabited (ds : List Decl) : List Nat :=
   concat_map Decl Nat
     (fun (d : Decl) =>
-      match d with
-      | DInductive ind _ _ cs _ =>
-          match cs with
-          | Nil => ([ind] : List Nat)
-          | Cons _ _ => Nil Nat
-          end
-      | DDef _ _ _ _ _ => Nil Nat
-      | DAxiom _ _ => Nil Nat
-      | DEffect _ _ _ => Nil Nat
-      | DImport _ => Nil Nat
-      | DIntrinsic _ _ _ _ => Nil Nat
-      | DExtern _ _ _ => Nil Nat
-      | DRepresentation _ _ => Nil Nat
-      end) ds;
-
--- Line of the inductive spelt `codes`; Z when the scan saw none.
-def unit_inductive_line (codes : List Nat) : List (Pair (List Nat) Nat) -> Nat :=
-  fix go (xs : List (Pair (List Nat) Nat)) : Nat :=
-    match xs with
-    | Nil => Z
-    | Cons p rest =>
-        match p with
-        | MkPair name line =>
-            match source_bytes_equal name codes with
-            | True => line
-            | False => go rest
-            end
+      if let DInductive ind _ _ cs _ := d then
+        match cs with
+        | Nil => ([ind] : List Nat)
+        | Cons _ _ => Nil Nat
         end
-    end;
+      else Nil Nat) ds;
 
-def unit_inductive_lines (st : InternState) (inds : List (Pair (List Nat) Nat))
-    (ds : List Decl) : List (Pair Nat Nat) :=
+private def unit_inductive_lines_with (line_at : Nat -> Nat) (ds : List Decl) : List (Pair Nat Nat) :=
   concat_map Decl (Pair Nat Nat)
     (fun (d : Decl) =>
-      match d with
-      | DInductive ind _ _ _ _ =>
-          ([MkPair Nat Nat ind (unit_inductive_line(unit_name_codes st ind, inds))]
-            : List (Pair Nat Nat))
-      | DDef _ _ _ _ _ => Nil (Pair Nat Nat)
-      | DAxiom _ _ => Nil (Pair Nat Nat)
-      | DEffect _ _ _ => Nil (Pair Nat Nat)
-      | DImport _ => Nil (Pair Nat Nat)
-      | DIntrinsic _ _ _ _ => Nil (Pair Nat Nat)
-      | DExtern _ _ _ => Nil (Pair Nat Nat)
-      | DRepresentation _ _ => Nil (Pair Nat Nat)
-      end) ds;
+      if let DInductive ind _ _ _ _ := d then
+        ([MkPair Nat Nat ind (line_at ind)] : List (Pair Nat Nat))
+      else Nil (Pair Nat Nat)) ds;
 
-def unit_types (st : InternState) (inds : List (Pair (List Nat) Nat)) (ds : List Decl)
-    : UnitTypes :=
-    MkUnitTypes (unit_ctor_pairs ds) (unit_dependent_ctors ds) (unit_uninhabited ds)
-      (unit_inductive_lines st inds ds);
+private def unit_inductive_line_lookup (lookup_name : List Nat -> Maybe Nat)
+    (lines : List (Pair (List Nat) Nat)) : Nat -> Nat :=
+    let index : SourceNameIndex := foldl (Pair (List Nat) Nat) SourceNameIndex
+      (fun (entries : SourceNameIndex) (row : Pair (List Nat) Nat) =>
+        let (MkPair name line) := row in
+        match lookup_name name with
+        | Nothing => entries
+        | Just id => source_name_index_insert [id] line entries
+        end) SourceNameIndexEmpty lines in
+    fun (id : Nat) => source_name_index_lookup [id] index ?? Z;
+
+private def unit_types_with_lines (ds : List Decl) (lines : List (Pair Nat Nat)) : UnitTypes :=
+    MkUnitTypes (unit_ctor_pairs ds) (unit_dependent_ctors ds) (unit_uninhabited ds) lines;
 
 def unit_is_blank (c : Nat) : Bool :=
     orb(eqNat c ch_space, orb(eqNat c ch_tab, eqNat c ch_cr));
@@ -331,10 +277,8 @@ def unit_split_lines (src : List Nat) : List (List Nat) :=
           | Cons _ _ => Cons(List Nat, reverse Nat line_rev, Nil (List Nat))
           end
       | Cons c rest =>
-          match eqNat c ch_lf with
-          | True => Cons(List Nat, reverse Nat line_rev, scan(rest, Nil Nat))
-          | False => scan(rest, Cons Nat c line_rev)
-          end
+          if eqNat c ch_lf then Cons(List Nat, reverse Nat line_rev, scan(rest, Nil Nat))
+          else scan(rest, Cons Nat c line_rev)
       end) src (Nil Nat);
 
 -- Keyword followed by whitespace.
@@ -358,19 +302,18 @@ def unit_kw_def : List Nat := [100, 101, 102];
 def unit_kw_private : List Nat := [112, 114, 105, 118, 97, 116, 101];
 
 def unit_declaration_start (text : List Nat) : List Nat :=
-    match unit_starts_kw unit_kw_private text with
-    | True => drop_while Nat unit_is_blank
+    if unit_starts_kw unit_kw_private text then
+      drop_while Nat unit_is_blank
         (drop Nat (length Nat unit_kw_private) text)
-    | False => text
-    end;
+    else text;
 
 def unit_kw_inductive : List Nat := [105, 110, 100, 117, 99, 116, 105, 118, 101];
 
 -- Identifier after the keyword and the blanks that follow it.
 def unit_name_after (kw : List Nat) (t : List Nat) : List Nat :=
-    match span Nat source_is_ident_char (drop_while Nat unit_is_blank (drop Nat (length Nat kw) t)) with
-    | MkPair name _ => name
-    end;
+    let (MkPair name _) :=
+      span Nat source_is_ident_char (drop_while Nat unit_is_blank (drop Nat (length Nat kw) t)) in
+    name;
 
 def unit_is_comment (xs : List Nat) : Bool :=
     match xs with
@@ -404,31 +347,25 @@ def unit_scan_lines (src : List Nat) : UnitScan :=
     | Cons raw rest =>
         let t : List Nat := drop_while Nat unit_is_blank raw in
         let declaration : List Nat := unit_declaration_start t in
-        match unit_is_comment t with
-        | True =>
-            go rest (S line) (Cons(Pair Nat String, unit_comment_note line t, block))
-              defs loose inds
-        | False =>
-            match unit_starts_kw unit_kw_def declaration with
-            | False =>
-                let inds2 : List (Pair (List Nat) Nat) :=
-                  match unit_starts_kw unit_kw_inductive declaration with
-                  | True =>
-                      Cons (Pair(List Nat, Nat))
-                        (MkPair(List Nat, Nat, unit_name_after unit_kw_inductive declaration, line))
-                        inds
-                  | False => inds
-                  end in
-                go rest (S line) (Nil (Pair Nat String)) defs
-                  (append (Pair Nat String) block loose) inds2
-            | True =>
-                go rest (S line) (Nil (Pair Nat String))
-                  (Cons DefLine
-                    (MkDefLine (unit_name_after unit_kw_def declaration) line
-                      (reverse(Pair Nat String, block))) defs)
-                  loose inds
-            end
-        end
+        if unit_is_comment t then
+          go rest (S line) (Cons(Pair Nat String, unit_comment_note line t, block))
+            defs loose inds
+        else
+          if unit_starts_kw unit_kw_def declaration then
+            go rest (S line) (Nil (Pair Nat String))
+              (Cons DefLine
+                (MkDefLine (unit_name_after unit_kw_def declaration) line
+                  (reverse(Pair Nat String, block))) defs)
+              loose inds
+          else
+            let inds2 : List (Pair (List Nat) Nat) :=
+              if unit_starts_kw unit_kw_inductive declaration then
+                Cons (Pair(List Nat, Nat))
+                  (MkPair(List Nat, Nat, unit_name_after unit_kw_inductive declaration, line))
+                  inds
+              else inds in
+            go rest (S line) (Nil (Pair Nat String)) defs
+              (append (Pair Nat String) block loose) inds2
     end) (unit_split_lines (source_mask_literals src)) (S Z)
       (Nil (Pair Nat String)) (Nil DefLine)
     (Nil (Pair Nat String)) (Nil (Pair(List Nat, Nat)));
@@ -442,39 +379,69 @@ def unit_scan_loose (s : UnitScan) : List (Pair Nat String) :=
 def unit_scan_inductives (s : UnitScan) : List (Pair (List Nat) Nat) :=
     match s with | MkUnitScan _ _ inds => inds end;
 
-def unit_find_def_line (codes : List Nat) : List DefLine -> DefLine :=
-  fix go (xs : List DefLine) : DefLine :=
-    match xs with
-    | Nil => MkDefLine codes Z (Nil (Pair Nat String))
-    | Cons d rest =>
-        match d with
-        | MkDefLine name _ _ =>
-            match source_bytes_equal name codes with
-            | True => d
-            | False => go rest
-            end
-        end
-    end;
-
-def unit_defs (st : InternState) (lines : List DefLine) (ds : List Decl)
+private def unit_defs_with (line_at : Nat -> DefLine) (ds : List Decl)
     : List UnitDef :=
   concat_map Decl UnitDef
     (fun (d : Decl) =>
-      match d with
-      | DDef n ty body _ _ =>
-          match unit_find_def_line(unit_name_codes st n, lines) with
-          | MkDefLine _ line notes =>
-              ([MkUnitDef n line notes (AAscribe(adapt body, adapt ty))]
-                : List UnitDef)
-          end
-      | DAxiom _ _ => Nil UnitDef
-      | DInductive _ _ _ _ _ => Nil UnitDef
-      | DEffect _ _ _ => Nil UnitDef
-      | DImport _ => Nil UnitDef
-      | DIntrinsic _ _ _ _ => Nil UnitDef
-      | DExtern _ _ _ => Nil UnitDef
-      | DRepresentation _ _ => Nil UnitDef
-      end) ds;
+      if let DDef n ty body _ _ := d then
+        let (MkDefLine _ line notes) := line_at n in
+        ([MkUnitDef n line notes (AAscribe(adapt body, adapt ty))]
+          : List UnitDef)
+      else Nil UnitDef) ds;
+
+private inductive UnitDefLineIndex : Type :=
+  | UnitDefLineEmpty : UnitDefLineIndex
+  | UnitDefLineNode : Nat -> DefLine -> UnitDefLineIndex -> UnitDefLineIndex -> UnitDefLineIndex;
+
+private def unit_def_line_index_take
+    : Nat -> Nat -> List (Pair Nat DefLine) -> Pair UnitDefLineIndex (List (Pair Nat DefLine)) :=
+  fix take_rows (fuel : Nat) (count : Nat) (rows : List (Pair Nat DefLine))
+      : Pair UnitDefLineIndex (List (Pair Nat DefLine)) :=
+    match fuel with
+    | Z => MkPair UnitDefLineIndex (List (Pair Nat DefLine)) UnitDefLineEmpty rows
+    | S remaining => match count with
+      | Z => MkPair UnitDefLineIndex (List (Pair Nat DefLine)) UnitDefLineEmpty rows
+      | S children =>
+        let left_count : Nat := div_nat children 2 in
+        let (MkPair left rest) := take_rows remaining left_count rows in
+        match rest with
+        | Nil => MkPair UnitDefLineIndex (List (Pair Nat DefLine)) left rest
+        | Cons row more =>
+            let (MkPair id line) := row in
+            let (MkPair right tail) := take_rows remaining (sub children left_count) more in
+            MkPair UnitDefLineIndex (List (Pair Nat DefLine)) (UnitDefLineNode id line left right) tail
+        end
+      end
+    end;
+
+-- The sort keeps equal IDs in source order. Look left to keep the first line and its notes.
+private def unit_def_line_at (name : Nat) : UnitDefLineIndex -> DefLine -> DefLine :=
+  fix find (index : UnitDefLineIndex) (found : DefLine) : DefLine :=
+    match index with
+    | UnitDefLineEmpty => found
+    | UnitDefLineNode id line left right => match compareNat name id with
+      | EQ => find left line
+      | LT => find left found
+      | GT => find right found
+      end
+    end;
+
+private def unit_def_line_lookup (lookup_name : List Nat -> Maybe Nat) (lines : List DefLine)
+    : Nat -> DefLine :=
+    let rows : List (Pair Nat DefLine) := filter_map DefLine (Pair Nat DefLine)
+      (fun (line : DefLine) => match line with | MkDefLine name _ _ =>
+        match lookup_name name with
+        | Nothing => Nothing (Pair Nat DefLine)
+        | Just id => Just (Pair Nat DefLine) (MkPair Nat DefLine id line)
+        end
+      end) lines in
+    let ordered : List (Pair Nat DefLine) := quality_sort (Pair Nat DefLine)
+      (fun (left : Pair Nat DefLine) (right : Pair Nat DefLine) =>
+        leb_nat (fst Nat DefLine left) (fst Nat DefLine right)) rows in
+    let count : Nat := length (Pair Nat DefLine) ordered in
+    let (MkPair index _) := unit_def_line_index_take (S count) count ordered in
+    let missing : DefLine := MkDefLine [] Z [] in
+    fun (name : Nat) => unit_def_line_at name index missing;
 
 -- Key is a prefix of the codes.
 def unit_has_prefix : List Nat -> List Nat -> Bool :=
@@ -484,7 +451,7 @@ def unit_has_prefix : List Nat -> List Nat -> Bool :=
     | Cons k key' =>
         match xs with
         | Nil => False
-        | Cons c xs' => andb(eqNat k c, unit_has_prefix key' xs')
+        | Cons c xs' => if eqNat k c then unit_has_prefix key' xs' else False
         end
     end;
 
@@ -494,41 +461,42 @@ def unit_after_key (key : List Nat) : List Nat -> Maybe (List Nat) :=
     match cs with
     | Nil => Nothing (List Nat)
     | Cons _ rest =>
-        match unit_has_prefix key cs with
-        | True => Just(List Nat, drop Nat (length Nat key) cs)
-        | False => go rest
-        end
+        if unit_has_prefix key cs then Just(List Nat, drop Nat (length Nat key) cs) else go rest
     end;
 
 -- The identifier following `key` in a comment; blanks between them allowed.
 def unit_marked_name (key : List Nat) (note : Pair Nat String) : List (List Nat) :=
-    match note with
-    | MkPair _ text =>
-        match unit_after_key(key, prim_string_to_char_codes text) with
-        | Nothing => Nil (List Nat)
-        | Just rest =>
-            match span Nat source_is_ident_char (drop_while Nat unit_is_blank rest) with
-            | MkPair name _ =>
-                match name with
-                | Nil => Nil (List Nat)
-                | Cons _ _ => Cons(List Nat, name, Nil (List Nat))
-                end
-            end
+    let (MkPair _ text) := note in
+    match unit_after_key(key, prim_string_to_char_codes text) with
+    | Nothing => Nil (List Nat)
+    | Just rest =>
+        let (MkPair name _) := span Nat source_is_ident_char (drop_while Nat unit_is_blank rest) in
+        match name with
+        | Nil => Nil (List Nat)
+        | Cons _ _ => Cons(List Nat, name, Nil (List Nat))
         end
     end;
 
 -- Intern ids of the names marked by `key` anywhere in the comments; names
 -- the unit never mentions have no id and are dropped.
-def unit_marked_ids (st : InternState) (key : String) (notes : List (Pair Nat String))
-    : List Nat :=
+def unit_marked_ids_with (lookup_name : List Nat -> Maybe Nat) (key : String)
+    (notes : List (Pair Nat String)) : List Nat :=
+  let key_codes : List Nat := prim_string_to_char_codes key in
   concat_map (List Nat) Nat
     (fun (name : List Nat) =>
-      match source_lookup_id(unit_intern_ids st, name) with
+      match lookup_name name with
       | Nothing => Nil Nat
       | Just n => ([n] : List Nat)
       end)
     (concat_map (Pair Nat String) (List Nat)
-      (unit_marked_name (prim_string_to_char_codes key)) notes);
+      (fun (note : Pair Nat String) =>
+        let (MkPair _ text) := note in
+        if prim_string_contains text key then unit_marked_name key_codes note
+        else Nil (List Nat)) notes);
+
+def unit_marked_ids (st : InternState) (key : String) (notes : List (Pair Nat String))
+    : List Nat :=
+    unit_marked_ids_with (source_lookup_id (unit_intern_ids st)) key notes;
 
 def unit_all_notes (s : UnitScan) : List (Pair Nat String) :=
     append (Pair Nat String)
@@ -540,31 +508,27 @@ def unit_all_notes (s : UnitScan) : List (Pair Nat String) :=
 def unit_effect_ops (ds : List Decl) : List Nat :=
   concat_map Decl Nat
     (fun (d : Decl) =>
-      match d with
-      | DEffect _ _ ops =>
-          map (Pair Nat Expr) Nat
-            (fun (op : Pair Nat Expr) => match op with | MkPair n _ => n end) ops
-      | DDef _ _ _ _ _ => Nil Nat
-      | DAxiom _ _ => Nil Nat
-      | DInductive _ _ _ _ _ => Nil Nat
-      | DImport _ => Nil Nat
-      | DIntrinsic _ _ _ _ => Nil Nat
-      | DExtern _ _ _ => Nil Nat
-      | DRepresentation _ _ => Nil Nat
-      end) ds;
+      if let DEffect _ _ ops := d then
+        map (Pair Nat Expr) Nat
+          (fun (op : Pair Nat Expr) => match op with | MkPair n _ => n end) ops
+      else Nil Nat) ds;
 
 -- `@entry NAME` and `@export NAME` name the public definitions;
 -- `ouro-analyze:source=NAME`, `sink=NAME`, `secret=NAME` name taint policy.
-def unit_marks (st : InternState) (s : UnitScan) (ds : List Decl) : UnitMarks :=
+def unit_marks_with (lookup_name : List Nat -> Maybe Nat) (s : UnitScan)
+    (ds : List Decl) : UnitMarks :=
     let notes : List (Pair Nat String) := unit_all_notes s in
     MkUnitMarks
-      (append Nat (unit_marked_ids st "@entry" notes)
-        (unit_marked_ids st "@export" notes))
-      (unit_marked_ids st "ouro-analyze:source=" notes)
-      (unit_marked_ids st "ouro-analyze:sink=" notes)
-      (unit_marked_ids st "ouro-analyze:secret=" notes)
+      (append Nat (unit_marked_ids_with lookup_name "@entry" notes)
+        (unit_marked_ids_with lookup_name "@export" notes))
+      (unit_marked_ids_with lookup_name "ouro-analyze:source=" notes)
+      (unit_marked_ids_with lookup_name "ouro-analyze:sink=" notes)
+      (unit_marked_ids_with lookup_name "ouro-analyze:secret=" notes)
       (unit_effect_ops ds)
       (unit_scan_loose s);
+
+def unit_marks (st : InternState) (s : UnitScan) (ds : List Decl) : UnitMarks :=
+    unit_marks_with (source_lookup_id (unit_intern_ids st)) s ds;
 
 -- Extra parse steps only: fuel is a Peano value copied through parser
 -- closures, so it must stay close to the source length.
@@ -572,37 +536,41 @@ def unit_fuel (n : Nat) : Nat := add(n, mul 64 16);
 
 def unit_parse (fuel : Nat) (codes : List Nat) (expanded : List Nat)
     : AnalysisUnit :=
-    match lex_all_import fuel expanded with
-    | LexMalformed _ => UnitRejected "lex-malformed"
-    | LexExhausted _ => UnitRejected "lex-exhausted"
-    | LexOk toks st =>
+    match lex_go_carried_with next_import_token_indexed fuel expanded
+      (lexer_intern_from empty_intern) (Nil Token) with
+    | IndexedLexMalformed _ => UnitRejected "lex-malformed"
+    | IndexedLexExhausted _ => UnitRejected "lex-exhausted"
+    | IndexedLexOk toks indexed =>
         match parse_file parse fuel toks Z with
         | PErr _ => UnitRejected "parse-fail"
         | POk ds _ _ =>
+            let (LexerInternOf st identifiers _) := indexed in
             let scan : UnitScan := unit_scan_lines codes in
-            MkAnalysisUnit st (unit_cap_ids st) (unit_types st (unit_scan_inductives scan) ds)
-              (unit_marks st scan ds) (unit_defs st (unit_scan_defs scan) ds)
+            let lookup_name (name : List Nat) : Maybe Nat := source_name_index_lookup name identifiers in
+            let def_line_at : Nat -> DefLine := unit_def_line_lookup lookup_name (unit_scan_defs scan) in
+            let type_line_at : Nat -> Nat := unit_inductive_line_lookup lookup_name (unit_scan_inductives scan) in
+            let types : UnitTypes := unit_types_with_lines ds (unit_inductive_lines_with type_line_at ds) in
+            MkAnalysisUnit st (unit_cap_ids_with lookup_name) types
+              (unit_marks_with lookup_name scan ds) (unit_defs_with def_line_at ds)
         end
     end;
 
 def unit_of_source (src : String) : AnalysisUnit :=
     let codes : List Nat := prim_string_to_char_codes src in
-    match preprocess_imports_reg empty_imp_reg codes with
-    | MkPair aliases imported => match imported with
-      | ImpErr _ _ => UnitRejected "preprocess-import"
-      | ImpOk prepared =>
-          match preprocess_records_reg (Nil Nat) aliases
-              empty_rec_reg prepared with
-          | MkPair _ tagged => match tagged with
-            | MkPair _ result => match result with
-              | PrepErr _ _ => UnitRejected "preprocess-record"
-              | PrepOk expanded =>
-                  unit_parse (unit_fuel (prim_string_length src)) codes expanded
-              end
-            end
-          end
+    let (MkPair aliases imported) := preprocess_imports_reg empty_imp_reg codes in
+    match imported with
+    | ImpErr _ _ => UnitRejected "preprocess-import"
+    | ImpOk prepared =>
+        let (MkPair _ tagged) :=
+          preprocess_records_reg (Nil Nat) aliases
+            empty_rec_reg prepared in
+        let (MkPair _ result) := tagged in
+        match result with
+        | PrepErr _ _ => UnitRejected "preprocess-record"
+        | PrepOk expanded =>
+            unit_parse (unit_fuel (prim_string_length src)) codes expanded
         end
-    end;
+      end;
 
 def layer_of_path (p : String) : Layer :=
     match prim_string_contains p "compiler/kernel.ouro" with
@@ -614,44 +582,38 @@ def layer_of_path (p : String) : Layer :=
             match orb (prim_string_contains p "tools/analyze/")
               (prim_string_contains p "tests/analyze/") with
             | True =>
-                -- These two executable entry points own host IO; sibling
-                -- modules remain pure analyzer policy.
-                match orb (prim_string_eq p "tools/analyze/main.ouro")
-                  (prim_string_eq p "tools/analyze/drive_main.ouro") with
-                | True => LyTools
-                | False => LyAnalyze
-                end
+                -- Only these exact analyzer paths own host IO. Policy and
+                -- similarly named files retain the pure analyzer layer.
+                if
+                  elem String prim_string_eq p
+                  [ "tools/analyze/main.ouro", "tools/analyze/drive_main.ouro"
+                  , "tools/analyze/native_main.ouro", "tools/analyze/native_request.ouro"
+                  , "tools/analyze/native_workspace.ouro", "tools/analyze/native_composition.ouro"
+                  , "tools/analyze/native_base_executor.ouro", "tools/analyze/native_drive_executor.ouro"
+                  , "tools/analyze/native_executor.ouro" ] then
+                  LyTools
+                else LyAnalyze
             | False =>
-                match prim_string_eq p "std/http.ouro" with
-                | True => LyStdHttp
-                | False =>
-                    match orb (orb (prim_string_eq p "std/runtime.ouro")
-                        (prim_string_eq p "std/process.ouro"))
-                      (orb (prim_string_contains p "std/io.ouro")
-                        (orb (prim_string_contains p "std/fs.ouro")
-                          (orb (prim_string_contains p "std/fs_walk.ouro")
-                            (prim_string_eq p "std/fs_replace.ouro")))) with
-                    | True => LyStdIo
-                    | False =>
-                        match orb (prim_string_contains p "std/word.ouro")
-                          (prim_string_contains p "std/crypto.ouro") with
-                        | True => LyStdWord
-                        | False =>
-                            match prim_string_starts p "std/" with
-                            | True => LyStd
-                            | False =>
-                                match prim_string_starts p "tools/" with
-                                | True => LyTools
-                                | False =>
-                                    match prim_string_starts p "samples/" with
-                                    | True => LySamples
-                                    | False => LyOther
-                                    end
-                                end
-                            end
-                        end
-                    end
-                end
+                if prim_string_eq p "std/http.ouro" then LyStdHttp
+                else
+                  if
+                    orb (orb (prim_string_eq p "std/runtime.ouro")
+                      (prim_string_eq p "std/process.ouro"))
+                    (orb (prim_string_contains p "std/io.ouro")
+                      (orb (prim_string_contains p "std/fs.ouro")
+                        (orb (prim_string_contains p "std/fs_walk.ouro")
+                          (prim_string_eq p "std/fs_replace.ouro")))) then
+                    LyStdIo
+                  else
+                    if
+                      orb (prim_string_contains p "std/word.ouro")
+                      (prim_string_contains p "std/crypto.ouro") then
+                      LyStdWord
+                    else
+                      if prim_string_starts p "std/" then LyStd
+                      else
+                        if prim_string_starts p "tools/" then LyTools
+                        else if prim_string_starts p "samples/" then LySamples else LyOther
             end
         end
     end;

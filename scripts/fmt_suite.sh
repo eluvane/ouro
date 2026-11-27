@@ -19,15 +19,24 @@ if ! command -v "$CC_BIN" >/dev/null 2>&1; then
 fi
 
 FMT="$OUT/ouro-fmt"
-# Native selftest modes must not resolve a stale Python host shim from an older run.
-rm -f "$FMT" "$FMT.exe"
+# The native builder resolves the destination before installing the image.
+for image in "$FMT" "$FMT.exe"; do
+	if [ -L "$image" ]; then
+		rm -f "$image"
+	fi
+done
 if ! OURO_BUILD_TOOL_MODE=native sh "$ROOT/scripts/build_tool.sh" tools/fmt.ouro "$FMT" >"$OUT/build.log" 2>&1; then
 	echo "FMT_SUITE: FAIL build" >&2
 	tail -n 20 "$OUT/build.log" >&2
 	exit 1
 fi
 
-if [ -f "$FMT.exe" ]; then FMT="$FMT.exe"; fi
+fmt_suffix=$("$PYTHON" -c 'import os, sys; sys.stdout.write(".exe" if os.name == "nt" else "")')
+FMT="$FMT$fmt_suffix"
+if [ ! -x "$FMT" ]; then
+	printf 'FMT_SUITE: FAIL prepared native formatter unavailable: %s\n' "$FMT" >&2
+	exit 1
+fi
 printf '%s\n' 'def argument_value : Nat :=0;' >"$OUT/arguments.original"
 printf '%s\n' 'def argument_value : Nat := 0;' >"$OUT/arguments-clean.ouro"
 argument_refusal() {

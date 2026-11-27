@@ -1,0 +1,282 @@
+-- The lexer drops comments, so docs are scanned from source text before parsing.
+-- Only a contiguous comment run above a top-level declaration becomes public API docs.
+
+import "../../std/stringx.ouro",
+  "../../std/pathx.ouro",
+  "../../std/map.ouro";
+
+-- kind ("def"), name, signature up to `:=`, doc lines, 1-based source line.
+-- The line is what the editor integration jumps to; rendering ignores it.
+inductive Decl : Type :=
+  | MkDecl : String -> String -> String -> List String -> Nat -> Decl;
+
+def decl_kind (d : Decl) : String :=
+    let (MkDecl k _ _ _ _) := d in
+    k;
+
+def decl_name (d : Decl) : String :=
+    let (MkDecl _ n _ _ _) := d in
+    n;
+
+def decl_sig (d : Decl) : String :=
+    let (MkDecl _ _ s _ _) := d in
+    s;
+
+def decl_docs (d : Decl) : List String :=
+    let (MkDecl _ _ _ ds _) := d in
+    ds;
+
+def decl_line (d : Decl) : Nat :=
+    let (MkDecl _ _ _ _ n) := d in
+    n;
+
+-- module path, module-level doc lines, declarations in source order.
+inductive ModDoc : Type :=
+  | MkModDoc : String -> List String -> List Decl -> ModDoc;
+
+def mod_path (m : ModDoc) : String :=
+    let (MkModDoc p _ _) := m in
+    p;
+
+def mod_docs (m : ModDoc) : List String :=
+    let (MkModDoc _ ds _) := m in
+    ds;
+
+def mod_decls (m : ModDoc) : List Decl :=
+    let (MkModDoc _ _ xs) := m in
+    xs;
+
+def doc_kinds : List String :=
+    [ "def", "axiom", "inductive", "record", "effect", "intrinsic", "extern" ];
+
+private def doc_kind_prefixes : List (Pair String String) :=
+    map String (Pair String String)
+      (fun (kind : String) => MkPair String String kind (str_concat kind " ")) doc_kinds;
+
+-- A comment line is `--` at the start of the line; `-- @entry` and the like
+-- are markers for other tools, not prose.
+def doc_is_comment (line : String) : Bool :=
+    str_starts line "--";
+
+private def doc_content_start (line : String) (width : Nat) : Nat :=
+    (fix skip (remaining : Nat) (column : Nat) : Nat :=
+      match remaining with
+      | Z => column
+      | S rest =>
+          if is_ws (prim_string_byte_at line column) then skip rest (add 1 column)
+          else column
+      end) width Z;
+
+def doc_comment_text (line : String) : String :=
+    str_trim (str_drop line 2);
+
+private def doc_is_marker_text (text : String) : Bool :=
+    str_starts text "@";
+
+def doc_kind_at (line : String) : Maybe String :=
+    mapMaybe (Pair String String) String (fst String String)
+      (find (Pair String String)
+        (fun (entry : Pair String String) => str_starts line (snd String String entry))
+        doc_kind_prefixes);
+
+-- The declared name is what follows the keyword up to the first delimiter.
+def doc_name_stops : List String := [ " ", "(", ":", "{" ];
+
+def doc_first_stop (rest : String) : Nat :=
+    foldl String Nat
+      (fun (acc : Nat) (stop : String) =>
+        match str_index rest stop with
+        | Nothing => acc
+        | Just i => minNat acc i
+        end)
+      (str_len rest) doc_name_stops;
+
+def doc_name_of (line : String) (kind : String) : String :=
+    let rest : String := str_drop(line, S (str_len kind)) |> str_trim in
+    str_trim (str_take(rest, doc_first_stop rest));
+
+private def doc_signature_prefix (line : String) (assignment : Maybe Nat) : String :=
+    match assignment with
+    | Nothing => str_rtrim line
+    | Just column => str_rtrim (str_take line column)
+    end;
+
+private def doc_signature_head (line : String) (assignment : Maybe Nat) : String :=
+    let sig : String := doc_signature_prefix line assignment in
+    if str_ends sig ";" then str_rtrim (str_take(sig, sub(str_len sig, S Z))) else sig;
+
+-- The signature is the declaration up to `:=`, with the trailing `;` of a
+-- one-line body dropped.
+def doc_sig_of (line : String) : String :=
+    doc_signature_head line (str_index line ":=");
+
+-- The scanner keeps pending comments, the module header, declarations in
+-- reverse source order, and the number of the next line.
+inductive Scan : Type :=
+  | MkScan : List String -> Maybe (List String) -> List Decl -> Nat -> Scan;
+
+def scan_pending (s : Scan) : List String :=
+    let (MkScan p _ _ _) := s in
+    p;
+
+def scan_header (s : Scan) : Maybe (List String) :=
+    let (MkScan _ h _ _) := s in
+    h;
+
+def scan_decls_reversed (s : Scan) : List Decl :=
+    let (MkScan _ _ ds _) := s in
+    ds;
+
+def scan_decls (s : Scan) : List Decl :=
+    reverse_lin Decl (scan_decls_reversed s);
+
+-- 1-based number of the line about to be scanned.
+def scan_at (s : Scan) : Nat :=
+    let (MkScan _ _ _ n) := s in
+    n;
+
+def scan_empty : Scan :=
+    MkScan(Nil String, Nothing (List String), Nil Decl, S Z);
+
+def scan_add_doc (s : Scan) (text : String) : Scan :=
+    MkScan (snoc String (scan_pending s) text) (scan_header s) (scan_decls_reversed s)
+      (S (scan_at s));
+
+def scan_skip (s : Scan) : Scan :=
+    MkScan(Nil String, scan_header s, scan_decls_reversed s, S (scan_at s));
+
+-- A blank line closes the run. If nothing has been declared yet and no header
+-- was taken, that run was the module header.
+def scan_close (s : Scan) : Scan :=
+    match scan_header s with
+    | Just _ => scan_skip s
+    | Nothing =>
+        match scan_decls_reversed s with
+        | Nil =>
+            MkScan (Nil String) (Just(List String, scan_pending s))
+              (scan_decls_reversed s) (S (scan_at s))
+        | Cons _ _ => scan_skip s
+        end
+    end;
+
+-- A marker comment (`-- @entry`) stays in the file but does not join the
+-- pending prose run. Advance the line counter only.
+def scan_keep (s : Scan) : Scan :=
+    MkScan(scan_pending s, scan_header s, scan_decls_reversed s, S (scan_at s));
+
+def scan_comment (s : Scan) (line : String) : Scan :=
+    let text : String := doc_comment_text line in
+    if doc_is_marker_text text then scan_keep s else scan_add_doc s text;
+
+private def doc_signature_needs_tail (kind : String) (assignment : Maybe Nat) : Bool :=
+    match assignment with
+    | Nothing => orb (str_eq kind "def")
+        (orb (str_eq kind "intrinsic")
+          (orb (str_eq kind "extern") (str_eq kind "inductive")))
+    | Just _ => False
+    end;
+
+def doc_signature_tail (remaining : List String) (first : String) : String :=
+    (fix go (lines : List String) (signature : String) : String :=
+      match lines with
+      | Nil => signature
+      | Cons line rest =>
+          let width : Nat := str_len line in
+          let start : Nat := doc_content_start line width in
+          if eq_nat start width then signature
+          else
+            match doc_kind_at line with
+            | Just _ => signature
+            | Nothing =>
+                let comment : Bool := if eq_nat (prim_string_byte_at line start) ch_minus then
+                    eq_nat (prim_string_byte_at line (add 1 start)) ch_minus
+                  else False in
+                if comment then go rest signature
+                else
+                  let assignment : Maybe Nat := str_index line ":=" in
+                  let part : String := doc_signature_prefix line assignment in
+                  let next : String :=
+                    if str_null part then signature else str_cat3 signature "\n" part in
+                  match assignment with
+                  | Just _ => next
+                  | Nothing => go rest next
+                  end
+            end
+      end) remaining first;
+
+def scan_decl_line (s : Scan) (line : String) (kind : String)
+    (remaining : List String) : Scan :=
+    let assignment : Maybe Nat := str_index line ":=" in
+    let first : String := doc_signature_head line assignment in
+    let signature : String := if doc_signature_needs_tail kind assignment then
+        doc_signature_tail remaining first
+      else first in
+    MkScan (Nil String) (scan_header s)
+      (Cons Decl (MkDecl kind (doc_name_of line kind) signature (scan_pending s) (scan_at s))
+        (scan_decls_reversed s)) (S (scan_at s));
+
+def scan_line (s : Scan) (line : String) (remaining : List String) : Scan :=
+    if doc_is_comment line then scan_comment s line
+    else
+      let width : Nat := str_len line in
+      if eq_nat (doc_content_start line width) width then scan_close s
+      else
+        match doc_kind_at line with
+        | Just kind => scan_decl_line s line kind remaining
+        | Nothing => scan_skip s
+        end;
+
+-- Lines inspected for a signature still pass through the scanner for comments and positions.
+def doc_module (path : String) (text : String) : ModDoc :=
+    let s : Scan := (fix go (lines : List String) (state : Scan) : Scan :=
+      match lines with
+      | Nil => state
+      | Cons line rest => go rest (scan_line state line rest)
+      end) (str_lines text) scan_empty in
+    MkModDoc path (fromMaybe(List String, Nil String, scan_header s))
+      (scan_decls s);
+
+-- Rendering. One file per module, one section per declaration, signatures in
+-- fenced blocks so the Markdown stays readable in a plain editor too.
+def doc_section (d : Decl) : String :=
+    let head : String := str_cat4("## ", decl_kind d, " ", decl_name d) in
+    let body : String :=
+      str_cat3 "```ouro" (str_concat("\n", decl_sig d))
+        (str_concat "\n" "```") in
+    let prose : String := str_join(" ", decl_docs d) in
+    if str_null prose then str_cat3 head "\n\n" body
+    else str_cat4 head "\n\n" body (str_concat "\n\n" prose);
+
+def doc_render (m : ModDoc) : String :=
+    let head : String := str_concat("# ", mod_path m) in
+    let prose : String := str_join(" ", mod_docs m) in
+    let intro : String :=
+      if str_null prose then head else str_cat3 head "\n\n" prose in
+    str_cat4 intro "\n\n"
+      (str_cat3 "Declarations: " (prim_string_of_nat (length(Decl, mod_decls m))) ".")
+      (str_cat3 "\n\n"
+        (str_join("\n\n", map Decl String doc_section (mod_decls m))) "\n");
+
+-- Output paths: the module path with separators folded into underscores, so
+-- std/gate/share.ouro and std/share.ouro cannot collide.
+def doc_out_name (path : String) : String :=
+    -- A drive colon must not become an NTFS alternate-stream separator.
+    let portable : String := str_replace (path_from_host path) ":" "_" in
+    str_concat(str_replace (str_before portable ".ouro") "/" "_", ".md");
+
+def doc_index_name : String := "README.md";
+
+def doc_index_row (m : ModDoc) : String :=
+    let link : String :=
+      str_cat4("- [", mod_path m, "](", str_concat(doc_out_name (mod_path m), ")")) in
+    let count : Nat := length Decl (mod_decls m) in
+    str_cat4 link " — " (prim_string_of_nat count)
+      (if eq_nat count 1 then " declaration" else " declarations");
+
+def doc_index (ms : List ModDoc) : String :=
+    let head : String := "# Ouro standard library API" in
+    let intro : String :=
+      "Browse declaration signatures and source comments by module. `ouro doc` generates this reference from the standard library." in
+    str_cat4 head "\n\n"
+      (str_concat intro "\n\n")
+      (str_concat(str_join("\n", map ModDoc String doc_index_row ms), "\n"));

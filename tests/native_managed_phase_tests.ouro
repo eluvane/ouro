@@ -1,6 +1,10 @@
 -- Completed global work must preserve scheduling and typed failures.
 import "../compiler/native/managed_terms.ouro",
+  "../compiler/native/managed_source.ouro",
   "../compiler/driver.ouro",
+  "../std/word.ouro",
+  "native_word_checked_fixtures.ouro",
+  "native_nat_test_support.ouro",
   "compiler_startup_test_support.ouro";
 
 def managed_phase_force (work : Unit -> Either NativeLowerError ManagedState)
@@ -11,7 +15,7 @@ def managed_phase_abort (_ : Unit -> Either NativeLowerError ManagedState)
     Left NativeLowerError ManagedState (LowerUnknownGlobal 999);
 
 def managed_phase_state (pending : List Nat) : ManagedState :=
-    ManagedStateOf(77, [] : List MirFunction, [] : List MirData, pending, [10, 20], lower_empty_state 9);
+    ManagedStateOf(77, [] : List MirFunction, [] : List MirData, pending, [10, 20], lower_empty_state 9, NativeOriginsDisabled);
 
 def managed_phase_flow (flow : LowerState) : Bool :=
     match flow with | LowerStateOf local locals instructions blocks =>
@@ -20,7 +24,7 @@ def managed_phase_flow (flow : LowerState) : Bool :=
           current, next, length MirBlock finished] [9, 0, 0, 0, 1, 0] end end;
 
 def managed_phase_empty (state : ManagedState) : Bool :=
-    match state with | ManagedStateOf symbol functions data pending known flow =>
+    match state with | ManagedStateOf symbol functions data pending known flow _ =>
       andb (pe_bytes_equal [symbol, length MirFunction functions, length MirData data, length Nat pending] [77, 0, 0, 0])
         (andb(pe_bytes_equal known [10, 20], managed_phase_flow flow)) end;
 
@@ -57,8 +61,465 @@ def managed_phase_probe (mode : Nat) : String :=
                 (match ltb_nat mode 4 with | True => managed_phase_abort | False => managed_phase_force end)
                 compiler 500 (match eqNat mode 0 with | True => 0 | False => fuel end) state end end) end;
 
+-- Retain the pre-index raw traversal as an oracle for ordered data and fuel.
+def managed_reach_reference (entries : List Entry) (body_fuel : Nat)
+    : Nat -> List Nat -> List Nat -> Either NativeLowerError (List Nat) :=
+  fix visit (fuel : Nat) (pending : List Nat) (seen : List Nat) : Either NativeLowerError (List Nat) :=
+    match pending with | Nil => Right NativeLowerError (List Nat) seen
+    | Cons id rest => match fuel with | Z => Left NativeLowerError (List Nat) LowerResourceExhausted
+      | S next => match mir_has id seen with | True => visit next rest seen
+        | False => match lower_find_entry id entries with
+          | Nothing => visit next rest seen
+          | Just entry => let known : List Nat := Cons Nat id seen in
+            if let MkEntry _ _ body := (entry : Entry) then
+              match body with | Nothing => visit next rest known
+              | Just term => lower_bind (List Nat) (List Nat) (managed_core_globals body_fuel term)
+                  (fun (references : List Nat) => visit next (append Nat references rest) known) end
+            else visit next rest known end end end end;
+
+def managed_reach_resource (result : Either NativeLowerError (List Nat)) : Bool :=
+    match result with
+    | Right _ => False
+    | Left error => if let LowerResourceExhausted := (error : NativeLowerError) then True else False
+    end;
+
+def managed_reach_equal (left : Either NativeLowerError (List Nat))
+    (right : Either NativeLowerError (List Nat)) : Bool :=
+    match left with | Left _ => andb(managed_reach_resource left, managed_reach_resource right)
+    | Right ids => match right with | Left _ => False | Right other => pe_bytes_equal ids other end end;
+
+def managed_reach_equivalent (entries : List Entry) (body_fuel : Nat) (fuel : Nat)
+    (pending : List Nat) (seen : List Nat) : Bool :=
+    let reference : Either NativeLowerError (List Nat) := managed_reach_reference entries body_fuel fuel pending seen in
+    andb (managed_reach_equal(managed_raw_reachable entries body_fuel fuel pending seen, reference))
+      (managed_reach_equal(managed_raw_reachable_indexed (check_environment_from_entries entries)
+        body_fuel fuel pending seen, reference));
+
+def managed_reach_all_fuels (entries : List Entry) (pending : List Nat) (seen : List Nat) : Bool :=
+    all Nat (fun (body_fuel : Nat) => all Nat (fun (fuel : Nat) =>
+      managed_reach_equivalent entries body_fuel fuel pending seen) ([0, 1, 2, 3, 4, 5, 6, 7, 8] : List Nat))
+      ([0, 1, 2, 4] : List Nat);
+
+def managed_reach_graph : List Entry :=
+    [MkEntry(10, CSort 0, Just CoreTerm (CConst 20)),
+      MkEntry(20, CSort 0, Just CoreTerm (CApp(CConst 30, CConst 30))),
+      MkEntry(30, CSort 0, Nothing CoreTerm)];
+
+def managed_reach_cycle : List Entry :=
+    [MkEntry(10, CSort 0, Just CoreTerm (CConst 20)),
+      MkEntry(20, CSort 0, Just CoreTerm (CConst 10))];
+
+def managed_reach_duplicates : List Entry :=
+    [MkEntry(10, CSort 0, Nothing CoreTerm),
+      MkEntry(10, CSort 0, Just CoreTerm (CConst 90)), MkEntry(90, CSort 0, Nothing CoreTerm)];
+
+def managed_reach_reserved : List Entry :=
+    [MkRoleEntry (PrimitiveRoleOf PrimitiveNatRole (PrimitiveInductiveOf 13 0 0 (CSort 0) [])),
+      MkIndEntry 10 (MkIndDecl 10 [] [] 0 ([MkCtor 11 (CInd 10), MkCtor 12 (CInd 10)] : List Ctor)),
+      MkEntry(11, CSort 0, Just CoreTerm (CConst 20)), MkEntry(20, CSort 0, Nothing CoreTerm),
+      MkEntry(10, CSort 0, Just CoreTerm (CConst 99)), MkEntry(99, CSort 0, Nothing CoreTerm)];
+
+def managed_reach_binding : List Entry :=
+    [MkBoundEntry 50 (CSort 0)
+      (PrimitiveIntrinsicBinding PrimitiveU32Type PrimitiveTypeOnly PrimitiveNoGc (Nothing CoreTerm))];
+
+def managed_reach_raw_natural : Nat -> Nat -> Nat :=
+  fix raw (remaining : Nat) (accumulator : Nat) : Nat :=
+    match remaining with | Z => accumulator | S next => raw next (S accumulator) end;
+
+def managed_reach_numeric (_ : Unit) : Bool :=
+    let boundary : Nat := add(w32_of_bytes 255 255 255 255, 1) in
+    let wide : Nat := mul boundary boundary in
+    let packed : Nat := 128 in
+    let raw : Nat := managed_reach_raw_natural packed Z in
+    let entries : List Entry := [MkEntry(packed, CSort 0, Just CoreTerm (CConst wide)),
+      MkEntry(wide, CSort 0, Nothing CoreTerm), MkEntry(boundary, CSort 0, Nothing CoreTerm)] in
+    andb (managed_reach_all_fuels entries ([raw, boundary, packed] : List Nat) [])
+      (andb (managed_reach_equal(managed_raw_reachable entries 2 4 [raw, boundary, packed] [],
+          Right NativeLowerError (List Nat) [boundary, wide, raw]))
+        (managed_reach_equal(managed_raw_reachable entries 0 2 [packed, raw] [raw, raw, wide],
+          Right NativeLowerError (List Nat) [raw, raw, wide])));
+
+def managed_reach_checked_source (_ : Unit) : Bool :=
+    match compile_checked_source 1000 (prim_string_to_char_codes
+      "intrinsic Word : Type := \"ouro.u32\"; axiom dependency : Word; def selected : Word := dependency;") with
+    | CErr _ => False | COk program => match lower_recheck_program 1000 program with
+      | Left _ => False | Right checked => match managed_source_symbol checked (prim_string_to_char_codes "selected") with
+        | Left _ => False | Right entry => match managed_source_symbol checked (prim_string_to_char_codes "dependency") with
+          | Left _ => False | Right dependency =>
+            let entries : List Entry := checked_program_entries checked in
+            andb (managed_reach_all_fuels entries [entry] [])
+              (managed_reach_equal(managed_raw_reachable entries 2 2 [entry] [],
+                Right NativeLowerError (List Nat) [dependency, entry])) end end end end;
+
+def managed_reach_tests (_ : Unit) : List StartupTest :=
+    [startup_test_assert "raw and indexed reachability retain ordered references and duplicate fuel"
+      (managed_reach_all_fuels managed_reach_graph [10] []),
+      startup_test_assert "cyclic raw references retain the original visited order and fuel"
+        (managed_reach_all_fuels managed_reach_cycle [10] []),
+      startup_test_assert "self references terminate only after consuming the duplicate visit"
+        (managed_reach_all_fuels [MkEntry(10, CSort 0, Just CoreTerm (CConst 10))] [10] []),
+      startup_test_assert "first bodyless duplicate wins even when the later body cannot be traversed"
+        (andb (managed_reach_all_fuels managed_reach_duplicates [10] [])
+          (managed_reach_equal(managed_raw_reachable managed_reach_duplicates 0 1 [10] [],
+            Right NativeLowerError (List Nat) [10]))),
+      startup_test_assert "reversing duplicate declarations selects the first definition body"
+        (andb (managed_reach_all_fuels (reverse Entry managed_reach_duplicates) [10] [])
+          (managed_reach_equal(managed_raw_reachable (reverse Entry managed_reach_duplicates) 2 2 [10] [],
+            Right NativeLowerError (List Nat) [90, 10]))),
+      startup_test_assert "constructor reservations and role metadata do not shadow actual globals"
+        (andb (managed_reach_all_fuels managed_reach_reserved [12, 13, 10, 11, 12, 13] [])
+          (managed_reach_equal(managed_raw_reachable managed_reach_reserved 2 7 [12, 13, 10, 11, 12, 13] [],
+            Right NativeLowerError (List Nat) [20, 11, 10]))),
+      startup_test_assert "bound intrinsics remain reachable without inspecting a body"
+        (andb (managed_reach_all_fuels managed_reach_binding [50, 50] [])
+          (managed_reach_equal(managed_raw_reachable managed_reach_binding 0 2 [50, 50] [],
+            Right NativeLowerError (List Nat) [50]))),
+      startup_test_assert "initial seen retains duplicate and missing IDs in their complete order"
+        (andb (managed_reach_all_fuels managed_reach_cycle [10, 20, 77, 99] [99, 10, 99, 77])
+          (managed_reach_equal(managed_raw_reachable managed_reach_cycle 2 5 [10, 20, 77, 99] [99, 10, 99, 77],
+            Right NativeLowerError (List Nat) [20, 99, 10, 99, 77]))),
+      startup_test_assert "empty pending returns initial seen before either fuel refusal"
+        (andb (managed_reach_equivalent managed_reach_graph 0 0 [] [99, 10, 99])
+          (managed_reach_equal(managed_raw_reachable managed_reach_graph 0 0 [] [99, 10, 99],
+            Right NativeLowerError (List Nat) [99, 10, 99]))),
+      startup_test_assert "nonempty zero fuel refuses before missing-ID lookup"
+        (andb (managed_reach_equivalent [] 0 0 [99] [])
+          (managed_reach_resource (managed_raw_reachable [] 0 0 [99] []))),
+      startup_test_assert "missing globals skip body traversal and never enter seen"
+        (andb (managed_reach_all_fuels managed_reach_duplicates [77, 10, 77] [])
+          (managed_reach_equal(managed_raw_reachable [] 0 1 [77] [], Right NativeLowerError (List Nat) []))),
+      startup_test_assert "seen globals bypass body failure but duplicate visits still consume fuel"
+        (andb (managed_reach_equal(managed_raw_reachable managed_reach_graph 0 1 [10] [10],
+            Right NativeLowerError (List Nat) [10]))
+          (andb (managed_reach_resource (managed_raw_reachable managed_reach_graph 0 1 [10] []))
+            (managed_reach_resource (managed_raw_reachable managed_reach_duplicates 0 1 [10, 10] [])))),
+      startup_test_assert "ordered reference traversal preserves the exact successful fuel boundary"
+        (andb (managed_reach_resource (managed_raw_reachable managed_reach_graph 4 3 [10] []))
+          (managed_reach_equal(managed_raw_reachable managed_reach_graph 4 4 [10] [],
+            Right NativeLowerError (List Nat) [30, 20, 10]))),
+      startup_test_assert "wide and Peano-built IDs retain numeric membership and original payloads" (managed_reach_numeric MkUnit),
+      startup_test_assert "checked and strict-replayed source feeds the same raw and indexed traversal"
+        (managed_reach_checked_source MkUnit)];
+
+def managed_raw_selection_type (entry : Entry) : CoreTerm :=
+    match entry with | MkEntry _ typ _ => typ | MkBoundEntry _ typ _ => typ
+    | MkIndEntry _ _ => CSort 0 | MkRoleEntry _ => CSort 0 end;
+
+def managed_raw_selection_same (entries : List Entry) (ids : List Nat) : Bool :=
+    let selected : List Entry := managed_raw_entries entries ids in
+    let reference : List Entry := filter Entry (fun (entry : Entry) => mir_has(lower_entry_id entry, ids)) entries in
+    match lower_entries_equal 500 selected reference with
+    | Left _ => False
+    | Right _ => match lower_core_list_equal 500 0
+        (map Entry CoreTerm managed_raw_selection_type selected) (map Entry CoreTerm managed_raw_selection_type reference) with
+        | Left _ => False
+        | Right _ => match lower_bodies_equal 500 (lower_expected_bodies selected) (lower_expected_bodies reference) with
+            | Left _ => False | Right _ => True end end
+    end;
+
+def managed_raw_selection_numeric (_ : Unit) : Bool :=
+    let boundary : Nat := add(w32_of_bytes 255 255 255 255, 1) in
+    let wide : Nat := mul boundary boundary in
+    let raw : Nat := managed_reach_raw_natural 128 Z in
+    let entries : List Entry := [MkEntry(0, CSort 0, Just CoreTerm (CSort 0)),
+      MkEntry(128, CSort 1, Just CoreTerm (CSort 1)),
+      MkEntry(wide, CSort 2, Just CoreTerm (CSort 2)), MkEntry(boundary, CSort 3, Nothing CoreTerm)] in
+    andb (managed_raw_selection_same entries [raw, wide, raw, 0, S wide])
+      (managed_raw_selection_same (reverse Entry entries) [boundary, 128, wide, boundary]);
+
+def managed_raw_selection_tests (_ : Unit) : List StartupTest :=
+    [startup_test_assert "raw entry selection preserves empty inputs and missing IDs"
+       (andb(managed_raw_selection_same [] [0, 10, 10], managed_raw_selection_same managed_reach_graph [])),
+     startup_test_assert "raw entry selection preserves graph order and missing roots"
+       (managed_raw_selection_same managed_reach_graph [30, 99, 10, 30]),
+     startup_test_assert "raw entry selection retains duplicate declarations and their distinct bodies"
+       (andb (managed_raw_selection_same managed_reach_duplicates [10, 10])
+         (managed_raw_selection_same (reverse Entry managed_reach_duplicates) [90, 10, 90])),
+     startup_test_assert "raw entry selection preserves roles bindings and constructor declarations"
+       (managed_raw_selection_same (append Entry managed_reach_reserved managed_reach_binding) [13, 50, 11, 10]),
+     startup_test_assert "raw entry selection preserves zero Peano and wide numeric IDs"
+       (managed_raw_selection_numeric MkUnit)];
+
+-- Invalid duplicate lists exercise lookup only, never source acceptance or MIR publication.
+def managed_lookup_raw (entries : List Entry) : ManagedCompiler :=
+    nat_test_compiler (CheckedProgramOf empty_intern entries (lower_expected_bodies (reverse Entry entries)));
+
+def managed_lookup_body_as (expected : CoreTerm) (result : Either NativeLowerError CoreTerm) : Bool :=
+    match result with | Left _ => False | Right actual =>
+      match lower_core_equal 1000 0 expected actual with | Left _ => False | Right _ => True end end;
+
+def managed_lookup_error (A : Type) (kind : Nat) (id : Nat) (result : Either NativeLowerError A) : Bool :=
+    match result with | Right _ => False | Left error => match error with
+    | LowerResourceExhausted => eqNat kind 0
+    | LowerUnknownGlobal actual => andb(eqNat kind 1, eqNat id actual)
+    | LowerDeclarationFailure actual phase failure => andb (eqNat id actual)
+        (andb (match phase with | CheckDeclarationBody => True | CheckDeclarationPlan => False
+          | CheckDeclarationType => False | CheckInductiveDeclaration => False end)
+          (match failure with
+          | CheckMalformedCore fault => if let CheckUnknownConstructor family index := (fault : CheckCoreFault) then
+              andb(eqNat kind 2, andb(eqNat family id, eqNat index 1))
+            else False
+          | CheckTypeFailure fault => match fault with
+            | CheckTypeMismatch => eqNat kind 3 | CheckExpectedSort => False | CheckExpectedFunction => False
+            | CheckCaseMotive => False | CheckNonPositive => False | CheckNonTerminating => False | CheckUniverseBound => False end
+          | CheckReductionFailure _ => False | CheckResourceLimit => False | CheckUnsupported _ => False
+          | CheckCancelled => False | CheckInternalFailure _ => False | CheckPrimitiveFailure _ => False end))
+    | LowerUnsupportedType term => andb (eqNat kind 4)
+        (match lower_core_equal 1000 0 (CSort 0) term with | Left _ => False | Right _ => True end)
+    | LowerMetadataMismatch _ => False | LowerBodyMismatch _ => False | LowerUnsupportedTerm _ => False
+    | LowerUnsupportedPrimitive _ => False | LowerUnboundLocal _ => False | LowerInvalidCall _ => False
+    | LowerEffectMismatch => False | LowerInvalidEntry _ => False | LowerMirFailure _ => False | LowerBackendFailure _ => False end end;
+
+def managed_lookup_duplicates (_ : Unit) : Bool :=
+    let entries : List Entry := [MkEntry(7, CSort 0, Nothing CoreTerm), MkEntry(7, CSort 1, Just CoreTerm (CSort 0))] in
+    andb (managed_lookup_error CoreTerm 1 7 (managed_global_body (managed_lookup_raw entries) 0 7))
+      (andb (managed_lookup_error CoreTerm 1 7 (managed_global_body (managed_lookup_raw entries) 500 7))
+        (managed_lookup_body_as (CSort 0) (managed_global_body (managed_lookup_raw (reverse Entry entries)) 500 7)));
+
+def managed_lookup_bound_and_inductive (_ : Unit) : Bool :=
+    let definition : Entry := MkEntry(7, CSort 1, Just CoreTerm (CSort 0)) in
+    let bound : ManagedCompiler := managed_lookup_raw
+      [MkBoundEntry 7 (CSort 1) (PrimitiveIntrinsicBinding PrimitiveU32Type PrimitiveTypeOnly PrimitiveNoGc (Nothing CoreTerm)), definition] in
+    let family : ManagedCompiler := managed_lookup_raw [MkIndEntry 7 (MkIndDecl 7 [] [] 0 []), definition] in
+    andb (managed_lookup_error CoreTerm 1 7 (managed_global_body bound 0 7))
+      (andb (managed_lookup_error ManagedResult 0 7 (managed_global_expression bound 0 7 (CSort 0) (managed_phase_state [])))
+        (andb (managed_lookup_error CoreTerm 1 7 (managed_global_body family 0 7))
+          (managed_lookup_error ManagedResult 1 7 (managed_global_expression family 0 7 (CSort 0) (managed_phase_state [])))));
+
+def managed_lookup_reserved (_ : Unit) : Bool :=
+    let compiler : ManagedCompiler := managed_lookup_raw
+      [MkRoleEntry (PrimitiveRoleOf PrimitiveNatRole (PrimitiveInductiveOf 7 0 0 (CSort 0) [])),
+       MkIndEntry 10 (MkIndDecl 10 [] [] 0 ([MkCtor(7, CInd 10), MkCtor(11, CInd 10)] : List Ctor)),
+       MkEntry(7, CSort 1, Just CoreTerm (CSort 0))] in
+    andb (managed_lookup_body_as (CSort 0) (managed_global_body compiler 500 7))
+      (andb (managed_lookup_error ManagedResult 4 7 (managed_global_expression compiler 500 7 (CSort 0) (managed_phase_state [])))
+        (andb (managed_lookup_error CoreTerm 1 11 (managed_global_body compiler 0 11))
+          (managed_lookup_error ManagedResult 1 11 (managed_global_expression compiler 0 11 (CSort 0) (managed_phase_state [])))));
+
+def managed_lookup_numeric (_ : Unit) : Bool :=
+    let boundary : Nat := add(w32_of_bytes 255 255 255 255, 1) in
+    let wide : Nat := mul boundary boundary in
+    let raw : Nat := managed_reach_raw_natural 128 Z in
+    let compiler : ManagedCompiler := managed_lookup_raw
+      [MkEntry(wide, CSort 1, Just CoreTerm (CSort 0)), MkEntry(boundary, CSort 2, Just CoreTerm (CSort 1)),
+       MkEntry(128, CSort 1, Just CoreTerm (CSort 0))] in
+    andb (managed_lookup_body_as (CSort 0) (managed_global_body compiler 500 wide))
+      (andb (managed_lookup_body_as (CSort 1) (managed_global_body compiler 500 boundary))
+        (andb (managed_lookup_body_as (CSort 0) (managed_global_body compiler 500 raw))
+          (managed_lookup_error ManagedResult 1 (S wide)
+            (managed_global_expression compiler 0 (S wide) (CSort 0) (managed_phase_state [])))));
+
+def managed_lookup_failures (_ : Unit) : Bool :=
+    let malformed : ManagedCompiler := managed_lookup_raw
+      [MkEntry(7, CSort 1, Just CoreTerm (CConstruct 7 1 0)), MkEntry(7, CSort 1, Just CoreTerm (CSort 0))] in
+    andb (managed_lookup_error CoreTerm 2 7 (managed_global_body malformed 500 7))
+      (andb (managed_lookup_error CoreTerm 0 7 (managed_global_body malformed 0 7))
+        (managed_lookup_error CoreTerm 3 7
+          (managed_global_body (managed_lookup_raw [MkEntry(7, CSort 0, Just CoreTerm (CSort 0))]) 500 7)));
+
+def managed_lookup_checked_source (_ : Unit) : Bool :=
+    match compile_checked_source 1000 (prim_string_to_char_codes
+      "intrinsic Word : Type := \"ouro.u32\"; def identity (value : Word) : Word := value;") with
+    | CErr _ => False | COk program => match lower_recheck_program 1000 program with
+      | Left _ => False | Right checked => match managed_source_symbol checked (prim_string_to_char_codes "identity") with
+        | Left _ => False | Right id => match managed_source_symbol checked (prim_string_to_char_codes "Word") with
+          | Left _ => False | Right word =>
+            let compiler : ManagedCompiler := nat_test_compiler checked in
+            match managed_global_body compiler 1000 id with | Left _ => False | Right body =>
+              andb (managed_lookup_body_as (CLam(CConst word, CRel 0)) (Right NativeLowerError CoreTerm body))
+                (andb (managed_lookup_error CoreTerm 0 id (managed_global_body compiler 0 id))
+                  (match managed_global_expression compiler 1000 id body (managed_phase_state []) with
+                   | Left _ => False | Right lowered => match lowered with | ManagedResultOf value state => match state with
+                     | ManagedStateOf symbol functions data pending known _ _ =>
+                       andb (match value with | MirUse local => eqNat local 10 | MirBits _ _ => False end)
+                         (andb (pe_bytes_equal [symbol, length MirFunction functions, length MirData data, length Nat pending] [78, 1, 0, 0])
+                           (pe_bytes_equal known [10, 20])) end end end)) end end end end end;
+
+def managed_lookup_tests (_ : Unit) : List StartupTest :=
+    [startup_test_assert "global lookup retains the first bodyless duplicate and reverses with source order" (managed_lookup_duplicates MkUnit),
+     startup_test_assert "bound and inductive duplicates preserve body and expression fuel priority" (managed_lookup_bound_and_inductive MkUnit),
+     startup_test_assert "roles and constructor reservations never replace a standalone global" (managed_lookup_reserved MkUnit),
+     startup_test_assert "global lookup preserves wide and Peano-built IDs and exact missing payloads" (managed_lookup_numeric MkUnit),
+     startup_test_assert "global lookup retains exact close and check errors before erasure" (managed_lookup_failures MkUnit),
+     startup_test_assert "checked and strict-replayed identity retains its body and managed closure" (managed_lookup_checked_source MkUnit)];
+
+def managed_entry_index_same (entries : List Entry) (id : Nat) : Bool :=
+    let compiler : ManagedCompiler := managed_lookup_raw entries in
+    let environment : CheckEnvironment := managed_compiler_environment compiler in
+    match lower_entries_equal 500 entries (check_environment_entries environment) with
+    | Left _ => False | Right _ => match lower_find_entry id entries, check_environment_lookup id environment with
+      | Nothing, Nothing => True | Nothing, Just _ => False | Just _, Nothing => False
+      | Just expected, Just actual => match lower_entries_equal 500 [expected] [actual] with
+        | Left _ => False | Right _ => match lower_core_equal 500 id
+            (managed_raw_selection_type expected) (managed_raw_selection_type actual) with
+          | Left _ => False | Right _ => match lower_bodies_equal 500
+              (lower_expected_bodies [expected]) (lower_expected_bodies [actual]) with
+            | Left _ => False | Right _ => True end end end end end;
+
+def managed_entry_dispatch_rejected (kind : Nat) (result : Either NativeLowerError ManagedResult) : Bool :=
+    match result with | Right _ => False | Left error => match error with
+    | LowerUnsupportedTerm tag => andb(eqNat kind 1, eqNat tag 7)
+    | LowerUnsupportedPrimitive primitive => andb(eqNat kind 2, primitive_id_equal primitive PrimitiveU32Type)
+    | LowerResourceExhausted => False | LowerDeclarationFailure _ _ _ => False | LowerMetadataMismatch _ => False
+    | LowerBodyMismatch _ => False | LowerUnsupportedType _ => False | LowerUnknownGlobal _ => False
+    | LowerUnboundLocal _ => False | LowerInvalidCall _ => False | LowerEffectMismatch => False
+    | LowerInvalidEntry _ => False | LowerMirFailure _ => False | LowerBackendFailure _ => False end end;
+
+def managed_entry_dispatch_step (_ : ManagedScope) (_ : CoreTerm) (_ : ManagedState)
+    : Either NativeLowerError ManagedResult :=
+    Left NativeLowerError ManagedResult (LowerUnknownGlobal 9002);
+
+def managed_entry_dispatch_fallback (_ : Unit) : Either NativeLowerError ManagedResult :=
+    Right NativeLowerError ManagedResult (ManagedResultOf(MirUse 88, managed_phase_state []));
+
+def managed_entry_dispatch_plain (result : Either NativeLowerError ManagedResult) : Bool :=
+    match result with | Left _ => False | Right lowered => match lowered with | ManagedResultOf value state =>
+      andb (match value with | MirUse local => eqNat local 88 | MirBits _ _ => False end)
+        (managed_phase_empty state) end end;
+
+def managed_entry_dispatch_call (symbol : Nat) (instruction : MirInstruction) : Bool :=
+    if let MirCall gc destination target arguments := (instruction : MirInstruction) then
+      andb (match gc with | MirMayGc => True | MirNoGc => False end)
+        (andb (match destination with | Just local => eqNat local 9 | Nothing => False end)
+          (andb (match target with | MirDirect actual => eqNat actual symbol | MirIndirect _ _ => False end)
+            (match arguments with | Nil => True | Cons _ _ => False end)))
+    else False;
+
+def managed_entry_dispatch_called_in (entries : List Entry) (id : Nat) : Bool :=
+    let compiler : ManagedCompiler := managed_lookup_raw entries in
+    match managed_global_value compiler managed_entry_dispatch_step 0 id (managed_phase_state [8, 9]) with
+    | Left _ => False | Right lowered => match lowered with | ManagedResultOf value state => match state with
+      | ManagedStateOf symbol functions data pending known flow origins =>
+          andb (match value with | MirUse local => eqNat local 9 | MirBits _ _ => False end)
+            (andb (pe_bytes_equal [symbol, length MirFunction functions, length MirData data] [77, 0, 0])
+              (andb (pe_bytes_equal pending (match mir_has id [10, 20] with | True => [8, 9] | False => [id, 8, 9] end))
+                (andb (pe_bytes_equal known (match mir_has id [10, 20] with | True => [10, 20] | False => [id, 10, 20] end))
+                  (andb (match origins with | NativeOriginsDisabled => True | NativeOriginsEnabled _ _ => False end)
+                    (match flow with | LowerStateOf next locals instructions blocks =>
+                      andb (eqNat next 10)
+                        (andb (match locals with | Nil => False | Cons local rest => match local with | MirLocalDef name typ =>
+                          andb(eqNat name 9, andb(mir_type_equal typ MirManagedPtr,
+                            match rest with | Nil => True | Cons _ _ => False end)) end end)
+                          (andb (match instructions with | Nil => False | Cons instruction rest =>
+                            andb (managed_entry_dispatch_call (managed_global_symbol compiler id) instruction)
+                              (match rest with | Nil => True | Cons _ _ => False end) end)
+                            (match blocks with | LowerFlowOf current fresh finished =>
+                              pe_bytes_equal [current, fresh, length MirBlock finished] [0, 1, 0] end))) end))))) end end end;
+
+def managed_entry_dispatch_called (id : Nat) : Bool :=
+    managed_entry_dispatch_called_in [MkEntry(id, CSort 1, Just CoreTerm (CSort 0))] id;
+
+def managed_entry_dispatch_family_payload (entries : List Entry) : Bool :=
+    match check_environment_lookup 10 (managed_compiler_environment (managed_lookup_raw entries)) with
+    | Nothing => False | Just entry => match entry with
+      | MkEntry _ _ _ => False | MkBoundEntry _ _ _ => False | MkRoleEntry _ => False
+      | MkIndEntry id declaration => match declaration with | MkIndDecl family params indices sort constructors =>
+          andb (pe_bytes_equal [id, family, length Param params, length CoreTerm indices, sort] [10, 10, 0, 0, 0])
+            (match constructors with | Nil => False | Cons first rest => match rest with
+              | Nil => False | Cons last tail => match first, last with | MkCtor first_id first_type, MkCtor last_id last_type =>
+                andb (pe_bytes_equal [first_id, last_id, length Ctor tail] [7, 11, 0])
+                  (match lower_core_list_equal 500 0 [first_type, last_type] [CInd 10, CInd 10] with
+                   | Left _ => False | Right _ => True end) end end end) end end end;
+
+def managed_entry_dispatch_pair (entries : List Entry) (id : Nat) : Bool :=
+    let compiler : ManagedCompiler := managed_lookup_raw entries in
+    andb (managed_entry_index_same entries id)
+      (managed_entry_dispatch_plain (managed_spine_global compiler managed_entry_dispatch_step
+        ([] : List (Maybe MirValue)) 0
+        (MkPair Nat (List CoreTerm) id []) managed_entry_dispatch_fallback (managed_phase_state [])));
+
+def managed_entry_dispatch_bound (_ : Unit) : Bool :=
+    let bound : Entry := MkBoundEntry 7 (CSort 1)
+      (PrimitiveIntrinsicBinding PrimitiveU32Type PrimitiveTypeOnly PrimitiveNoGc (Nothing CoreTerm)) in
+    let bodyless : Entry := MkEntry(7, CSort 0, Nothing CoreTerm) in
+    let definition : Entry := MkEntry(7, CSort 1, Just CoreTerm (CSort 0)) in
+    let compiler : ManagedCompiler := managed_lookup_raw [bodyless, bound] in
+    let reversed : ManagedCompiler := managed_lookup_raw [bound, bodyless] in
+    andb (managed_lookup_error ManagedResult 1 7
+      (managed_global_value compiler managed_entry_dispatch_step 0 7 (managed_phase_state [])))
+      (andb (managed_entry_dispatch_pair [bodyless, bound] 7)
+        (andb (managed_entry_dispatch_rejected 2
+          (managed_global_value reversed managed_entry_dispatch_step 0 7 (managed_phase_state [])))
+          (andb (managed_entry_index_same [bound, bodyless] 7)
+            (andb (managed_entry_dispatch_rejected 2 (managed_spine_global reversed managed_entry_dispatch_step
+              ([] : List (Maybe MirValue)) 0
+              (MkPair Nat (List CoreTerm) 7 []) managed_entry_dispatch_fallback (managed_phase_state [])))
+              (andb (managed_entry_index_same [bodyless, definition] 7)
+                (andb (managed_entry_dispatch_pair [definition, bodyless] 7)
+                  (managed_entry_dispatch_called_in [definition, bodyless] 7)))))));
+
+def managed_entry_dispatch_reserved (_ : Unit) : Bool :=
+    let entries : List Entry :=
+      [MkRoleEntry (PrimitiveRoleOf PrimitiveNatRole (PrimitiveInductiveOf 7 0 0 (CSort 0) [])),
+       MkIndEntry 10 (MkIndDecl 10 [] [] 0 ([MkCtor(7, CInd 10), MkCtor(11, CInd 10)] : List Ctor)),
+       MkEntry(7, CSort 1, Just CoreTerm (CSort 0)), MkEntry(7, CSort 2, Just CoreTerm (CSort 1))] in
+    all (List Entry) (fun (ordered : List Entry) =>
+      let compiler : ManagedCompiler := managed_lookup_raw ordered in
+      andb (managed_entry_dispatch_pair ordered 7)
+        (andb (managed_entry_dispatch_called_in ordered 7)
+          (andb (managed_entry_dispatch_family_payload ordered)
+            (andb (managed_entry_index_same ordered 10)
+          (andb (managed_entry_dispatch_rejected 1
+            (managed_global_value compiler managed_entry_dispatch_step 0 10 (managed_phase_state [])))
+            (andb (managed_lookup_error ManagedResult 1 11
+              (managed_global_value compiler managed_entry_dispatch_step 0 11 (managed_phase_state [])))
+              (managed_lookup_error ManagedResult 1 11 (managed_spine_global compiler managed_entry_dispatch_step
+                ([] : List (Maybe MirValue)) 0
+                (MkPair Nat (List CoreTerm) 11 []) managed_entry_dispatch_fallback (managed_phase_state [])))))))))
+      [entries, reverse Entry entries];
+
+def managed_entry_dispatch_missing (_ : Unit) : Bool :=
+    let compiler : ManagedCompiler := managed_lookup_raw
+      [MkRoleEntry (PrimitiveRoleOf PrimitiveNatRole (PrimitiveInductiveOf 7 0 0 (CSort 0) []))] in
+    all Nat (fun (fuel : Nat) => andb (managed_lookup_error ManagedResult 1 7
+        (managed_global_value compiler managed_entry_dispatch_step fuel 7 (managed_phase_state [])))
+      (managed_lookup_error ManagedResult 1 7 (managed_spine_global compiler managed_entry_dispatch_step
+        ([] : List (Maybe MirValue)) fuel
+        (MkPair Nat (List CoreTerm) 7 []) managed_entry_dispatch_fallback (managed_phase_state [])))) [0, 4];
+
+def managed_entry_dispatch_rename (_ : Unit) : Bool :=
+    let compiler : ManagedCompiler := managed_lookup_raw [MkBoundEntry 7 (CSort 0)
+      (PrimitiveIntrinsicBinding PrimitiveFileRename PrimitiveRuntimeAction PrimitiveMayGc (Nothing CoreTerm))] in
+    let step : ManagedStep := fun (scope : ManagedScope) (term : CoreTerm) (state : ManagedState) =>
+      Left NativeLowerError ManagedResult (LowerUnknownGlobal
+        (match lower_core_equal 500 0 term (CRel 0) with | Left _ => 9003 | Right _ =>
+          match andb(eqNat(length (Maybe MirValue) scope) 1, managed_phase_empty state) with
+          | True => 9002 | False => 9004 end end)) in
+    andb (managed_lookup_error ManagedResult 0 7
+      (managed_global_value compiler managed_entry_dispatch_step 0 7 (managed_phase_state [])))
+      (andb (managed_entry_dispatch_plain (managed_spine_global compiler step ([] : List (Maybe MirValue)) 0
+        (MkPair Nat (List CoreTerm) 7 [CRel 0]) managed_entry_dispatch_fallback (managed_phase_state [])))
+        (managed_lookup_error ManagedResult 1 9002 (managed_spine_global compiler step
+          ([Just MirValue (MirUse 42)] : List (Maybe MirValue)) 0
+          (MkPair Nat (List CoreTerm) 7 [CRel 0, CRel 1]) managed_entry_dispatch_fallback (managed_phase_state []))));
+
+def managed_entry_dispatch_numeric (_ : Unit) : Bool :=
+    let boundary : Nat := add(w32_of_bytes 255 255 255 255, 1) in
+    let wide : Nat := S (mul boundary boundary) in
+    let peano : Nat := managed_reach_raw_natural 128 Z in
+    let entries : List Entry := [MkEntry(128, CSort 1, Just CoreTerm (CSort 0)),
+      MkEntry(wide, CSort 2, Just CoreTerm (CSort 1))] in
+    let compiler : ManagedCompiler := managed_lookup_raw entries in
+    andb (all Nat managed_entry_dispatch_called [0, peano, wide, 10])
+      (andb (managed_entry_dispatch_pair entries peano)
+        (andb (managed_entry_dispatch_pair entries (add (mul boundary boundary) 1))
+          (all Nat (fun (missing : Nat) => andb (managed_lookup_error ManagedResult 1 missing
+              (managed_global_value compiler managed_entry_dispatch_step 0 missing (managed_phase_state [])))
+            (managed_lookup_error ManagedResult 1 missing (managed_spine_global compiler managed_entry_dispatch_step
+              ([] : List (Maybe MirValue)) 0
+              (MkPair Nat (List CoreTerm) missing []) managed_entry_dispatch_fallback (managed_phase_state [])))) [1, S wide])));
+
+def managed_entry_dispatch_tests (_ : Unit) : List StartupTest :=
+    [startup_test_assert "global value preserves exact call state and pending order at zero fuel" (managed_entry_dispatch_called 7),
+     startup_test_assert "bodyless and bound duplicates retain first selection in both dispatch callers" (managed_entry_dispatch_bound MkUnit),
+     startup_test_assert "roles and constructor reservations preserve actual payloads in both orders" (managed_entry_dispatch_reserved MkUnit),
+     startup_test_assert "missing role-only globals retain exact IDs before fallback and fuel" (managed_entry_dispatch_missing MkUnit),
+     startup_test_assert "partial fallback and saturated first-argument failure retain callback order" (managed_entry_dispatch_rename MkUnit),
+     startup_test_assert "both dispatch callers preserve Peano and wider-than-word ID payloads" (managed_entry_dispatch_numeric MkUnit)];
+
 def main : IO Unit :=
-    startup_test_run [
+    startup_test_run (append StartupTest [
       startup_test_eq "rename remains partial only below its two-argument boundary"
         (prim_string_concat
           (match managed_partial_string_application PrimitiveFileRename [] with | True => "1" | False => "0" end)
@@ -76,4 +537,8 @@ def main : IO Unit :=
       startup_test_eq "pending global exhausts fuel before invoking callback" (managed_phase_probe 2) "resource",
       startup_test_eq "callback failure is preserved before global body evaluation" (managed_phase_probe 3) "callback",
       startup_test_eq "forcing callback preserves first pending metadata failure" (managed_phase_probe 4) "first",
-      startup_test_eq "ordinary wrapper preserves first pending metadata failure" (managed_phase_probe 5) "first"];
+      startup_test_eq "ordinary wrapper preserves first pending metadata failure" (managed_phase_probe 5) "first"]
+      (append StartupTest (checked_word_tests MkUnit)
+        (append StartupTest (managed_reach_tests MkUnit)
+          (append StartupTest (managed_raw_selection_tests MkUnit)
+            (append StartupTest (managed_lookup_tests MkUnit) (managed_entry_dispatch_tests MkUnit))))));

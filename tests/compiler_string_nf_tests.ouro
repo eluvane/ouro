@@ -1,6 +1,7 @@
 -- Integration of authenticated String reductions, conversion and literal plans.
 import "compiler_string_nf_fixtures.ouro",
   "../std/test.ouro";
+import "compiler_wide_nat_fixtures.ouro";
 
 def string_nf_test_operations_laws : List Test :=
     [ assert_true "String concat preserves embedded NUL and byte 255"
@@ -283,9 +284,187 @@ def string_nf_test_unresolved_laws : List Test :=
         (string_nf_test_resolved_module CheckSourceCore string_nf_test_discarded_item)
     ];
 
+def string_nf_test_lookup_value (expected : CoreTerm)
+    (result : NormalizeResult (Maybe CoreTerm)) : Bool :=
+    if let Normalized value := result then
+      match value with
+        | Nothing => False | Just term => string_nf_test_core_equal term expected end
+    else False;
+
+def string_nf_test_lookup_neutral (result : NormalizeResult (Maybe CoreTerm)) : Bool :=
+    if let Normalized value := result then
+      match value with | Nothing => True | Just _ => False end
+    else False;
+
+def string_nf_test_lookup_exhausted (result : NormalizeResult (Maybe CoreTerm)) : Bool :=
+    match result with
+    | NormalizeExhausted => True | Normalized _ => False | NormalizeMalformed _ => False
+    end;
+
+def string_nf_test_lookup_pair (check : NormalizeResult (Maybe CoreTerm) -> Bool)
+    (reduce : CoreTerm -> NormalizeResult CoreTerm) (fuel : Nat) (entries : List Entry)
+    (head : CoreTerm) (arguments : List CoreTerm) (argument : CoreTerm) : Bool :=
+    andb (check (normalize_string_application reduce fuel entries head arguments argument))
+      (check (normalize_string_application reduce fuel
+        (string_application_lookup_entries (check_environment_from_entries entries) head)
+        head arguments argument));
+
+def string_nf_test_lookup_identity (term : CoreTerm) : NormalizeResult CoreTerm :=
+    Normalized CoreTerm term;
+
+def string_nf_test_lookup_reject (_term : CoreTerm) : NormalizeResult CoreTerm :=
+    NormalizeMalformed CoreTerm NormalizeStringBytes;
+
+def string_nf_test_lookup_shadow (entry : Entry) : Bool :=
+    string_nf_test_lookup_pair string_nf_test_lookup_neutral string_nf_test_lookup_reject 0
+      (Cons Entry entry string_nf_test_environment) (CConst 100)
+      ([string_nf_test_bytes ([65] : List Nat)] : List CoreTerm)
+      (string_nf_test_bytes ([0] : List Nat));
+
+def string_nf_test_lookup_other_heads : List CoreTerm -> Bool :=
+  fix check (heads : List CoreTerm) : Bool :=
+    match heads with
+    | Nil => True
+    | Cons head rest => andb
+        (string_nf_test_lookup_pair string_nf_test_lookup_neutral string_nf_test_lookup_reject 0
+          string_nf_test_environment head ([] : List CoreTerm) (CRel 0)) (check rest)
+    end;
+
+def string_nf_test_lookup_concat (entries : List Entry) (name : Nat) (expected : CoreTerm) : Bool :=
+    string_nf_test_lookup_pair (string_nf_test_lookup_value expected) string_nf_test_lookup_identity
+      string_nf_test_fuel entries (CConst name)
+      ([string_nf_test_bytes ([65] : List Nat)] : List CoreTerm)
+      (string_nf_test_bytes ([0] : List Nat));
+
+def string_nf_test_lookup_named (name : Nat) (query : Nat) : Bool :=
+    string_nf_test_lookup_concat
+      (Cons Entry (string_nf_test_binding name PrimitiveStringConcat string_nf_test_binary_string_type)
+        string_nf_test_support) query (string_nf_test_bytes ([65, 0] : List Nat));
+
+def string_nf_test_lookup_reserved : Entry :=
+    MkIndEntry 650 (MkIndDecl 650 [] [] 0 ([MkCtor(100, CInd 650)] : List Ctor));
+
+def string_nf_test_lookup_string_type (name : Nat) : Entry :=
+    MkBoundEntry name (CSort 0) (primitive_binding(PrimitiveStringType, Nothing CoreTerm));
+
+def string_nf_test_lookup_extern : Entry :=
+    MkBoundEntry 100 string_nf_test_binary_string_type (PrimitiveExternBinding
+      (CheckedExternOf PrimitiveWindowsX64 PrimitiveWin64
+        ([107, 101, 114, 110, 101, 108, 51, 50, 46, 100, 108, 108] : List Nat)
+        ([71, 101, 116, 67, 117, 114, 114, 101, 110, 116, 80, 114, 111, 99, 101, 115, 115, 73, 100] : List Nat)
+        (PrimitiveAbiSignatureOf ([] : List PrimitiveAbiValue)
+          (Just PrimitiveAbiValue (PrimitiveAbiWord PrimitiveWordU32))) PrimitiveNoGc));
+
+def string_nf_test_lookup_wide_name : Nat := compiler_test_wide_nat_base;
+
+def string_nf_test_lookup_laws : List Test :=
+    [ assert_true "String lookup view keeps metadata behind earlier roles"
+        (string_nf_test_lookup_concat
+          (append Entry string_nf_test_roles string_nf_test_environment) 100
+          (string_nf_test_bytes ([65, 0] : List Nat)))
+    , assert_true "String lookup view preserves the first Nat role"
+        (string_nf_test_lookup_pair
+          (string_nf_test_lookup_value (CConstruct 777 0 0)) string_nf_test_lookup_identity
+          string_nf_test_fuel
+          (Cons Entry (MkRoleEntry (PrimitiveRoleOf PrimitiveNatRole
+            (PrimitiveInductiveOf 777 0 0 (CSort 0)
+              ([CInd 777, CPi(CInd 777, CInd 777)] : List CoreTerm)))) string_nf_test_environment)
+          (CConst 101) ([] : List CoreTerm) (string_nf_test_bytes ([] : List Nat)))
+    , assert_true "String lookup view preserves String type candidate order"
+        (string_nf_test_lookup_concat
+          (Cons Entry (string_nf_test_lookup_string_type 19) string_nf_test_environment)
+          100 (CStrBytes([65, 0] : List Nat, 19)))
+    , assert_true "String lookup view still rejects an older shadowed String type"
+        (string_nf_test_lookup_concat
+          (Cons Entry (MkEntry 18 (CSort 0) (Nothing CoreTerm))
+            (append Entry string_nf_test_environment
+              ([string_nf_test_lookup_string_type 19] : List Entry)))
+          100 (CStrBytes([65, 0] : List Nat, 19)))
+    , assert_true "String lookup view keeps ordinary definitions and inductives neutral"
+        (andb
+          (string_nf_test_lookup_shadow (MkEntry 100 string_nf_test_binary_string_type (Nothing CoreTerm)))
+          (andb
+            (string_nf_test_lookup_shadow (MkEntry 100 string_nf_test_binary_string_type (Just CoreTerm (CConst 101))))
+            (string_nf_test_lookup_shadow
+              (MkIndEntry 100 (MkIndDecl 100 [] [] 0 ([MkCtor(900, CInd 100)] : List Ctor))))))
+    , assert_true "String lookup view does not reduce machine Runtime type or extern bindings"
+        (andb
+          (string_nf_test_lookup_shadow (MkBoundEntry 100 string_nf_test_binary_string_type
+            (primitive_binding(PrimitiveWordOperation PrimitiveWordU32 PrimitiveAddWrap, Nothing CoreTerm))))
+          (andb
+            (string_nf_test_lookup_shadow (MkBoundEntry 100 string_nf_test_binary_string_type
+              (primitive_binding(PrimitiveRuntimePure, Nothing CoreTerm))))
+            (andb (string_nf_test_lookup_shadow (string_nf_test_lookup_string_type 100))
+              (string_nf_test_lookup_shadow string_nf_test_lookup_extern))))
+    , assert_true "String lookup view keeps unknown and all nonconstant heads neutral before decoding"
+        (string_nf_test_lookup_other_heads
+          ([CConst 999, CRel 0, CSort 0, CPi(CSort 0, CSort 0), CLam(CSort 0, CRel 0),
+            CApp(CConst 100, CRel 0), CLetIn(CSort 0, CSort 0, CRel 0), CInd 40,
+            CConstruct 40 0 0, CCase (MkCaseInfo 40 0 ([] : List Nat)) (CSort 0) (CRel 0) ([] : List CoreTerm),
+            CFix 0 0 1 (CSort 0) (CRel 0), CStrLit 0 18,
+            string_nf_test_bytes ([] : List Nat)] : List CoreTerm))
+    , assert_true "String lookup view distinguishes constructor reservations from actual globals"
+        (andb
+          (string_nf_test_lookup_pair string_nf_test_lookup_neutral string_nf_test_lookup_reject 0
+            (Cons Entry string_nf_test_lookup_reserved string_nf_test_support) (CConst 100)
+            ([] : List CoreTerm) (CRel 0))
+          (andb
+            (string_nf_test_lookup_concat
+              (Cons Entry string_nf_test_lookup_reserved string_nf_test_environment) 100
+              (string_nf_test_bytes ([65, 0] : List Nat)))
+            (string_nf_test_lookup_concat
+              (append Entry string_nf_test_environment ([string_nf_test_lookup_reserved] : List Entry)) 100
+              (string_nf_test_bytes ([65, 0] : List Nat)))))
+    , assert_true "String lookup view preserves zero Peano and wide Nat identities"
+        (andb (string_nf_test_lookup_named 0 Z)
+          (andb (string_nf_test_lookup_named (S (S Z)) 2)
+            (string_nf_test_lookup_named string_nf_test_lookup_wide_name string_nf_test_lookup_wide_name)))
+    , assert_true "String lookup view does not truncate adjacent wide Nat identities"
+        (andb
+          (string_nf_test_lookup_pair string_nf_test_lookup_neutral string_nf_test_lookup_reject 0
+            (Cons Entry (string_nf_test_binding string_nf_test_lookup_wide_name PrimitiveStringConcat
+              string_nf_test_binary_string_type) string_nf_test_support)
+            (CConst (add string_nf_test_lookup_wide_name 1)) ([] : List CoreTerm) (CRel 0))
+          (string_nf_test_lookup_pair string_nf_test_lookup_neutral string_nf_test_lookup_reject 0
+            (Cons Entry (string_nf_test_binding string_nf_test_lookup_wide_name PrimitiveStringConcat
+              string_nf_test_binary_string_type) string_nf_test_support)
+            (CConst 0) ([] : List CoreTerm) (CRel 0)))
+    , assert_true "String lookup view preserves actual binding metadata classification"
+        (string_nf_test_lookup_concat
+          (Cons Entry (MkBoundEntry 100 (CSort 9)
+            (PrimitiveIntrinsicBinding (PrimitiveStringOperation PrimitiveStringConcat)
+              PrimitiveRuntimeAction PrimitiveMayGc (Just CoreTerm (CSort 7)))) string_nf_test_environment)
+          100 (string_nf_test_bytes ([65, 0] : List Nat)))
+    , assert_true "String lookup view checks arity before fuel and argument reduction"
+        (string_nf_test_lookup_pair string_nf_test_lookup_neutral string_nf_test_lookup_reject 0
+          string_nf_test_environment (CConst 100) ([] : List CoreTerm) (CRel 0))
+    , assert_true "String lookup view propagates the exact first argument failure"
+        (string_nf_test_lookup_pair (string_nf_test_fault (Maybe CoreTerm) 11)
+          string_nf_test_lookup_reject 1 string_nf_test_environment (CConst 100)
+          ([CRel 0] : List CoreTerm) (CRel 1))
+    , assert_true "String lookup view preserves zero decode fuel exhaustion before callbacks"
+        (string_nf_test_lookup_pair string_nf_test_lookup_exhausted string_nf_test_lookup_reject 0
+          string_nf_test_environment (CConst 100) ([CRel 0] : List CoreTerm) (CRel 1))
+    , assert_true "String lookup view preserves malformed Nat constructor failure"
+        (string_nf_test_lookup_pair (string_nf_test_fault (Maybe CoreTerm) 12)
+          string_nf_test_lookup_identity string_nf_test_fuel string_nf_test_environment
+          (CConst 105) ([] : List CoreTerm) (CConstruct 40 2 0))
+    , assert_true "String lookup view preserves missing result role failure"
+        (string_nf_test_lookup_pair (string_nf_test_fault (Maybe CoreTerm) 12)
+          string_nf_test_lookup_identity string_nf_test_fuel (string_nf_test_without_role PrimitiveNatRole)
+          (CConst 101) ([] : List CoreTerm) (string_nf_test_bytes ([] : List Nat)))
+    , assert_true "String lookup view preserves missing output String type failure"
+        (string_nf_test_lookup_pair (string_nf_test_fault (Maybe CoreTerm) 12)
+          string_nf_test_lookup_identity string_nf_test_fuel
+          (append Entry string_nf_test_operations string_nf_test_roles) (CConst 100)
+          ([string_nf_test_bytes ([65] : List Nat)] : List CoreTerm)
+          (string_nf_test_bytes ([0] : List Nat)))
+    ];
+
 -- @entry main
 def main : IO Unit :=
     test_run (append Test string_nf_test_operations_laws
       (append Test string_nf_test_opacity_laws
         (append Test string_nf_test_failure_laws
-          (append Test string_nf_test_literal_laws string_nf_test_unresolved_laws))));
+          (append Test string_nf_test_literal_laws
+            (append Test string_nf_test_unresolved_laws string_nf_test_lookup_laws)))));

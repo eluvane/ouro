@@ -7,13 +7,22 @@ from ourosmith import ROOT
 from ourosmith.surface import forms, gen, mutate
 
 
-def constructors(path, name):
-    text = (ROOT / path).read_text(encoding="utf-8")
+def constructor_reader(path, *, text=None):
+    if text is None:
+        text = (ROOT / path).read_text(encoding="utf-8")
     text = re.sub(r'--[^\r\n]*|"(?:\\.|[^"\\])*"', " ", text)
-    block = re.search(r"inductive " + name + r"\b[^;]+;", text)
-    if block is None:
-        raise ValueError(f"cannot extract {name} from {path}")
-    return re.findall(r"\|\s*(\w+)\s*:", block[0])
+
+    def read(name):
+        block = re.search(r"inductive " + name + r"\b[^;]+;", text)
+        if block is None:
+            raise ValueError(f"cannot extract {name} from {path}")
+        return re.findall(r"\|\s*(\w+)\s*:", block[0])
+
+    return read
+
+
+def constructors(path, name):
+    return constructor_reader(path)(name)
 
 
 def inventory():
@@ -25,12 +34,18 @@ def inventory():
     for start, end in re.findall(r"code >= (\d+) && code <= (\d+)", diagnostic):
         codes.update(range(int(start), int(end) + 1))
     lint = (ROOT / "tools/lint_host.ouro").read_text(encoding="utf-8")
-    return {
-        "expr": constructors("compiler/ast.ouro", "Expr"),
+    ast = constructor_reader("compiler/ast.ouro")
+    rows = {
+        "expr": ast("Expr"),
         "analyzer_ast": constructors("tools/analyze/ast.ouro", "Ast"),
-        "decl": constructors("compiler/ast.ouro", "Decl"),
-        "token": constructors("compiler/token.ouro", "Token"),
-        "keyword": re.findall(r"^def (kw\w+) : Nat", (ROOT / "compiler/token.ouro").read_text(encoding="utf-8"), re.M),
+        "decl": ast("Decl"),
+    }
+    lexer_model = "compiler/token.ouro"
+    token_source = (ROOT / lexer_model).read_text(encoding="utf-8")
+    return {
+        **rows,
+        "token": constructor_reader(lexer_model, text=token_source)("Token"),
+        "keyword": re.findall(r"^def (kw\w+) : Nat", token_source, re.M),
         "diagnostic": sorted(set(re.findall(r'"(OURO-[A-Z]+-\d+)"', diagnostic)) | {f"CErr code={code}" for code in codes}),
         "lint": sorted(set(re.findall(r'MkWarnText "OURO-LINT\d+" "([a-z-]+)"', lint))),
     }

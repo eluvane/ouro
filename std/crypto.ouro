@@ -1,5 +1,5 @@
--- SHA-256 and HMAC-SHA256 in Ouro. Word32 ops come from std/word.ouro
--- (host-fast at emit). Not a TLS stack and not a C digest primitive.
+-- SHA-256 digests and HMAC-SHA256 message authentication in Ouro.
+-- Both use the 32-bit operations in `std/word.ouro`.
 
 import "word.ouro",
   "bytes.ouro";
@@ -161,18 +161,19 @@ def sha_to_bytes (st : ShaSt) : List Nat :=
 def w_at (ws : List Nat) (i : Nat) : Nat := nth Nat Z i ws;
 
 def w_extend (w0 : List Nat) : List Nat :=
-    (fix go (fuel : Nat) (acc : List Nat) : List Nat :=
+    -- Backward offsets before the start of a short schedule select its first word.
+    let first : Nat := head Nat Z w0 in
+    (fix go (fuel : Nat) (recent : List Nat) : List Nat :=
       match fuel with
-      | Z => acc
+      | Z => reverse_lin Nat recent
       | S fuel2 =>
-        let i : Nat := length Nat acc in
-        let s0 : Nat := sig0 (w_at(acc, sub i 15)) in
-        let s1 : Nat := sig1 (w_at(acc, sub i 2)) in
+        let s0 : Nat := sig0 (nth Nat first 14 recent) in
+        let s1 : Nat := sig1 (nth Nat first 1 recent) in
         let wt : Nat :=
-          add32 (add32(w_at(acc, sub i 16), s0))
-            (add32(w_at(acc, sub i 7), s1)) in
-        go(fuel2, append Nat acc [wt])
-      end) n48 w0;
+          add32 (add32(nth Nat first 15 recent, s0))
+            (add32(nth Nat first 6 recent, s1)) in
+        go(fuel2, Cons Nat wt recent)
+      end) n48 (reverse_lin Nat w0);
 
 def sha_round (k : Nat) (w : Nat) (st : ShaSt) : ShaSt :=
     match st with
@@ -185,13 +186,13 @@ def sha_round (k : Nat) (w : Nat) (st : ShaSt) : ShaSt :=
 def sha_compress (st : ShaSt) (block : List Nat) : ShaSt :=
     let w : List Nat := w_extend (pack_words block) in
     let mid : ShaSt :=
-      (fix go (fuel : Nat) (i : Nat) (cur : ShaSt) : ShaSt :=
+      (fix go (fuel : Nat) (keys : List Nat) (words : List Nat) (cur : ShaSt) : ShaSt :=
         match fuel with
         | Z => cur
         | S fuel2 =>
-          go fuel2 (S i)
-            (sha_round(w_at sha256_k i, w_at w i, cur))
-        end) n64 Z st in
+          go fuel2 (tail Nat keys) (tail Nat words)
+            (sha_round(head Nat Z keys, head Nat Z words, cur))
+        end) n64 sha256_k w st in
     match st with
     | MkSha a0 b0 c0 d0 e0 f0 g0 h0 =>
       match mid with
@@ -238,3 +239,111 @@ def hmac_sha256_bytes (key : List Nat) (msg : List Nat) : List Nat :=
 
 def hmac_sha256 (key : String) (msg : String) : String :=
     str_of_codes (hex_encode (hmac_sha256_bytes(str_codes key, str_codes msg)));
+
+-- Count failures retain the attempted total byte count.
+inductive Sha256StreamError : Type :=
+  | Sha256StreamInvalidState : Sha256StreamError
+  | Sha256StreamByteLimitExceeded : Nat -> Sha256StreamError;
+
+-- A stream state stores the total byte count, eight hash words, and a binary tail
+-- of at most 63 bytes. Update and finalization check the state shape.
+-- A directly constructed state relies on the caller to supply the correct hash history.
+inductive Sha256Stream : Type :=
+  | Sha256StreamOf : Nat -> ShaSt -> String -> Sha256Stream;
+
+-- The existing length encoder retains only 32 bit-length bits.
+def sha256_stream_byte_limit : Nat := pow_nat 2 29;
+
+def sha256_stream_init : Sha256Stream :=
+    Sha256StreamOf Z (sha_from_list sha256_iv) "";
+
+def sha256_stream_error_code (cause : Sha256StreamError) : String :=
+    match cause with
+    | Sha256StreamInvalidState => "sha256_stream_invalid_state"
+    | Sha256StreamByteLimitExceeded _ => "sha256_stream_byte_limit"
+    end;
+
+def sha256_stream_error_message (cause : Sha256StreamError) : String :=
+    match cause with
+    | Sha256StreamInvalidState => "SHA-256 stream state has invalid words, count or tail"
+    | Sha256StreamByteLimitExceeded count =>
+      str_cat3 "SHA-256 stream byte count " (str_of_nat count) " must be below 536870912"
+    end;
+
+private def sha256_stream_words_valid (hash : ShaSt) : Bool :=
+    match hash with
+    | MkSha a b c d e f g h =>
+      let limit : Nat := mul n65536 n65536 in
+      andb (andb(ltb_nat a limit, ltb_nat b limit))
+        (andb (andb(ltb_nat c limit, ltb_nat d limit))
+          (andb (andb(ltb_nat e limit, ltb_nat f limit))
+            (andb(ltb_nat g limit, ltb_nat h limit))))
+    end;
+
+private def sha256_stream_checked_count (state : Sha256Stream)
+    : Either Sha256StreamError Nat :=
+    match state with
+    | Sha256StreamOf count hash tail =>
+      if ltb_nat count sha256_stream_byte_limit then
+        if andb (sha256_stream_words_valid hash)
+            (andb(ltb_nat (str_len tail) n64, eq_nat (str_len tail) (mod_nat count n64))) then
+          Right Sha256StreamError Nat count
+        else Left Sha256StreamError Nat Sha256StreamInvalidState
+      else Left Sha256StreamError Nat (Sha256StreamByteLimitExceeded count)
+    end;
+
+private def sha256_stream_advance (count : Nat) (bytes : Nat)
+    : Either Sha256StreamError Nat :=
+    let total : Nat := add count bytes in
+    if ltb_nat total sha256_stream_byte_limit then Right Sha256StreamError Nat total
+    else Left Sha256StreamError Nat (Sha256StreamByteLimitExceeded total);
+
+-- Only complete 64-byte blocks become byte lists; the residual tail stays packed.
+private def sha256_stream_feed (total : Nat) (chunk : String)
+    : Nat -> Nat -> ShaSt -> String -> Either Sha256StreamError Sha256Stream :=
+    fix feed (blocks : Nat) (offset : Nat) (hash : ShaSt) (tail : String)
+        : Either Sha256StreamError Sha256Stream :=
+      let needed : Nat := sub n64 (str_len tail) in
+      let remaining : Nat := sub (str_len chunk) offset in
+      if ltb_nat remaining needed then
+        Right Sha256StreamError Sha256Stream (Sha256StreamOf total hash
+          (str_concat tail (str_slice chunk offset remaining)))
+      else
+        match blocks with
+        | Z => Left Sha256StreamError Sha256Stream Sha256StreamInvalidState
+        | S rest =>
+          let block : String := str_concat tail (str_slice chunk offset needed) in
+          feed rest (add offset needed) (sha_compress hash (str_codes block)) ""
+        end;
+
+-- Append exact binary bytes, including NUL; reject invalid state or total >= 512 MiB.
+def sha256_stream_update (state : Sha256Stream) (chunk : String)
+    : Either Sha256StreamError Sha256Stream :=
+    match state with
+    | Sha256StreamOf _ hash tail =>
+      let? (Left, Right) : Either Sha256StreamError Sha256Stream do
+        let count : Nat := (sha256_stream_checked_count state)?;
+        let total : Nat := (sha256_stream_advance count (str_len chunk))?;
+        let updated : Sha256Stream :=
+          (sha256_stream_feed total chunk (div_nat (add (str_len tail) (str_len chunk)) n64)
+            Z hash tail)?;
+        updated
+      end
+    end;
+
+-- Return lowercase hex without consuming the immutable state.
+def sha256_stream_final (state : Sha256Stream) : Either Sha256StreamError String :=
+    match state with
+    | Sha256StreamOf _ hash tail =>
+      let? (Left, Right) : Either Sha256StreamError String do
+        let count : Nat := (sha256_stream_checked_count state)?;
+        let with1 : List Nat := append Nat (str_codes tail) [b80];
+        let rem : Nat := length Nat with1;
+        let zeros : Nat :=
+          if leb_nat rem n56 then sub n56 rem else add (sub n64 rem) n56;
+        -- Padding includes the length of blocks already compressed.
+        let padded : List Nat :=
+          append Nat (append Nat with1 (replicate Nat Z zeros)) (be64_len (mul count 8));
+        str_of_codes (hex_encode (sha_to_bytes (sha_blocks 2 padded hash)))
+      end
+    end;

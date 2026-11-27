@@ -1,6 +1,5 @@
-/* ouro_io_selftest.c: prove C IO prims without Node.
-   Covers checked writes, unique private scratch, JSON string decoding, and
-   process capture without the old predictable shared filenames. */
+/* Exercise C host writes, private scratch files, JSON string decoding and
+   isolated process capture. */
 #include "ouro_io.h"
 #include "ouro_rt.h"
 
@@ -153,6 +152,7 @@ static int runtime_operations_check(void)
 	ouro_v *successor;
 	unsigned long n;
 	unsigned long converted;
+	uint64_t wide;
 	for (n = 0; n <= 257; n++) {
 		result = ouro_apply(ouro_io_prim_req("ouro.u8.from_nat.checked"), ouro_nat(n));
 		if (result->tag != (n <= 255 ? 1 : 0) || result->n != (n <= 255 ? 1 : 0))
@@ -181,6 +181,20 @@ static int runtime_operations_check(void)
 	result = ouro_apply(ouro_io_prim_req("ouro.u32.from_nat.checked"), ouro_str("invalid Nat"));
 	if (result->tag != 0 || result->n != 0)
 		return fail("malformed checked word conversion accepted");
+	value = ouro_nat_u64(UINT64_MAX - 1);
+	successor = ouro_ctor(1, 1, &value);
+	result = ouro_apply(ouro_io_prim_req("ouro.u64.from_nat.checked"), successor);
+	if (result->tag != 1 || result->n != 1 ||
+	    !ouro_nat_to_u64(OURO_F(result, 0), &wide) || wide != UINT64_MAX)
+		return fail("checked U64 maximum");
+	value = ouro_nat_u64(UINT64_MAX);
+	successor = ouro_ctor(1, 1, &value);
+	result = ouro_apply(ouro_io_prim_req("ouro.u64.from_nat.checked"), successor);
+	if (result->tag != 0 || result->n != 0)
+		return fail("checked U64 overflow accepted");
+	result = ouro_apply(ouro_io_prim_req("ouro.u64.from_nat.checked"), ouro_str("invalid Nat"));
+	if (result->tag != 0 || result->n != 0)
+		return fail("malformed checked U64 conversion accepted");
 	result = ouro_apply(ouro_apply(ouro_io_prim_req("ouro.u8.sub.wrap"), ouro_nat(0)), ouro_nat(1));
 	if (result->tag != OURO_TAG_NAT || result->n != 255)
 		return fail("U8 subtraction must wrap");
@@ -243,10 +257,9 @@ static int json_string_primitive_check(void)
 	return 0;
 }
 
-/* The list prim_string_to_char_codes returns is a packed chunk, and an
-   append of two of them is a concat node. The host-fast `reverse` bound to
-   compiled programs must read both the way ouro_case does; it used to return
-   Nil for a packed chunk. */
+/* prim_string_to_char_codes returns a packed chunk. Appending two chunks
+   creates a concat node. Host reverse must traverse both representations
+   with the same list semantics as ouro_case. */
 static int packed_codes_reverse_check(void)
 {
 	ouro_v *codes = ouro_apply(ouro_io_prim("prim_string_to_char_codes"),
@@ -270,6 +283,24 @@ static int packed_codes_reverse_check(void)
 	text = ouro_apply(ouro_io_prim("prim_string_of_char_codes"), reversed);
 	if (!host_bytes_eq(text, "abcde", 5))
 		return fail("reverse of a cons list");
+	return 0;
+}
+
+static int deep_codes_concat_check(void)
+{
+	unsigned char expected[640];
+	ouro_v *append = ouro_fast("append");
+	ouro_v *codes = ouro_ctor(0, 0, 0);
+	ouro_v *text;
+	size_t i;
+	for (i = 0; i < sizeof expected; i += 2U) {
+		expected[i] = (unsigned char)i;
+		expected[i + 1U] = (unsigned char)(255U - expected[i]);
+		codes = ouro_apply(ouro_apply(append, codes), ouro_bytes(expected + i, 2));
+	}
+	text = ouro_apply(ouro_io_prim("prim_string_of_char_codes"), codes);
+	if (!host_bytes_eq(text, (const char *)expected, sizeof expected))
+		return fail("of_char_codes preserves deep concat bytes");
 	return 0;
 }
 
@@ -308,9 +339,43 @@ static int binary_file_roundtrip_check(void)
 	read = ouro_apply(read, ouro_ctor(0, 0, 0));
 	if (!host_bytes_eq(read, (const char *)payload, sizeof payload))
 		return fail("binary read dropped bytes");
+	read = ouro_apply(ouro_io_prim_req("prim_fs_read_file_status"), ouro_str(path));
+	read = ouro_apply(read, ouro_ctor(0, 0, 0));
+	if (read == 0 || read->tag != 0 || read->n != 2 || OURO_F(read, 0)->tag != OURO_TAG_NAT ||
+	    OURO_F(read, 0)->n != 0 || !host_bytes_eq(OURO_F(read, 1), (const char *)payload, sizeof payload))
+		return fail("status read dropped binary bytes");
 	remove(path);
+	read = ouro_apply(ouro_apply(ouro_io_prim_req("prim_fs_read_file_status"), ouro_str(path)), ouro_ctor(0, 0, 0));
+	if (read == 0 || read->tag != 0 || read->n != 2 || OURO_F(read, 0)->tag != OURO_TAG_NAT ||
+	    OURO_F(read, 0)->n == 0 || !host_bytes_eq(OURO_F(read, 1), "", 0))
+		return fail("status read accepted a removed file or exposed partial bytes");
 	return 0;
 }
+
+#ifndef _WIN32
+static int file_write_refusal_check(const char *executable, const char *path)
+{
+	static const char expected_error[] = "ouro run: fs_write_file: open failed\n";
+	ouro_v *arguments[2] = {ouro_str("--write-symlink"), string_list_one(path)};
+	ouro_v *action;
+	ouro_v *result;
+	ouro_v *streams;
+
+	action = ouro_apply(ouro_io_prim_req("ouro.process.capture"), ouro_str(executable));
+	action = ouro_apply(action, ouro_ctor(1, 2, arguments));
+	result = ouro_apply(action, ouro_ctor(0, 0, 0));
+	if (result == 0 || result->tag != 0 || result->n != 2 ||
+	    OURO_F(result, 0) == 0 || OURO_F(result, 0)->tag != OURO_TAG_NAT ||
+	    OURO_F(result, 0)->n != 73)
+		return fail("symlink write refusal status");
+	streams = OURO_F(result, 1);
+	if (streams == 0 || streams->tag != 0 || streams->n != 2 ||
+	    !host_bytes_eq(OURO_F(streams, 0), "", 0) ||
+	    !host_bytes_eq(OURO_F(streams, 1), expected_error, sizeof expected_error - 1U))
+		return fail("symlink write refusal streams");
+	return 0;
+}
+#endif
 
 static int binary_string_equality_check(void)
 {
@@ -384,6 +449,72 @@ static int binary_string_concat_check(void)
 		ouro_str("hello")), ouro_str(" world"));
 	if (!host_bytes_eq(result, "hello world", 11))
 		return fail("text string concatenation");
+	{
+		unsigned char repeated[1024];
+		ouro_v *shared;
+		for (i = 0; i < 512; i++)
+			repeated[i] = repeated[i + 512] = (unsigned char)i;
+		shared = ouro_packed(repeated, 512);
+		result = ouro_apply(ouro_apply(ouro_io_prim("prim_string_concat"), shared), shared);
+		if (!host_bytes_eq(result, (const char *)repeated, sizeof repeated)
+		    || !host_bytes_eq(shared, (const char *)repeated, 512))
+			return fail("concatenation changed shared packed bytes");
+	}
+	return 0;
+}
+
+static ouro_v *string_slice(ouro_v *text, unsigned long start, unsigned long count)
+{
+	ouro_v *slice = ouro_apply(ouro_io_prim_req("prim_string_slice"), text);
+	return ouro_apply(ouro_apply(slice, ouro_nat(start)), ouro_nat(count));
+}
+
+static ouro_v *slice_tail(ouro_env *env, ouro_v *tail)
+{
+	(void)env;
+	return tail;
+}
+
+static ouro_v *slice_skip_head(ouro_env *env, ouro_v *head)
+{
+	(void)env;
+	(void)head;
+	return ouro_clos(slice_tail, 0);
+}
+
+static int packed_string_conversion_check(void)
+{
+	const unsigned char payload[] = { 33, 0, 255, 13, 10, 195, 169 };
+	ouro_v *to_codes = ouro_io_prim_req("prim_string_to_char_codes");
+	ouro_v *from_codes = ouro_io_prim_req("prim_string_of_char_codes");
+	ouro_heap_context *temporary = ouro_heap_context_enter();
+	ouro_v *source = ouro_packed(payload, sizeof payload);
+	ouro_v *codes = ouro_apply(to_codes, source);
+	ouro_v *text = ouro_apply(from_codes, codes);
+	ouro_v *branches[2] = {ouro_ctor(0, 0, 0), ouro_clos(slice_skip_head, 0)};
+	ouro_v *tail = ouro_case(codes, 2, branches);
+	ouro_v *suffix = ouro_apply(from_codes, tail);
+	ouro_v *view = string_slice(text, 1, sizeof payload);
+	ouro_v *nested = string_slice(view, 1, sizeof payload - 2U);
+	ouro_v *survivors[] = { suffix, nested };
+	int reused = codes == source && text == source && suffix == tail &&
+		string_slice(text, 0, sizeof payload) == source &&
+		string_slice(text, 0, sizeof payload + 1U) == source;
+	int shared = view->u.s == source->u.s + 1 && nested->u.s == source->u.s + 2;
+	ouro_v *retained = ouro_heap_context_leave(temporary, ouro_ctor(0, 2, survivors));
+
+	if (!reused || !host_bytes_eq(OURO_F(retained, 0), (const char *)payload + 1, sizeof payload - 1U))
+		return fail("packed string conversion copied bytes or lost the retained suffix");
+	nested = OURO_F(retained, 1);
+	if (!shared || !host_bytes_eq(nested, (const char *)payload + 2, sizeof payload - 2U) ||
+	    nested->u.s[sizeof payload - 2U] != 0)
+		return fail("packed suffix slice copied bytes or lost the retained suffix");
+	codes = ouro_apply(to_codes, ouro_str("ok"));
+	if (!host_bytes_eq(codes, "ok", 2) || codes->tag != OURO_TAG_BYTES)
+		return fail("text conversion did not produce packed codes");
+	text = ouro_apply(from_codes, ouro_bytes(payload, sizeof payload));
+	if (!host_bytes_eq(text, (const char *)payload, sizeof payload) || text->tag != OURO_TAG_BYTES)
+		return fail("ordinary code list conversion changed bytes");
 	return 0;
 }
 
@@ -392,7 +523,13 @@ static int binary_string_operations_check(void)
 	const unsigned char payload[] = { 77, 90, 0, 255, 66, 0 };
 	const unsigned char needle[] = { 0, 255 };
 	const unsigned char missing[] = { 0, 128 };
+	const unsigned char overlapping[] = { 0, 255, 0, 255, 0, 255, 66 };
 	ouro_v *text = ouro_packed(payload, sizeof payload);
+	ouro_v *inputs[3];
+	ouro_v *chunks[2];
+	ouro_v *branches[2];
+	ouro_v *tail;
+	size_t i;
 	ouro_v *result = ouro_apply(ouro_apply(ouro_io_prim("prim_string_contains"),
 		ouro_str("C:\\bin\\coil.exe")), ouro_packed(payload + 2, 1));
 	if (result == 0 || result->tag != 1 || result->n != 0)
@@ -408,18 +545,185 @@ static int binary_string_operations_check(void)
 	result = ouro_apply(ouro_apply(ouro_io_prim("prim_string_contains"), text), ouro_str(""));
 	if (result == 0 || result->tag != 0 || result->n != 0)
 		return fail("empty string search pattern");
-	result = ouro_apply(ouro_apply(ouro_apply(ouro_io_prim("prim_string_slice"), text),
-		ouro_nat(2)), ouro_nat(3));
-	if (!host_bytes_eq(result, (const char *)payload + 2, 3))
-		return fail("binary string slice dropped bytes");
-	result = ouro_apply(ouro_apply(ouro_apply(ouro_io_prim("prim_string_slice"), text),
-		ouro_nat(3)), ouro_nat(99));
+	result = ouro_apply(ouro_apply(ouro_io_prim("prim_string_contains"),
+		ouro_packed(overlapping, sizeof overlapping)), ouro_packed(overlapping + 3, 4));
+	if (result == 0 || result->tag != 0 || result->n != 0)
+		return fail("binary string search missed an overlapping match at the end");
+	inputs[0] = text;
+	inputs[1] = ouro_bytes(payload, sizeof payload);
+	chunks[0] = ouro_packed(payload, 3);
+	chunks[1] = ouro_bytes(payload + 3, sizeof payload - 3);
+	inputs[2] = ouro_ctor(OURO_TAG_CAT, 2, chunks);
+	for (i = 0; i < sizeof inputs / sizeof inputs[0]; i++) {
+		result = string_slice(inputs[i], 2, 3);
+		if (!host_bytes_eq(result, (const char *)payload + 2, 3) || result->tag != OURO_TAG_BYTES)
+			return fail("binary string slice dropped bytes");
+	}
+	result = string_slice(text, 2, 2);
+	if (!host_bytes_eq(result, (const char *)payload + 2, 2) || result->u.s[2] != 0)
+		return fail("interior string slice is not terminated");
+	branches[0] = ouro_ctor(0, 0, 0);
+	branches[1] = ouro_clos(slice_skip_head, 0);
+	tail = ouro_case(text, 2, branches);
+	if (!host_bytes_eq(string_slice(tail, 1, 3), (const char *)payload + 2, 3))
+		return fail("slice of packed tail lost bytes");
+	if (!host_bytes_eq(string_slice(ouro_str("hello"), 1, 3), "ell", 3))
+		return fail("text string slice");
+	result = string_slice(text, 3, 99);
 	if (!host_bytes_eq(result, (const char *)payload + 3, 3))
 		return fail("binary string slice did not clamp length");
-	result = ouro_apply(ouro_apply(ouro_apply(ouro_io_prim("prim_string_slice"), text),
-		ouro_nat(sizeof payload)), ouro_nat(1));
+	result = string_slice(text, sizeof payload, 1);
 	if (!host_bytes_eq(result, "", 0))
 		return fail("out-of-range string slice");
+	result = string_slice(text, 2, 0);
+	if (!host_bytes_eq(result, "", 0) || result->tag != OURO_TAG_BYTES)
+		return fail("zero-length string slice");
+	return 0;
+}
+
+static int string_text_search_check(void)
+{
+	const unsigned char payload[] = { '!', 'a', 'b', 0, 255 };
+	const struct {
+		const char *primitive;
+		const char *pattern;
+		int tag;
+		int index;
+	} cases[] = {
+		{ "prim_string_starts", "ab", 0, -1 },
+		{ "prim_string_starts", "abc", 1, -1 },
+		{ "prim_string_starts", "", 0, -1 },
+		{ "prim_string_ends", "b", 0, -1 },
+		{ "prim_string_ends", "\xff", 1, -1 },
+		{ "prim_string_index", "b", 1, 1 },
+		{ "prim_string_index", "", 1, 0 },
+		{ "prim_string_index", "\xff", 0, -1 },
+		{ "prim_string_le", "ab", 0, -1 },
+		{ "prim_string_le", "aa", 1, -1 },
+	};
+	ouro_v *inputs[5];
+	ouro_v *chunks[2];
+	ouro_v *branches[2];
+	size_t i;
+	size_t j;
+
+	inputs[0] = ouro_str("ab");
+	inputs[1] = ouro_packed(payload + 1, sizeof payload - 1U);
+	inputs[2] = ouro_bytes(payload + 1, sizeof payload - 1U);
+	chunks[0] = ouro_str("a");
+	chunks[1] = ouro_packed(payload + 2, sizeof payload - 2U);
+	inputs[3] = ouro_ctor(OURO_TAG_CAT, 2, chunks);
+	branches[0] = ouro_ctor(0, 0, 0);
+	branches[1] = ouro_clos(slice_skip_head, 0);
+	inputs[4] = ouro_case(ouro_packed(payload, sizeof payload), 2, branches);
+
+	for (i = 0; i < sizeof inputs / sizeof inputs[0]; i++) {
+		for (j = 0; j < sizeof cases / sizeof cases[0]; j++) {
+			unsigned long index;
+			ouro_v *result = ouro_apply(ouro_apply(ouro_io_prim_req(cases[j].primitive),
+				inputs[i]), ouro_str(cases[j].pattern));
+			if (result == 0 || result->tag != cases[j].tag ||
+			    result->n != (cases[j].index >= 0))
+				return fail(cases[j].primitive);
+			if (cases[j].index >= 0 &&
+			    (!ouro_nat_to_ulong(OURO_F(result, 0), &index) ||
+			     index != (unsigned long)cases[j].index))
+				return fail("string search returned the wrong byte index");
+		}
+		if (i > 0) {
+			ouro_v *result = ouro_apply(ouro_apply(ouro_io_prim_req("prim_string_contains"),
+				inputs[i]), ouro_packed(payload + 4, 1));
+			if (result == 0 || result->tag != 0 || result->n != 0)
+				return fail("single-byte search skipped a byte after NUL");
+		}
+	}
+	return 0;
+}
+
+static int string_segments_equal(ouro_v *list, const char *const *items, size_t count)
+{
+	size_t i;
+	for (i = 0; i < count; i++) {
+		if (list == 0 || list->tag != 1 || list->n != 2 ||
+		    !host_bytes_eq(OURO_F(list, 0), items[i], strlen(items[i])) ||
+		    OURO_F(list, 0)->tag != OURO_TAG_STR)
+			return 0;
+		list = OURO_F(list, 1);
+	}
+	return list != 0 && list->tag == 0 && list->n == 0;
+}
+
+static int string_segments_check(void)
+{
+	const unsigned char text[] = "\nalpha\n\nbeta\r\n\0ignored\n";
+	const char *const lines[] = { "", "alpha", "", "beta\r", "" };
+	const char *const words[] = { "alpha", "beta" };
+	const char *const whole[] = { "\nalpha\n\nbeta\r\n" };
+	char borrowed_text[] = "alpha\nbeta";
+	ouro_v *inputs[] = {
+		ouro_str((const char *)text),
+		ouro_packed(text, sizeof text - 1U),
+		ouro_bytes(text, sizeof text - 1U)
+	};
+	ouro_v *borrowed_split;
+	size_t i;
+	for (i = 0; i < sizeof inputs / sizeof inputs[0]; i++) {
+		ouro_v *split = ouro_apply(ouro_io_prim_req("prim_string_split"), inputs[i]);
+		if (!string_segments_equal(ouro_apply(split, ouro_nat('\n')), lines,
+		    sizeof lines / sizeof lines[0]))
+			return fail("string split changed empty lines or NUL truncation");
+		if (!string_segments_equal(ouro_apply(split, ouro_nat(256)), whole, 1) ||
+		    !string_segments_equal(ouro_apply(split, ouro_nat(0)), whole, 1))
+			return fail("string split changed an absent separator");
+		if (!string_segments_equal(ouro_apply(ouro_io_prim_req("prim_string_tokens"),
+		    inputs[i]), words, sizeof words / sizeof words[0]))
+			return fail("string tokens changed whitespace or NUL truncation");
+	}
+	if (!host_bytes_eq(inputs[1], (const char *)text, sizeof text - 1U))
+		return fail("string segmentation changed the packed input");
+	borrowed_split = ouro_apply(ouro_apply(ouro_io_prim_req("prim_string_split"),
+		ouro_str(borrowed_text)), ouro_nat('\n'));
+	borrowed_text[0] = 'z';
+	if (!string_segments_equal(borrowed_split, words, sizeof words / sizeof words[0]))
+		return fail("string split did not own its result bytes");
+	return 0;
+}
+
+static int string_replace_check(void)
+{
+	const unsigned char text[] = { 'a', 'a', 'a', 'a', 'b', 0, 'a' };
+	const unsigned char pattern[] = { 'a', 'a', 0, 'b' };
+	const unsigned char replacement[] = { 'x', 0, 'y' };
+	const struct {
+		ouro_v *pattern;
+		ouro_v *replacement;
+		const char *expected;
+	} cases[] = {
+		{ ouro_str("aa"), ouro_str("XYZ"), "XYZXYZb" },
+		{ ouro_str("aaa"), ouro_str("x"), "xab" },
+		{ ouro_str("aa"), ouro_str(""), "b" },
+		{ ouro_str("z"), ouro_str("x"), "aaaab" },
+		{ ouro_str(""), ouro_str("x"), "aaaab" },
+		{ ouro_packed(pattern, sizeof pattern), ouro_bytes(replacement, sizeof replacement), "xxb" }
+	};
+	ouro_v *inputs[] = {
+		ouro_str("aaaab"),
+		ouro_packed(text, sizeof text),
+		ouro_bytes(text, sizeof text)
+	};
+	size_t i;
+	size_t j;
+	for (i = 0; i < sizeof inputs / sizeof inputs[0]; i++) {
+		for (j = 0; j < sizeof cases / sizeof cases[0]; j++) {
+			ouro_v *replace = ouro_apply(ouro_io_prim_req("prim_string_replace"), inputs[i]);
+			ouro_v *result = ouro_apply(ouro_apply(replace, cases[j].pattern), cases[j].replacement);
+			if (!host_bytes_eq(result, cases[j].expected, strlen(cases[j].expected)) ||
+			    result->tag != OURO_TAG_STR)
+				return fail("text replacement changed bytes or representation");
+		}
+	}
+	if (!host_bytes_eq(inputs[1], (const char *)text, sizeof text))
+		return fail("text replacement changed the packed input");
 	return 0;
 }
 
@@ -560,7 +864,8 @@ static int file_rename_check(void)
 		error = "rename file setup";
 		goto done;
 	}
-	action = rename_action(ouro_str(source), ouro_str(target));
+	action = rename_action(ouro_str(source),
+		ouro_packed((const unsigned char *)target, (unsigned long)strlen(target)));
 	if (!file_text_eq(source, "new\n") || !file_text_eq(target, "old\n")) {
 		error = "rename ran before action execution";
 		goto done;
@@ -637,10 +942,13 @@ static int file_rename_check(void)
 		goto done;
 	}
 #endif
+	chunks[0] = ouro_str("_build/c/");
+	chunks[1] = ouro_str(target + sizeof "_build/c/" - 1U);
 	status = rename_result_status(rename_action(
-		ouro_bytes((const unsigned char *)source, (unsigned long)strlen(source)), ouro_str(target)));
+		ouro_bytes((const unsigned char *)source, (unsigned long)strlen(source)),
+		ouro_ctor(OURO_TAG_CAT, 2, chunks)));
 	if (status != 0 || !file_text_eq(target, "staging\n") || stat(source, &info) == 0)
-		error = "rename plain byte-list path";
+		error = "rename byte-list source and concat target";
 done:
 #ifdef _WIN32
 	if (!DeleteFileW(wide_path) && GetLastError() != ERROR_FILE_NOT_FOUND && error == 0)
@@ -943,6 +1251,122 @@ static int process_bounded_check(const char *executable)
 		    !ouro_nat_to_ulong(peak, &peak_bytes) || peak_bytes == 0)
 			return fail("bounded capture basic completion");
 	}
+	/* Tail slashes must survive bounded argv quoting and action reuse. */
+	{
+		static const char single[] = "C:\\p10\\trail\\\0tail\0";
+		static const char doubled[] = "ends\\\\\0\0tail\0";
+		static const char quoted_tail[] = { ' ', '\\', '\\', '"', '\\', 0 };
+		char long_word[300];
+		char long_expected[sizeof long_word + sizeof "tail"];
+		const struct {
+			const char *name;
+			const char *words[4];
+			size_t count;
+			const char *expected;
+			size_t bytes;
+			int concat_depth;
+		} cases[] = {
+			{"bounded capture argv trailing single slash",
+			 {"--host-arguments", "C:\\p10\\trail\\", "tail", 0},
+			 3, single, sizeof single - 1U, 0},
+			{"bounded capture argv trailing double slash",
+			 {"--host-arguments", "ends\\\\", "", "tail"},
+			 4, doubled, sizeof doubled - 1U, 0},
+			{"bounded capture argv growth with escaped quote and trailing slash",
+			 {"--host-arguments", long_word, "tail", 0},
+			 3, long_expected, sizeof long_expected, 70},
+		};
+		size_t row;
+		memset(long_word, 'x', sizeof long_word);
+		memcpy(long_word + sizeof long_word - sizeof quoted_tail, quoted_tail, sizeof quoted_tail);
+		memcpy(long_expected, long_word, sizeof long_word);
+		memcpy(long_expected + sizeof long_word, "tail", sizeof "tail");
+		for (row = 0; row < sizeof cases / sizeof cases[0]; row++) {
+			ouro_v *arguments = ouro_ctor(0, 0, 0);
+			size_t word;
+			int depth;
+			for (word = cases[row].count; word > 0; word--) {
+				const char *argument = cases[row].words[word - 1U];
+				ouro_v *value;
+				ouro_v *fields[2];
+
+				if (argument == long_word) {
+					size_t prefix = sizeof long_word - sizeof quoted_tail;
+					ouro_v *pieces[2] = {
+						ouro_packed((const unsigned char *)long_word, (unsigned long)prefix),
+						ouro_bytes((const unsigned char *)quoted_tail, sizeof quoted_tail - 1U)
+					};
+					value = ouro_ctor(OURO_TAG_CAT, 2, pieces);
+				} else {
+					value = ouro_str(argument);
+				}
+				fields[0] = value;
+				fields[1] = arguments;
+				arguments = ouro_ctor(1, 2, fields);
+			}
+			for (depth = 0; depth < cases[row].concat_depth; depth++)
+				arguments = ouro_ctor(OURO_TAG_CAT, 2,
+					(ouro_v *[]){arguments, ouro_ctor(0, 0, 0)});
+			action = ouro_io_prim("ouro.process.capture_bounded");
+			if (action == 0 || action->tag != OURO_TAG_CLOS)
+				return fail("bounded capture argv primitive");
+			action = ouro_apply(action, ouro_str(executable));
+			if (action == 0 || action->tag != OURO_TAG_CLOS)
+				return fail("bounded capture argv executable");
+			action = ouro_apply(action, arguments);
+			if (action == 0 || action->tag != OURO_TAG_CLOS)
+				return fail("bounded capture argv partial");
+			action = ouro_apply(action,
+				bounded_request(ouro_str(""), 10000, 64, 1,
+					cases[row].bytes > 64 ? cases[row].bytes : 64, 0));
+			if (action == 0 || action->tag != OURO_TAG_CLOS)
+				return fail("bounded capture argv stored action");
+			for (iteration = 0; iteration < 2; iteration++) {
+				unsigned long peak_bytes = 0;
+				result = ouro_apply(action, ouro_ctor(0, 0, 0));
+				if (!bounded_unpack(result, &kind, &detail, &peak, &out, &err))
+					return fail("bounded capture argv reply shape");
+				if (!bounded_nat_eq(kind, 0) || !bounded_nat_eq(detail, 0))
+					return fail("bounded capture argv child outcome");
+				if (!ouro_nat_to_ulong(peak, &peak_bytes) || peak_bytes == 0)
+					return fail("bounded capture argv child peak");
+				if (!host_bytes_eq(err, "", 0))
+					return fail("bounded capture argv child stderr");
+				if (!host_bytes_eq(out, cases[row].expected, cases[row].bytes)) {
+					if (out != 0 && (out->tag == OURO_TAG_STR || out->tag == OURO_TAG_BYTES) &&
+					    out->u.s != 0 &&
+					    out->n >= 0 && out->n <= 64) {
+						size_t byte;
+						fprintf(stderr, "OURO_IO_SELFTEST: ARGV_HEX row=%lu attempt=%d ",
+							(unsigned long)row, iteration);
+						for (byte = 0; byte < (size_t)out->n; byte++)
+							fprintf(stderr, "%02x", (unsigned int)(unsigned char)out->u.s[byte]);
+						fputc('\n', stderr);
+					}
+					return fail(cases[row].name);
+				}
+			}
+		}
+	}
+	{
+		static const unsigned char with_nul[] = {'a', 0, 'b'};
+		ouro_v *arguments[] = {
+			ouro_ctor(1, 2, (ouro_v *[]){ouro_packed(with_nul, sizeof with_nul), ouro_ctor(0, 0, 0)}),
+			ouro_ctor(OURO_TAG_CAT, 2, (ouro_v *[]){string_list_one("--host-arguments"), ouro_ctor(77, 0, 0)})
+		};
+		size_t i;
+
+		for (i = 0; i < sizeof arguments / sizeof arguments[0]; i++) {
+			action = ouro_apply(ouro_io_prim_req("ouro.process.capture_bounded"), ouro_str(executable));
+			action = ouro_apply(ouro_apply(action, arguments[i]),
+				bounded_request(ouro_str(""), 10000, 64, 1, 0, 0));
+			result = ouro_apply(action, ouro_ctor(0, 0, 0));
+			if (!bounded_unpack(result, &kind, &detail, &peak, &out, &err) ||
+			    !bounded_nat_eq(kind, 1) || !bounded_nat_eq(detail, 87) ||
+			    !host_bytes_eq(out, "", 0) || !host_bytes_eq(err, "", 0))
+				return fail("bounded capture accepted invalid arguments");
+		}
+	}
 	/* Binary stdin round-trips exactly, including interior NUL. */
 	action = bounded_action(executable, "--bounded-echo",
 		bounded_request(ouro_packed(binary, sizeof binary), 10000, 64, 1, 64, 0));
@@ -1059,6 +1483,157 @@ static int process_bounded_check(const char *executable)
 	return 0;
 }
 
+static ouro_v *bounded_at_action(ouro_v *executable, ouro_v *arguments,
+	ouro_v *directory, ouro_v *request)
+{
+	ouro_v *action = ouro_io_prim("ouro.process.capture_bounded_at");
+	if (action == 0 || action->tag != OURO_TAG_CLOS)
+		return 0;
+	action = ouro_apply(action, executable);
+	action = ouro_apply(action, arguments);
+	action = ouro_apply(action, directory);
+	return ouro_apply(action, request);
+}
+
+#ifdef _WIN32
+static int bounded_directory_child(int argc, char **argv)
+{
+	static const unsigned char binary[] = {65, 0, 255, 128, 10, 13, 90};
+	unsigned char input[8];
+	wchar_t *directory = _wgetcwd(NULL, 0);
+	wchar_t *expected = 0;
+	int okay = argc == 5 && directory != 0 &&
+		ouro_host_wide_path(argv[2], &expected) == 0;
+	if (okay) {
+		wchar_t *part;
+		for (part = expected; *part != 0; part++)
+			if (*part == L'/')
+				*part = L'\\';
+		okay = wcscmp(directory, expected) == 0 &&
+			strcmp(argv[3], "a \"b\\") == 0 && strcmp(argv[4], "") == 0;
+	}
+	free(directory);
+	free(expected);
+	if (!okay || _setmode(_fileno(stdin), _O_BINARY) == -1 ||
+	    _setmode(_fileno(stdout), _O_BINARY) == -1 ||
+	    _setmode(_fileno(stderr), _O_BINARY) == -1)
+		return 91;
+	if (fread(input, 1, sizeof input, stdin) != sizeof binary ||
+	    memcmp(input, binary, sizeof binary) != 0 || ferror(stdin) ||
+	    fwrite(binary, 1, sizeof binary, stdout) != sizeof binary ||
+	    fwrite(binary, 1, sizeof binary, stderr) != sizeof binary)
+		return 91;
+	return 259;
+}
+#endif
+
+static int process_bounded_at_check(const char *executable)
+{
+	ouro_v *kind;
+	ouro_v *detail;
+	ouro_v *peak;
+	ouro_v *out;
+	ouro_v *err;
+	ouro_v *action;
+	ouro_v *result;
+	ouro_v *unit = ouro_ctor(0, 0, 0);
+#ifdef _WIN32
+	static const unsigned char binary[] = {65, 0, 255, 128, 10, 13, 90};
+	static const unsigned char nul[] = {'C', ':', '\\', 0, 'x'};
+	static const unsigned char invalid_utf8[] = {'C', ':', '\\', 255};
+	ouro_v *directory = ouro_apply(ouro_apply(ouro_io_prim_req("prim_fs_realpath"),
+		ouro_str("_build/c")), unit);
+	ouro_v *program = ouro_apply(ouro_apply(ouro_io_prim_req("prim_fs_realpath"),
+		ouro_str(executable)), unit);
+	ouro_v *words[2];
+	ouro_v *arguments = ouro_ctor(0, 0, 0);
+	wchar_t *before = _wgetcwd(NULL, 0);
+	wchar_t *after;
+	int iteration;
+	int status = 0;
+	if (before == 0 || directory == 0 || directory->u.s == 0 || directory->n == 0 ||
+	    program == 0 || program->u.s == 0 || program->n == 0) {
+		free(before);
+		return fail("bounded cwd canonical fixture paths");
+	}
+	words[0] = ouro_str(""); words[1] = arguments; arguments = ouro_ctor(1, 2, words);
+	words[0] = ouro_str("a \"b\\"); words[1] = arguments; arguments = ouro_ctor(1, 2, words);
+	words[0] = directory; words[1] = arguments; arguments = ouro_ctor(1, 2, words);
+	words[0] = ouro_str("--bounded-cwd-child"); words[1] = arguments; arguments = ouro_ctor(1, 2, words);
+	action = bounded_at_action(program, arguments, directory,
+		bounded_request(ouro_packed(binary, sizeof binary), 10000, 64, 1, 7, 7));
+	if (action == 0 || action->tag != OURO_TAG_CLOS) {
+		status = fail("bounded cwd deferred action");
+		goto done;
+	}
+	for (iteration = 0; iteration < 2; iteration++) {
+		result = ouro_apply(action, unit);
+		if (!bounded_unpack(result, &kind, &detail, &peak, &out, &err) ||
+		    !bounded_nat_eq(kind, 0) || !bounded_nat_eq(detail, 259) ||
+		    !host_bytes_eq(out, (const char *)binary, sizeof binary) ||
+		    !host_bytes_eq(err, (const char *)binary, sizeof binary)) {
+			status = fail("bounded cwd repeated literal argv and binary streams");
+			goto done;
+		}
+	}
+	{
+		ouro_v *invalid[] = {ouro_str(""), ouro_str("relative"), ouro_str("C:relative"),
+			ouro_packed(nul, sizeof nul), ouro_packed(invalid_utf8, sizeof invalid_utf8), program};
+		size_t index;
+		for (index = 0; index < sizeof invalid / sizeof invalid[0]; index++) {
+			action = bounded_at_action(program, arguments, invalid[index],
+				bounded_request(ouro_str(""), 10000, 64, 1, 0, 0));
+			result = ouro_apply(action, unit);
+			if (!bounded_unpack(result, &kind, &detail, &peak, &out, &err) ||
+			    !bounded_nat_eq(kind, 1) || bounded_nat_eq(detail, 0)) {
+				status = fail("bounded cwd invalid or file directory became child success");
+				goto done;
+			}
+		}
+	}
+	action = bounded_at_action(program, string_list_one("--bounded-sleep"), directory,
+		bounded_request(ouro_str(""), 250, 64, 1, 0, 0));
+	result = ouro_apply(action, unit);
+	if (!bounded_unpack(result, &kind, &detail, &peak, &out, &err) || !bounded_nat_eq(kind, 2)) {
+		status = fail("bounded cwd timeout kind");
+		goto done;
+	}
+	action = bounded_at_action(program, arguments, directory,
+		bounded_request(ouro_packed(binary, sizeof binary), 10000, 64, 1, 5, 7));
+	result = ouro_apply(action, unit);
+	if (!bounded_unpack(result, &kind, &detail, &peak, &out, &err) ||
+	    !bounded_nat_eq(kind, 6) || !bounded_nat_eq(detail, sizeof binary)) {
+		status = fail("bounded cwd output cap");
+		goto done;
+	}
+	action = bounded_at_action(program, arguments, directory,
+		bounded_request(ouro_packed(binary, sizeof binary), 10000, 64, 1, 7, 5));
+	result = ouro_apply(action, unit);
+	if (!bounded_unpack(result, &kind, &detail, &peak, &out, &err) ||
+	    !bounded_nat_eq(kind, 7) || !bounded_nat_eq(detail, sizeof binary)) {
+		status = fail("bounded cwd error cap");
+		goto done;
+	}
+done:
+	after = _wgetcwd(NULL, 0);
+	if (after == 0 || wcscmp(before, after) != 0)
+		status = fail("bounded cwd changed parent directory");
+	free(before);
+	free(after);
+	return status;
+#else
+	action = bounded_at_action(ouro_str(executable), ouro_ctor(0, 0, 0), ouro_str("C:\\unused"),
+		bounded_request(ouro_str(""), 5000, 64, 1, 0, 0));
+	if (action == 0 || action->tag != OURO_TAG_CLOS)
+		return fail("bounded cwd deferred POSIX action");
+	result = ouro_apply(action, unit);
+	if (!bounded_unpack(result, &kind, &detail, &peak, &out, &err) ||
+	    !bounded_nat_eq(kind, 1) || !bounded_nat_eq(detail, 120))
+		return fail("bounded cwd POSIX unavailability");
+	return 0;
+#endif
+}
+
 static int http_unavailable_check(void)
 {
 	const char *reason = "HTTP transport unavailable in C host";
@@ -1110,6 +1685,13 @@ int main(int argc, char **argv)
 
 	if (!ouro_host_utf8_argv(&argc, &argv))
 		return fail("invalid Windows command line");
+	if (argc == 2 && strcmp(argv[1], "--string-concat-only") == 0)
+		return binary_string_concat_check();
+	if (argc == 2 && strcmp(argv[1], "--string-operations-only") == 0)
+		return binary_string_equality_check() || binary_string_concat_check() ||
+		       binary_string_operations_check() || string_text_search_check() ||
+		       string_segments_check() || string_replace_check() || packed_string_conversion_check() ||
+		       json_string_primitive_check();
 	if (argc >= 2 && strcmp(argv[1], "--host-arguments") == 0) {
 		int i;
 		ouro_io_set_argv(argc, argv);
@@ -1124,6 +1706,22 @@ int main(int argc, char **argv)
 		fputs("capture-err", stderr);
 		return 7;
 	}
+	if (argc == 2 && strcmp(argv[1], "--text-stream-child") == 0) {
+		static const unsigned char out[] = "skipcapture-out\0tail";
+		static const unsigned char err[] = "err\0tail";
+		ouro_v *packed = ouro_packed(out, sizeof out - 1U);
+		ouro_v *chunks[] = { ouro_str("capture-"), ouro_bytes(err, sizeof err - 1U) };
+		ouro_v *joined = ouro_ctor(OURO_TAG_CAT, 2, chunks);
+		ouro_v *unit = ouro_ctor(0, 0, 0);
+
+		ouro_apply(ouro_apply(ouro_io_prim_req("prim_stdout_write"), ouro_packed_suffix(packed, 4)), unit);
+		ouro_apply(ouro_apply(ouro_io_prim_req("prim_stderr_write"), joined), unit);
+		return 0;
+	}
+#ifdef _WIN32
+	if (argc >= 2 && strcmp(argv[1], "--bounded-cwd-child") == 0)
+		return bounded_directory_child(argc, argv);
+#endif
 	if (argc == 2 && strcmp(argv[1], "--bounded-echo") == 0) {
 		char chunk[4096];
 		size_t got;
@@ -1148,18 +1746,82 @@ int main(int argc, char **argv)
 	if (argc == 2 && strcmp(argv[1], "--bounded-child73") == 0)
 		return 73;
 	ouro_rt_warmup();
-	if (argc == 3 && (strcmp(argv[1], "--read-file") == 0 || strcmp(argv[1], "--read-nul-path") == 0 ||
+#ifndef _WIN32
+	if (argc == 3 && strcmp(argv[1], "--write-symlink") == 0) {
+		w = ouro_apply(ouro_io_prim_req("prim_fs_write_file"), ouro_str(argv[2]));
+		w = ouro_apply(w, ouro_str("overwrite\n"));
+		(void)ouro_apply(w, ouro_ctor(0, 0, 0));
+		return fail("symlink writer returned");
+	}
+#endif
+	if (argc == 2 && strcmp(argv[1], "--stdin-bytes") == 0) {
+		static const unsigned char header_bytes[] = {0, 13, 10, 255};
+		ouro_v *action;
+		ouro_v *single;
+		ouro_v *first = 0;
+		int attempt;
+#ifdef _WIN32
+		if (_setmode(_fileno(stdin), _O_BINARY) == -1 || _setmode(_fileno(stdout), _O_BINARY) == -1)
+			return fail("stdin byte observer binary mode");
+#endif
+		r = ouro_apply(ouro_apply(ouro_io_prim_req("prim_stdin_read_bytes"), ouro_nat(0)), ouro_ctor(0, 0, 0));
+		if (!host_bytes_eq(r, "", 0))
+			return fail("zero-byte stdin read");
+		single = ouro_apply(ouro_io_prim_req("prim_stdin_read_bytes"), ouro_nat(1));
+		for (attempt = 0; attempt < (int)sizeof header_bytes; attempt++) {
+			if (ungetc(header_bytes[attempt], stdin) == EOF)
+				return fail("stdin single-byte pushback");
+			r = ouro_apply(single, ouro_ctor(0, 0, 0));
+			if (!host_bytes_eq(r, (const char *)header_bytes + attempt, 1))
+				return fail("stdin single-byte contents");
+			if (attempt == 0)
+				first = r;
+		}
+		if (!host_bytes_eq(first, (const char *)header_bytes, 1))
+			return fail("stdin single-byte result changed after reuse");
+		action = ouro_apply(ouro_io_prim_req("prim_stdin_read_bytes"), ouro_nat(8));
+		for (attempt = 0; attempt < 2; attempt++) {
+			r = ouro_apply(action, ouro_ctor(0, 0, 0));
+			if (r == 0 || r->tag != OURO_TAG_BYTES || r->n < 0 || r->n > 8)
+				return fail("stdin read did not return bounded packed bytes");
+			if (r->n && fwrite(r->u.s, 1, (size_t)r->n, stdout) != (size_t)r->n)
+				return fail("stdin byte observer output");
+		}
+		if (feof(stdin) && !host_bytes_eq(ouro_apply(single, ouro_ctor(0, 0, 0)), "", 0))
+			return fail("stdin single-byte EOF contents");
+		return ferror(stdin) ? fail("stdin byte observer read") : 0;
+	}
+	if (argc == 3 && (strcmp(argv[1], "--read-file") == 0 || strcmp(argv[1], "--read-status") == 0 ||
+	    strcmp(argv[1], "--read-deferred-status") == 0 || strcmp(argv[1], "--read-status-nul-path") == 0 ||
+	    strcmp(argv[1], "--read-status-invalid-utf8-path") == 0 || strcmp(argv[1], "--read-nul-path") == 0 ||
 	    strcmp(argv[1], "--read-invalid-utf8-path") == 0)) {
 		ouro_v *name = ouro_str(argv[2]);
+		int status_read = strstr(argv[1], "status") != 0;
 		ouro_io_set_argv(argc, argv);
-		if (strcmp(argv[1], "--read-nul-path") == 0) {
+		if (strcmp(argv[1], "--read-nul-path") == 0 || strcmp(argv[1], "--read-status-nul-path") == 0) {
 			static const unsigned char suffix[] = { 0, 'x' };
 			name = ouro_apply(ouro_apply(ouro_io_prim_req("prim_string_concat"), name),
 			    ouro_packed(suffix, sizeof suffix));
 		}
-		if (strcmp(argv[1], "--read-invalid-utf8-path") == 0)
+		if (strcmp(argv[1], "--read-invalid-utf8-path") == 0 || strcmp(argv[1], "--read-status-invalid-utf8-path") == 0)
 			name = ouro_apply(ouro_apply(ouro_io_prim_req("prim_string_concat"), name), ouro_str("\xC0\xAF"));
-		r = ouro_apply(ouro_apply(ouro_io_prim_req("prim_fs_read_file"), name), ouro_ctor(0, 0, 0));
+		r = ouro_apply(ouro_io_prim_req(status_read ? "prim_fs_read_file_status" : "prim_fs_read_file"), name);
+		if (strcmp(argv[1], "--read-deferred-status") == 0 && remove(argv[2]) != 0)
+			return fail("deferred read removal");
+		r = ouro_apply(r, ouro_ctor(0, 0, 0));
+		if (status_read) {
+			ouro_v *status;
+			if (r == 0 || r->tag != 0 || r->n != 2 || OURO_F(r, 0)->tag != OURO_TAG_NAT)
+				return fail("read status did not return status/body pair");
+			status = OURO_F(r, 0);
+			r = OURO_F(r, 1);
+			if (status->n != 0) {
+				if (!host_bytes_eq(r, "", 0))
+					return fail("read status failure exposed partial bytes");
+				fprintf(stderr, "read OS status=%lu\n", (unsigned long)status->n);
+				return 1;
+			}
+		}
 		if (r == 0 || r->tag != OURO_TAG_BYTES || r->n < 0)
 			return fail("read did not return packed bytes");
 		if (fwrite(r->u.s, 1, (size_t)r->n, stdout) != (size_t)r->n)
@@ -1207,10 +1869,20 @@ int main(int argc, char **argv)
 		(void)ouro_apply(w, ouro_ctor(0, 0, 0));
 		return fail("invalid Runtime loop condition returned");
 	}
-	if (argc == 2 && strcmp(argv[1], "--bounded-only") == 0)
-		return process_bounded_check(argv[0]);
-	if (process_bounded_check(argv[0]) != 0)
+	{
+		char *dir = "_build/c";
+#ifdef _WIN32
+		_mkdir("_build");
+		_mkdir(dir);
+#else
+		mkdir("_build", 0777);
+		mkdir(dir, 0777);
+#endif
+	}
+	if (process_bounded_check(argv[0]) != 0 || process_bounded_at_check(argv[0]) != 0)
 		return 1;
+	if (argc == 2 && strcmp(argv[1], "--bounded-only") == 0)
+		return 0;
 	if (argc == 2 && strcmp(argv[1], "--inherit-only") == 0)
 		return process_inherit_unavailable_check();
 	if (process_inherit_unavailable_check() != 0)
@@ -1230,19 +1902,11 @@ int main(int argc, char **argv)
 	if (ouro_io_prim("io_bind") == 0)
 		return fail("missing io_bind");
 
-	{
-		char *dir = "_build/c";
-#ifdef _WIN32
-		_mkdir("_build");
-		_mkdir(dir);
-#else
-		mkdir("_build", 0777);
-		mkdir(dir, 0777);
-#endif
-	}
 	if (runtime_operations_check() != 0)
 		return 1;
 	if (packed_codes_reverse_check() != 0)
+		return 1;
+	if (deep_codes_concat_check() != 0)
 		return 1;
 	if (binary_file_roundtrip_check() != 0)
 		return 1;
@@ -1252,8 +1916,26 @@ int main(int argc, char **argv)
 		return 1;
 	if (binary_string_operations_check() != 0)
 		return 1;
+	if (string_text_search_check() != 0)
+		return 1;
+	if (string_segments_check() != 0)
+		return 1;
+	if (string_replace_check() != 0)
+		return 1;
+	if (packed_string_conversion_check() != 0)
+		return 1;
 	if (json_string_primitive_check() != 0)
 		return 1;
+	w = ouro_io_prim("ouro.managed.allocated_requested_bytes");
+	if (w == 0)
+		return fail("managed requested bytes action unavailable");
+	r = ouro_apply(w, ouro_ctor(0, 0, 0));
+	if (r == 0 || r->tag != 0 || r->n != 0)
+		return fail("C heap observer must return Nothing");
+	r = ouro_apply(w, ouro_ctor(0, 0, 0));
+	if (r == 0 || r->tag != 0 || r->n != 0)
+		return fail("C heap observer action reuse");
+
 	if (private_temp_check() != 0)
 		return 1;
 	if (file_rename_check() != 0)
@@ -1287,18 +1969,17 @@ int main(int argc, char **argv)
 	unlink(link);
 	if (symlink("io_selftest_target.txt", link) != 0)
 		return fail("symlink setup");
-	w = ouro_io_prim("prim_fs_write_file");
-	w = ouro_apply(w, ouro_str(link));
-	w = ouro_apply(w, ouro_str("overwrite\n"));
-	(void)ouro_apply(w, ouro_ctor(0, 0, 0));
+	if (file_write_refusal_check(argv[0], link) != 0)
+		return 1;
 	f = fopen(target, "rb");
-	if (f == 0 || fgets(buf, (int)sizeof buf, f) == 0) {
+	if (f == 0 || fread(buf, 1, sizeof buf, f) != 5U || ferror(f)) {
 		if (f != 0)
 			fclose(f);
 		return fail("symlink target read");
 	}
-	fclose(f);
-	if (strcmp(buf, "keep\n") != 0)
+	if (fclose(f) != 0)
+		return fail("symlink target close");
+	if (memcmp(buf, "keep\n", 5U) != 0)
 		return fail("write followed symlink");
 	unlink(link);
 #endif

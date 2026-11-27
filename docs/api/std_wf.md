@@ -6,43 +6,43 @@ Declarations: 7.
 
 ## inductive Unit
 
-```
+```ouro
 inductive Unit : Type
 ```
 
 ## inductive Nat
 
-```
+```ouro
 inductive Nat : Type
 ```
 
 ## inductive Acc
 
-```
+```ouro
 inductive Acc (A : Type) (R : A -> A -> Type) : A -> Type
 ```
 
 ## def acc_point
 
-```
+```ouro
 def acc_point (A : Type) (R : A -> A -> Type) (x : A) (a : Acc A R x) : A
 ```
 
 ## def acc_step
 
-```
+```ouro
 def acc_step (A : Type) (R : A -> A -> Type) (x : A) (a : Acc A R x) : ((y : A) -> R y x -> Acc A R y)
 ```
 
 ## def acc_map
 
-```
+```ouro
 def acc_map (A : Type) (R : A -> A -> Type) (B : Type) (f : A -> B) (x : A) (a : Acc A R x) : B
 ```
 
 ## def acc_elim_const
 
-```
+```ouro
 def acc_elim_const (A : Type) (R : A -> A -> Type) (P : A -> Type) (step : (x : A) -> ((y : A) -> R y x -> Acc A R y) -> P x) (x : A) (a : Acc A R x) : P x
 ```
 

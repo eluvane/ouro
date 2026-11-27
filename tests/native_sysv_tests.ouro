@@ -1,0 +1,237 @@
+-- Pure producer/ABI laws plus actual ELF payloads for independent Linux runs.
+import "native_sysv_fixtures.ouro",
+  "native_elf_fixtures.ouro",
+  "../std/test.ouro";
+
+def sysv_test_error (A : Type) (name : String) (accept : LinuxCodegenError -> Bool)
+    (actual : Either LinuxCodegenError A) : Test :=
+    match actual with | Left error => assert_true name (accept error)
+    | Right _ => test_fail name "invalid input accepted" end;
+
+def sysv_test_mir_error (name : String) (accept : MirError -> Bool) (program : MirProgram) : Test :=
+    sysv_test_error (List Nat) name
+      (fun (error : LinuxCodegenError) =>
+        if let LinuxMirRejected problem := error then accept problem else False)
+      (linux_codegen_program mir_default_limits program);
+
+def sysv_test_image (name : String) : Test :=
+    match sysv_fixture_named name with
+    | Nothing => test_fail name "fixture absent"
+    | Just result => match result with | Left _ => test_fail name "ELF producer rejected fixture"
+      | Right bytes => assert_true name
+          (andb (pe_bytes_equal (take Nat 8 bytes) [127,69,76,70,2,1,1,0])
+            (andb (ltb_nat elf_text_offset (length Nat bytes))
+              (andb (eq_nat (elf_test_read_word bytes 24 8) (add elf_image_base elf_text_offset))
+                (andb (eq_nat (elf_test_read_word bytes 96 8) (length Nat bytes))
+                  (andb (eq_nat (elf_test_read_word bytes 104 8) (length Nat bytes))
+                    (all Nat (fun (byte : Nat) => ltb_nat byte 256) bytes)))))) end end;
+
+def sysv_test_registers : Bool :=
+    pe_bytes_equal
+      (map Nat Nat (fun (index : Nat) => match sysv_argument_register index with
+        | Nothing => 255 | Just reg => add (x64_register_low reg) (mul 8 (x64_register_high reg)) end) [0,1,2,3,4,5])
+      [7,6,2,1,8,9];
+
+def sysv_test_frame (name : String) (function : MirFunction) (allocation : Nat) (first_slot : Nat) : Test :=
+    match sysv_frame function with | Left _ => test_fail name "frame rejected"
+    | Right frame => match frame with | CodegenFrameOf actual slots => assert_true name
+        (andb (eq_nat actual allocation)
+          (match slots with | Nil => eq_nat first_slot 0
+            | Cons slot _ => match slot with | CodegenSlotAt _ _ offset => eq_nat offset first_slot end end)) end end;
+
+def sysv_test_offset (name : String) (index : Nat) (base : Nat) (expected : List Nat) : Test :=
+    match sysv_stack_offset index base with | Left _ => test_fail name "stack offset rejected"
+    | Right disp => match x64_displacement_bytes disp with | Left _ => test_fail name "displacement rejected"
+      | Right bytes => assert_true name (pe_bytes_equal bytes expected) end end;
+
+def sysv_test_many_locals (count : Nat) : MirProgram :=
+    sysv_fixture_program [sysv_fixture_body 1 [] (sysv_fixture_args count MirU64) (Just MirType MirU32) []
+      (MirReturn (Just MirValue (sysv_fixture_word MirU32 42)))];
+
+def sysv_test_with_data : MirProgram :=
+    MirProgramDef [sysv_fixture_entry] [MirDataDef 7 False [195]] [] 1;
+
+def sysv_test_with_import : MirProgram :=
+    MirProgramDef [sysv_fixture_entry] []
+      [MirLibraryDef [108,105,98]
+        [MirExternDef MirNoGc 7 [102,110] (MirSignatureOf [] (Nothing MirType))]] 1;
+
+def sysv_test_bad_call : MirProgram :=
+    sysv_fixture_program
+      [sysv_fixture_body 1 [] [MirLocalDef 0 MirU64] (Just MirType MirU32)
+        [MirCall(MirNoGc, Just Nat 0, MirDirect 2, [])]
+        (MirReturn (Just MirValue (sysv_fixture_word MirU32 42))),
+       sysv_fixture_weighted,sysv_fixture_leaf];
+
+def sysv_test_bad_gc : MirProgram :=
+    sysv_fixture_program
+      [sysv_fixture_body 1 [] [MirLocalDef 0 MirRawPtr,MirLocalDef 1 MirU32] (Just MirType MirU32)
+        [MirAddress 0 2, MirCall(MirNoGc, Just Nat 1,
+          MirIndirect sysv_fixture_signature (MirUse 0), sysv_fixture_values)]
+        (MirReturn (Just MirValue (MirUse 1))),sysv_fixture_callee_contract];
+
+def sysv_test_uninitialized : MirProgram :=
+    sysv_fixture_program [sysv_fixture_body 1 [] [MirLocalDef 0 MirU32] (Just MirType MirU32) []
+      (MirReturn (Just MirValue (MirUse 0)))];
+
+def sysv_test_invalid_literal : MirProgram :=
+    sysv_fixture_program [sysv_fixture_body 1 [] [] (Just MirType MirU32) []
+      (MirReturn (Just MirValue (MirBits MirU32 (X64Words64 (X64Bytes32 256 0 0 0) (pe_word32 0)))))];
+
+def sysv_test_gc_fuel : MirProgram :=
+    sysv_fixture_program
+      [sysv_fixture_body 1 [] [] (Just MirType MirU32)
+        [MirCall(MirMayGc, Nothing Nat, MirDirect 2, [])]
+        (MirReturn (Just MirValue (sysv_fixture_word MirU32 42))),
+       sysv_fixture_body 2 [] [] (Nothing MirType)
+        [MirCall(MirMayGc, Nothing Nat, MirDirect 3, [])] (MirReturn (Nothing MirValue)),
+       sysv_fixture_body 3 [] [] (Nothing MirType)
+        [MirCall(MirMayGc, Nothing Nat, MirIndirect (MirSignatureOf [] (Nothing MirType))
+          (sysv_fixture_word MirRawPtr 0), [])] (MirReturn (Nothing MirValue))];
+
+def sysv_test_managed_local : MirProgram :=
+    sysv_fixture_program [sysv_fixture_body 1 [] [MirLocalDef 7 MirManagedPtr] (Just MirType MirU32) []
+      (MirReturn (Just MirValue (sysv_fixture_word MirU32 42)))];
+
+def sysv_test_managed_context : MirProgram :=
+    sysv_fixture_program [sysv_fixture_body 1 [] [MirLocalDef 0 MirRawPtr] (Just MirType MirU32)
+      [MirManagedContext 0] (MirReturn (Just MirValue (sysv_fixture_word MirU32 42)))];
+
+def sysv_test_void_entry : MirProgram :=
+    sysv_fixture_program [sysv_fixture_body 1 [] [] (Nothing MirType) [] (MirReturn (Nothing MirValue))];
+
+def sysv_test_managed_result : MirProgram :=
+    sysv_fixture_program [sysv_fixture_entry,
+      sysv_fixture_body 2 [] [] (Just MirType MirManagedPtr) []
+        (MirReturn (Just MirValue (sysv_fixture_word MirManagedPtr 0)))];
+
+def sysv_test_link_error (name : String) (accept : PeError -> Bool) (bytes : List Nat)
+    (symbols : List PeSymbol) (fixups : List PeFixup) : Test :=
+    sysv_test_error (List Nat) name
+      (fun (error : LinuxCodegenError) =>
+        if let LinuxFixupRejected problem := error then accept problem else False)
+      (linux_link_text bytes symbols fixups);
+
+def sysv_test_laws : List Test :=
+    [assert_true "SysV six registers have independent architectural positions" sysv_test_registers,
+     assert_true "SysV register lookup has no clamp fallback"
+       (match sysv_argument_register 6 with | Nothing => True | Just _ => False end),
+     sysv_test_frame "SysV zero-argument frame has no four home slots" sysv_fixture_entry 8 0,
+     sysv_test_frame "SysV eight-argument caller reserves only two stack arguments" (sysv_fixture_caller False) 56 16,
+     sysv_test_offset "SysV seventh outgoing argument starts at RSP" 6 0 [0,0,0,0],
+     sysv_test_offset "SysV eighth outgoing argument is RSP+8" 7 0 [8,0,0,0],
+     sysv_test_offset "SysV seventh incoming argument skips frame and return address" 6 48 [48,0,0,0],
+     sysv_test_offset "SysV eighth incoming argument is next eightbyte" 7 48 [56,0,0,0],
+     assert_true "SysV positive displacement overflow is rejected before word emission"
+       (match sysv_stack_offset 6 (S pe_max_rva) with
+        | Left problem => if let SysvOffsetOutOfRange value := (problem : SysvCallError) then
+            eq_nat value (S pe_max_rva)
+          else False
+        | Right _ => False end),
+     assert_true "SysV register index cannot become a stack offset"
+       (match sysv_stack_offset 5 0 with
+        | Left problem => if let SysvArgumentOutOfRange value := (problem : SysvCallError) then eq_nat value 5 else False
+        | Right _ => False end),
+     assert_true "SysV 4088-byte frame is still accepted by the full checked producer"
+       (match linux_codegen_program mir_default_limits (sysv_test_many_locals 511) with | Left _ => False | Right _ => True end),
+     sysv_test_error (List Nat) "SysV frame crossing 4096 is a typed ABI rejection"
+       (fun (error : LinuxCodegenError) => if let LinuxSysvRejected id problem := error then
+           andb (eq_nat id 1)
+           (if let SysvFrameTooLarge size := (problem : SysvCallError) then eq_nat size 4104 else False)
+         else False)
+       (linux_codegen_program mir_default_limits (sysv_test_many_locals 512)),
+     sysv_test_mir_error "MIR call arity rejection precedes Linux encoding"
+       (fun (error : MirError) => if let MirInvalidCall id := error then eq_nat id 1 else False) sysv_test_bad_call,
+     sysv_test_mir_error "MIR indirect NoGc annotation remains a strict failure"
+       (fun (error : MirError) => if let MirGcCallMismatch caller target := error then
+           andb (eq_nat caller 1) (eq_nat target 0)
+         else False) sysv_test_bad_gc,
+     sysv_test_mir_error "MIR definite assignment remains a strict failure"
+       (fun (error : MirError) => if let MirUninitialized block local := error then
+           andb (eq_nat block 0) (eq_nat local 0)
+         else False) sysv_test_uninitialized,
+     sysv_test_mir_error "Malformed literal byte remains compiler-owned rejection"
+       (fun (error : MirError) => if let MirInvalidLiteral := error then True else False) sysv_test_invalid_literal,
+     sysv_test_error (List Nat) "MIR exhausted bounds precede the unsupported import slice"
+       (fun (error : LinuxCodegenError) => if let LinuxMirRejected problem := error then
+           if let MirResourceExhausted := (problem : MirError) then True else False
+         else False)
+       (linux_codegen_program (MirLimitsWith 0 0 0) sysv_test_with_import),
+     match mir_check_program (MirLimitsWith 4096 1048576 3) sysv_test_gc_fuel with
+     | Left _ => test_fail "MIR GC fixed-point exhaustion cannot produce Linux bytes" "pre-GC checks did not pass"
+     | Right _ => sysv_test_error (List Nat) "MIR GC fixed-point exhaustion cannot produce Linux bytes"
+         (fun (error : LinuxCodegenError) => if let LinuxMirRejected problem := error then
+             if let MirResourceExhausted := (problem : MirError) then True else False
+           else False)
+         (linux_codegen_program (MirLimitsWith 4096 1048576 3) sysv_test_gc_fuel) end,
+     sysv_test_error (List Nat) "Linux rejects a valid foreign library"
+       (fun (error : LinuxCodegenError) => if let LinuxImportsUnsupported name := error then
+           pe_bytes_equal name [108,105,98]
+         else False) (linux_codegen_program mir_default_limits sysv_test_with_import),
+     assert_true "Linux accepts a checked readonly data object"
+       (match linux_codegen_program mir_default_limits sysv_test_with_data with
+        | Left _ => False | Right bytes => andb (eq_nat (elf_test_read_word bytes 56 2) 3)
+            (pe_bytes_equal (drop Nat 4096 bytes) [195,0,0,0,0,0,0,0]) end),
+     sysv_test_error (List Nat) "Linux rejects managed stack locals"
+       (fun (error : LinuxCodegenError) => if let LinuxManagedTypeUnsupported id := error then eq_nat id 7 else False)
+       (linux_codegen_program mir_default_limits sysv_test_managed_local),
+     sysv_test_error (List Nat) "Linux rejects a checked managed context operation"
+       (fun (error : LinuxCodegenError) => if let LinuxOperationUnsupported id := error then eq_nat id 1 else False)
+       (linux_codegen_program mir_default_limits sysv_test_managed_context),
+     sysv_test_error Unit "Linux allocation guard rejects the compiler-private managed operation"
+       (fun (error : LinuxCodegenError) => if let LinuxOperationUnsupported id := error then eq_nat id 1 else False)
+       (linux_check_instruction 1 (MirManagedAlloc 0 1 2 3 (sysv_fixture_word MirUSize 8))),
+     sysv_test_error (List Nat) "Linux entry requires its explicit U32 exit result"
+       (fun (error : LinuxCodegenError) => if let LinuxSignatureUnsupported id := error then eq_nat id 1 else False)
+       (linux_codegen_program mir_default_limits sysv_test_void_entry),
+     sysv_test_error (List Nat) "Linux rejects managed function result signatures"
+       (fun (error : LinuxCodegenError) => if let LinuxSignatureUnsupported id := error then eq_nat id 2 else False)
+       (linux_codegen_program mir_default_limits sysv_test_managed_result),
+     assert_true "Linux indirect signatures admit only the scalar slice"
+       (notb (linux_signature_supported (MirSignatureOf [MirManagedPtr] (Just MirType MirU32)))),
+     sysv_test_link_error "Linux text linker checks the first invalid byte before fixups"
+       (fun (error : PeError) => if let PeInvalidByte value := error then eq_nat value 256 else False)
+       [256,257] [] [PeRel32 PeText 0 4 (PeSymbolTarget 1)],
+     sysv_test_link_error "Linux text linker rejects missing local call symbol"
+       (fun (error : PeError) => if let PeMissingSymbol id := error then eq_nat id 9 else False)
+       [232,0,0,0,0] [] [PeRel32 PeText 1 5 (PeSymbolTarget 9)],
+     sysv_test_link_error "Linux text linker retains nonzero fixup rejection"
+       (fun (error : PeError) => if let PeNonzeroFixup offset := error then eq_nat offset 1 else False)
+       [232,1,0,0,0,195] [PeNamedSymbol 2 PeText 5] [PeRel32 PeText 1 5 (PeSymbolTarget 2)],
+     sysv_test_link_error "Linux text linker cannot accept an import fixup"
+       (fun (error : PeError) => if let PeInvalidFixup offset := error then eq_nat offset 1 else False)
+       [232,0,0,0,0] [] [PeRel32 PeText 1 5 (PeImportTarget 9)],
+     sysv_test_link_error "Linux text linker cannot accept absolute-address relocation"
+       (fun (error : PeError) => if let PeInvalidFixup offset := error then eq_nat offset 0 else False)
+       [0,0,0,0,0,0,0,0,195] [PeNamedSymbol 2 PeText 8] [PeVa64 PeText 0 (PeSymbolTarget 2)],
+     assert_true "Linux text linker resolves an independent backwards rel32 byte vector"
+       (match linux_link_text [195,232,0,0,0,0] [PeNamedSymbol 2 PeText 0]
+         [PeRel32 PeText 2 6 (PeSymbolTarget 2)] with
+        | Left _ => False | Right bytes => pe_bytes_equal bytes [195,232,250,255,255,255] end)];
+
+def sysv_test_error_phase (error : LinuxCodegenError) : String :=
+    match error with
+    | LinuxMirRejected _ => "mir" | LinuxImportsUnsupported _ => "imports" | LinuxDataUnsupported _ => "data"
+    | LinuxManagedTypeUnsupported _ => "managed-type" | LinuxOperationUnsupported _ => "managed-operation"
+    | LinuxSignatureUnsupported _ => "signature" | LinuxSysvRejected _ _ => "sysv"
+    | LinuxNativeRejected _ => "encoding" | LinuxFixupRejected _ => "fixup" | LinuxElfRejected _ => "elf" end;
+
+def sysv_test_emit (name : String) : IO Unit :=
+    match sysv_fixture_named name with
+    | Nothing => do eprintln (str_concat "SYSV_ERROR unknown-image:" name); exit 2
+    | Just result => match result with
+      | Left error => do eprintln (str_cat4 "SYSV_ERROR " name ":" (sysv_test_error_phase error)); exit 1
+      | Right bytes => println (str_join(",", map Nat String str_of_nat bytes)) end end;
+
+-- @entry main
+def main : IO Unit :=
+    do let! arguments := argv;
+       match eq_nat (length String arguments) 1 with
+       | True => test_run (append Test sysv_test_laws
+           (map String Test sysv_test_image ["mir-calls","caller8","indirect8","callee8","narrow3"]))
+       | False => match andb (eq_nat (length String arguments) 3)
+           (str_eq (nth String "" 1 arguments) "--image") with
+         | True => sysv_test_emit (nth String "" 2 arguments)
+         | False => do eprintln "usage: native_sysv_tests [--image mir-calls|caller8|indirect8|callee8|narrow3]"; exit 2
+         end
+       end;

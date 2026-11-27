@@ -1,0 +1,74 @@
+import "sysv_call.ouro",
+  "codegen_ops.ouro";
+
+-- Slots and the trailing shadow header belong to the same checked frame.
+-- Root offsets retain the managed runtime's 32-byte minimum.
+def sysv_managed_frame (function : MirFunction) : Either SysvCallError CodegenFrame :=
+    match mir_function_has_roots function with
+    | False => sysv_frame function
+    | True => match function with | MirFunctionDef _ _ args locals _ _ blocks =>
+      let count : Nat := foldr MirBlock Nat (fun (block : MirBlock) (other : Nat) =>
+        match block with | MirBlockDef _ instructions _ =>
+          maxNat other (foldr MirInstruction Nat (fun (instruction : MirInstruction) (n : Nat) =>
+            maxNat n (codegen_call_arity instruction)) 0 instructions) end) 0 blocks in
+      let outgoing : Nat := maxNat 32 (mul (sub count 6) 8) in
+      let all_locals : List MirLocal := append MirLocal args locals in
+      let occupied : Nat := add (add outgoing (mul 8 (length MirLocal all_locals))) 24 in
+      let allocation : Nat := sub (pe_align 16 (add occupied 8)) 8 in
+      match ltb_nat allocation sysv_frame_allocation_limit with
+      | False => Left SysvCallError CodegenFrame (SysvFrameTooLarge allocation)
+      | True => Right SysvCallError CodegenFrame
+          (CodegenFrameOf allocation (codegen_slots all_locals outgoing)) end end end;
+
+-- Descriptor IDs advance for rootless functions as well as rooted functions.
+def sysv_managed_shadow_data : List MirFunction -> Nat -> Either SysvCallError (List MirData) :=
+  fix descriptors (functions : List MirFunction) (symbol : Nat) : Either SysvCallError (List MirData) :=
+    match functions with
+    | Nil => Right SysvCallError (List MirData) []
+    | Cons function rest => match leb_nat symbol pe_max_rva with
+      | False => Left SysvCallError (List MirData) (SysvOffsetOutOfRange symbol)
+      | True => let? (Left, Right) : Either SysvCallError (List MirData) do
+          let frame : CodegenFrame := sysv_managed_frame function?;
+          let tail : List MirData := descriptors rest (S symbol)?;
+          match frame with | CodegenFrameOf _ slots =>
+            match codegen_root_slots slots with
+            | Nil => tail
+            | Cons root more =>
+              let roots : List NativeRootSlot := Cons NativeRootSlot root more in
+              Cons MirData (MirDataDef symbol False
+                (append Nat (pe_le64_rva (length NativeRootSlot roots))
+                  (concat_map NativeRootSlot Nat (fun (slot : NativeRootSlot) => match slot with
+                    | NativeRootAt _ offset => pe_le64_rva offset end) roots))) tail
+            end end
+        end end end;
+
+def sysv_managed_context_size (descriptors : Nat) : Either SysvCallError Nat :=
+    let bytes : Nat := add 56 (mul 16 descriptors) in
+    match leb_nat bytes pe_max_rva with
+    | False => Left SysvCallError Nat (SysvOffsetOutOfRange bytes)
+    | True => Right SysvCallError Nat bytes end;
+
+def sysv_managed_runtime_data (program : MirProgram) : Either SysvCallError (List MirData) :=
+    match mir_managed_enabled program with
+    | False => Right SysvCallError (List MirData) []
+    | True => match program with | MirProgramDef functions _ _ _ =>
+      let symbol : Nat := codegen_runtime_id program in
+      match leb_nat symbol pe_max_rva with
+      | False => Left SysvCallError (List MirData) (SysvOffsetOutOfRange symbol)
+      | True => let? (Left, Right) : Either SysvCallError (List MirData) do
+          let shadows : List MirData := sysv_managed_shadow_data functions (S symbol)?;
+          let bytes : Nat := sysv_managed_context_size (length Nat (codegen_runtime_descriptors program))?;
+          Cons MirData (MirDataDef symbol True (pe_zeros bytes)) shadows
+        end end end end;
+
+def sysv_managed_alloc (program : MirProgram) (slots : List CodegenSlot) (block : Nat) (site : Nat)
+    (id : Nat) (allocator : Nat) (collector : Nat) (descriptor : Nat) (bytes : MirValue)
+    : Either SysvCallError (List CodegenAtom) :=
+    sysv_from_codegen (List CodegenAtom)
+      (codegen_managed_alloc_arguments X64Rdi X64Rsi X64Rdx
+        program slots block site id allocator collector descriptor bytes);
+
+def sysv_managed_context (program : MirProgram) (slots : List CodegenSlot) (id : Nat)
+    : Either SysvCallError (List CodegenAtom) :=
+    sysv_from_codegen (List CodegenAtom)
+      (codegen_instruction program slots 0 0 (MirManagedContext id));

@@ -45,7 +45,10 @@ else
 	OURO_TEST_BUILD="$ROOT/scripts/build_tool.sh"
 	OURO_HOSTED_COMPILER_WRAPPER="$OURO_TEST_CHECK"
 	export OURO_TEST_CHECK OURO_TEST_BUILD OURO_HOSTED_COMPILER_WRAPPER
-	if ! sh "$ROOT/scripts/build_tool.sh" tools/test/main.ouro "$SUITE" >"$OUT/suite.build" 2>&1; then
+	if [ "${OURO_CI_PREPARED_TEST:-}" = 1 ]; then
+		"$PYTHON" "$ROOT/scripts/compiler_shards.py" --runner "$SUITE" \
+			--verify-with "${OURO_C_BUILD_DIR:-_build/c}/ouro1"
+	elif ! sh "$ROOT/scripts/build_tool.sh" tools/test/main.ouro "$SUITE" >"$OUT/suite.build" 2>&1; then
 		echo "SAMPLES_SUITE: FAIL native suite build" >&2
 		tail -n 20 "$OUT/suite.build" >&2
 		exit 1
@@ -62,6 +65,7 @@ LC_ALL=C sort -u "$OUT/cases-all.txt" >"$OUT/cases-unique.txt"
 LC_ALL=C sort "$OUT/cases-1.txt" "$OUT/cases-2.txt" >"$OUT/cases-union.txt"
 cmp "$OUT/cases-expected.txt" "$OUT/cases-unique.txt"
 cmp "$OUT/cases-expected.txt" "$OUT/cases-union.txt"
+"$PYTHON" "$ROOT/scripts/ci_sample_paths.py" "$OUT/cases-1.txt" "$OUT/cases-2.txt"
 awk 'FNR == NR { left[$2]++; next } { right[$2]++ }
   END { for (kind in left) if (left[kind] < right[kind] || left[kind] > right[kind] + 1) exit 1;
         if (left["native"] == 0 || right["native"] == 0 || left["check"] == 0 || right["check"] == 0) exit 1 }' \

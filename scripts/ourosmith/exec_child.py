@@ -22,17 +22,29 @@ def apply_rlimit(module, which, candidates):
 
 
 def main():
-    limit, *command = sys.argv[1:]
     try:
+        arguments = sys.argv[1:]
+        shared_job = None
+        if arguments[:1] == ["--shared-job"]:
+            shared_job, *arguments = arguments[1:]
+        limit, *command = arguments
+        if not command:
+            raise ValueError("missing limited command")
         if os.name == "nt":
             # This file is executed by path; expose the repository's scripts
             # root so the job adapter and its shared host helpers resolve.
             sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
             from ourosmith.windows_job import join
 
+            # Windows job nesting requires parent assignment before child assignment.
+            if shared_job is not None:
+                join(shared_job)
             join(limit)
             return subprocess.call(command, executable=command[0])
         import resource
+
+        if shared_job is not None:
+            raise ValueError("shared jobs require Windows")
 
         memory = int(limit) * 1024 * 1024
         address = memory

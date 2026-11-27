@@ -4,6 +4,6 @@ Declarations: 1.
 
 ## inductive Json
 
-```
+```ouro
 inductive Json : Type
 ```

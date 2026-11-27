@@ -9,6 +9,7 @@ import "../compiler/lexer.ouro",
   "../compiler/preprocess_import.ouro",
   "../compiler/preprocess_record.ouro",
   "../compiler/pipeline.ouro",
+  "../std/collections.ouro",
   "../std/num.ouro",
   "../std/io.ouro";
 
@@ -143,6 +144,75 @@ def abi_unit_error (fuel : Nat) (source : String) (expected : Nat) : Bool :=
     | UErr code _ _ => eqNat code expected
     end;
 
+def abi_same_intern (left : InternState) (right : InternState) : Bool :=
+    let same_rows : List (Pair (List Nat) Nat) -> List (Pair (List Nat) Nat) -> Bool :=
+      list_eq (Pair (List Nat) Nat)
+        (fun (row : Pair (List Nat) Nat) (other : Pair (List Nat) Nat) =>
+          match row, other with | MkPair key id, MkPair key2 id2 =>
+            andb(source_bytes_equal key key2, eqNat id id2) end) in
+    match left, right with
+    | MkIntern names next texts next_text, MkIntern names2 next2 texts2 next_text2 =>
+        andb (eqNat next next2) (andb (eqNat next_text next_text2)
+          (andb(same_rows names names2, same_rows texts texts2)))
+    end;
+
+def abi_carried_error (flat : InternState) (indexed : LexerIntern)
+    (fuel : Nat) (source : String) (expected : Nat) : Bool :=
+    let path : List Nat := prim_string_to_char_codes "pkg/./bad.ouro" in
+    let text : List Nat := prim_string_to_char_codes source in
+    match parse_unit (lex_go_with next_import_token) intern_string abi_parse_file fuel flat path text with
+    | UOk _ _ => False
+    | UErr code pos state =>
+        match parse_unit_indexed (lex_go_carried_with next_import_token_indexed) abi_parse_file fuel indexed path text with
+        | IndexedUnitOk _ _ => False
+        | IndexedUnitErr actual detail partial =>
+            andb (eqNat code expected) (andb (eqNat code actual)
+              (andb(eqNat pos detail, abi_same_intern state partial)))
+        end
+    end;
+
+def abi_carried_peer (caller : SrcUnit) (flat : InternState) (indexed : LexerIntern) : Bool :=
+    let path : List Nat := prim_string_to_char_codes "pkg/cache/../dep.ouro" in
+    let text : List Nat := prim_string_to_char_codes "private def shared : String := \"shared\"; def fresh : String := \"pkg/main.ouro\";" in
+    match parse_unit (lex_go_with next_import_token) intern_string abi_parse_file abi_fuel flat path text with
+    | UErr _ _ _ => False
+    | UOk _ reference =>
+        match parse_unit_indexed (lex_go_carried_with next_import_token_indexed) abi_parse_file abi_fuel indexed path text with
+        | IndexedUnitErr _ _ _ => False
+        | IndexedUnitOk peer final => match peer with | MkSrcUnit pid _ =>
+            let state : InternState := lexer_intern_state final in
+            match first_unresolved_import (src_unit_decls caller) with
+            | Nothing => False
+            | Just target => andb (eqNat pid target) (andb (abi_codes_equal(str_of_id state target, "pkg/dep.ouro"))
+                (andb (list_eq Nat eqNat (src_unit_private_names caller) (src_unit_private_names peer))
+                  (abi_same_intern reference state)))
+            end end
+        end
+    end;
+
+def abi_carried_units : Bool :=
+    let path : List Nat := prim_string_to_char_codes "pkg/./main.ouro" in
+    let text : List Nat := prim_string_to_char_codes "import \"./dep.ouro\"; private def shared : String := \"shared\";" in
+    match parse_unit (lex_go_with next_import_token) intern_string abi_parse_file abi_fuel empty_intern path text with
+    | UErr _ _ _ => False
+    | UOk _ flat =>
+        match parse_unit_indexed (lex_go_carried_with next_import_token_indexed) abi_parse_file abi_fuel
+            (lexer_intern_from empty_intern) path text with
+        | IndexedUnitErr _ _ _ => False
+        | IndexedUnitOk caller indexed =>
+            let malformed_literals : Bool := all String (fun (source : String) =>
+              match next_import_token_indexed abi_fuel (prim_string_to_char_codes source) indexed with
+              | LexerMalformed final => abi_same_intern (lexer_intern_state indexed) (lexer_intern_state final)
+              | LexerEnd _ => False
+              | LexerToken _ _ _ => False
+              end) (["b\"unterminated", "r#\"unterminated"] : List String) in
+            andb malformed_literals (andb (abi_carried_peer caller flat indexed)
+              (andb (abi_carried_error flat indexed abi_fuel "partial \"new\" @" 11)
+                (andb (abi_carried_error flat indexed 0 "x" 12)
+                  (abi_carried_error flat indexed abi_fuel "def partial : Type := ;" 10))))
+        end
+    end;
+
 def abi_resolver_error : Bool :=
     match resolve_imports
       ([mk_src_unit 0 ([DImport 1] : List Decl) ([] : List Nat)] : List SrcUnit) 0 with
@@ -267,6 +337,170 @@ def abi_resolver_diamond_order : Bool :=
        | RErr _ _ => False
        | ROk paths => source_bytes_equal paths [4, 2, 3, 1]
        end);
+
+def abi_import_path_results_equal (left : ResolveResult (List Nat))
+    (right : ResolveResult (List Nat)) : Bool :=
+    match left with
+    | RErr code detail => match right with
+      | ROk _ => False
+      | RErr actual at => andb(eqNat code actual, eqNat detail at)
+      end
+    | ROk paths => match right with
+      | RErr _ _ => False
+      | ROk actual => source_bytes_equal paths actual
+      end
+    end;
+
+-- The unchanged full resolver is the path oracle, including its failure order.
+def abi_import_paths_previous (fuel : Nat) (units : List SrcUnit) (entry : Nat)
+    : ResolveResult (List Nat) :=
+    match run_with_sources fuel units
+      (SourceVisit (MkPair Nat (List Nat) entry []) (SourceStOf [] [])) with
+    | RErr code detail => RErr (List Nat) code detail
+    | ROk state => match state with
+      | SourceStOf paths _ => ROk (List Nat) (reverse Nat paths)
+      end
+    end;
+
+def abi_import_paths_equivalent (units : List SrcUnit) (entry : Nat) : Bool :=
+    (fix compare (fuels : List Nat) : Bool :=
+      match fuels with
+      | Nil => True
+      | Cons fuel rest =>
+          andb (abi_import_path_results_equal
+            (abi_import_paths_previous fuel units entry)
+            (resolve_import_paths_fuel fuel units entry)) (compare rest)
+      end) [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, resolve_imports_cap];
+
+def abi_import_paths_case (units : List SrcUnit) (entry : Nat)
+    (expected : ResolveResult (List Nat)) : Bool :=
+    andb (abi_import_paths_equivalent units entry)
+      (abi_import_path_results_equal (resolve_import_paths units entry) expected);
+
+def abi_import_path_mode (fuel : Nat) (units : List SrcUnit)
+    (previous : SourceRMode) (current : ImportPathMode)
+    (expected : ResolveResult (List Nat)) : Bool :=
+    let old_paths : ResolveResult (List Nat) :=
+      match run_with_sources fuel units previous with
+      | RErr code detail => RErr (List Nat) code detail
+      | ROk state => match state with
+        | SourceStOf paths _ => ROk (List Nat) paths
+        end
+      end in
+    let paths : ResolveResult (List Nat) := run_import_paths fuel units current in
+    andb (abi_import_path_results_equal old_paths paths)
+      (abi_import_path_results_equal paths expected);
+
+def abi_import_paths_diamond : Bool :=
+    abi_import_paths_case
+      [mk_src_unit 1 [DAxiom 7 (ESort 0), DImport 2,
+         DAxiom 8 (ESort 0), DImport 3, DImport 2] [],
+       mk_src_unit 2 [DAxiom 9 (ESort 0), DImport 4] [],
+       mk_src_unit 3 [DImport 4, DAxiom 10 (ESort 0)] [],
+       mk_src_unit 4 [DAxiom 11 (ESort 0)] []] 1
+      (ROk (List Nat) [4, 2, 3, 1]);
+
+def abi_import_paths_missing : Bool :=
+    andb (abi_import_paths_case [mk_src_unit 2 [] []] 1
+      (RErr (List Nat) errMissing 1))
+      (abi_import_paths_case [mk_src_unit 1 [DImport 2] []] 1
+        (RErr (List Nat) errMissing 2));
+
+def abi_import_paths_cycles : Bool :=
+    andb (abi_import_paths_case [mk_src_unit 1 [DImport 1] []] 1
+      (RErr (List Nat) errCycle 1))
+      (abi_import_paths_case
+        [mk_src_unit 1 [DImport 2] [], mk_src_unit 2 [DImport 3] [],
+         mk_src_unit 3 [DImport 2] []] 1 (RErr (List Nat) errCycle 2));
+
+def abi_import_paths_failure_order : Bool :=
+    andb (abi_import_paths_case
+      [mk_src_unit 1 [DImport 3, DImport 2] [],
+       mk_src_unit 2 [DImport 1] []] 1 (RErr (List Nat) errMissing 3))
+      (abi_import_paths_case
+        [mk_src_unit 1 [DImport 2, DImport 3] [],
+         mk_src_unit 2 [DImport 1] []] 1 (RErr (List Nat) errCycle 1));
+
+def abi_import_paths_fuel_boundaries : Bool :=
+    let units : List SrcUnit :=
+      [mk_src_unit 1 [DImport 2] [], mk_src_unit 2 [] []] in
+    andb (abi_import_paths_equivalent units 1)
+      (andb (abi_import_path_results_equal (resolve_import_paths_fuel 0 units 1)
+        (RErr (List Nat) errFuel 1))
+        (andb (abi_import_path_results_equal (resolve_import_paths_fuel 1 units 1)
+          (RErr (List Nat) errFuel 1))
+          (andb (abi_import_path_results_equal (resolve_import_paths_fuel 2 units 1)
+            (RErr (List Nat) errFuel 2))
+            (andb (abi_import_path_results_equal (resolve_import_paths_fuel 3 units 1)
+              (RErr (List Nat) errFuel 2))
+              (abi_import_path_results_equal (resolve_import_paths_fuel 4 units 1)
+                (ROk (List Nat) [2, 1]))))));
+
+def abi_import_paths_visit_priority : Bool :=
+    let previous : SourceRMode :=
+      SourceVisit (MkPair Nat (List Nat) 1 [1])
+        (SourceStOf [1, 3] [SourceDeclOf (Just Nat 3) (DAxiom 4 (ESort 0))]) in
+    let current : ImportPathMode := ImportPathVisit 1 [1] [1, 3] in
+    andb (abi_import_path_mode 0 [] previous current (RErr (List Nat) errFuel 1))
+      (abi_import_path_mode 1 [] previous current (ROk (List Nat) [1, 3]));
+
+def abi_import_paths_nonimport_mode : Bool :=
+    let previous : SourceRMode := SourceImports 9 [DAxiom 1 (ESort 0)]
+      [DAxiom 2 (ESort 0)] []
+      (SourceStOf [3] [SourceDeclOf (Just Nat 3) (DAxiom 4 (ESort 0))]) in
+    let current : ImportPathMode := ImportPathImports 9 [DAxiom 1 (ESort 0)] [] [3] in
+    andb (abi_import_path_mode 1 [] previous current (RErr (List Nat) errFuel 9))
+      (andb (abi_import_path_mode 2 [] previous current (ROk (List Nat) [9, 3]))
+        (abi_import_path_mode 0 []
+          (SourceImports 9 [] [] [] (SourceStOf [3] []))
+          (ImportPathImports 9 [] [] [3]) (RErr (List Nat) errFuel 9)));
+
+def abi_import_paths_many_locals : Bool :=
+    let locals : List Decl := map Nat Decl
+      (fun (name : Nat) => DAxiom name (ESort 0)) (nat_range_count 100 256) in
+    abi_import_paths_case [mk_src_unit 1 locals []] 1 (ROk (List Nat) [1]);
+
+def abi_import_paths_owner_closures : Bool :=
+    let units : List SrcUnit :=
+      [mk_src_unit 1 [DImport 2] [], mk_src_unit 2 [DImport 3] [],
+       mk_src_unit 3 [] [], mk_src_unit 4 [] []] in
+    andb (abi_import_paths_case units 1 (ROk (List Nat) [3, 2, 1]))
+      (andb (abi_import_paths_case units 2 (ROk (List Nat) [3, 2]))
+        (abi_import_paths_case units 4 (ROk (List Nat) [4])));
+
+def abi_import_paths_source_mode (source : String) (rejected : Bool) : Bool :=
+    let root : List Nat := prim_string_to_char_codes "main.ouro" in
+    let dependency : List Nat := prim_string_to_char_codes "dep.ouro" in
+    let files : List (Pair (List Nat) (List Nat)) :=
+      [MkPair (List Nat) (List Nat) root (prim_string_to_char_codes source),
+       MkPair (List Nat) (List Nat) dependency
+         (prim_string_to_char_codes "private axiom Hidden : Type; axiom Value : Type;")] in
+    match preprocess_file_list preprocess_imports_reg preprocess_records_reg files with
+    | FilesPrepErr _ _ => False
+    | FilesPrepOk prepared aliases =>
+        match parse_units lex_go_import intern_string abi_parse_file abi_fuel empty_intern prepared with
+        | UsErr _ _ _ => False
+        | UsOk units state => match intern_string state root with
+          | MkPair entry intern => match intern_string intern dependency with
+            | MkPair imported current =>
+                andb (abi_import_paths_case units entry
+                  (ROk (List Nat) [imported, entry]))
+                  (match module_resolve_units abi_fuel units aliases entry current with
+                  | ROk plan => andb (notb rejected)
+                      (match plan with | MkPair scoped _ =>
+                        abi_import_paths_case scoped entry (ROk (List Nat) [imported, entry])
+                      end)
+                  | RErr code detail => andb rejected
+                      (andb (eqNat code 5)
+                        (match module_ident_id current (prim_string_to_char_codes "Hidden") with
+                        | Nothing => False
+                        | Just hidden => eqNat detail hidden
+                        end))
+                  end)
+            end
+          end
+        end
+    end;
 
 def abi_compiler_result : Bool :=
     match compile_program
@@ -689,8 +923,8 @@ def abi_record_text_wrapper_rejects_missing_metadata : Bool :=
 def abi_laws : List AbiLaw :=
     [ MkAbiLaw "lexer/parser/resolver share declarations and intern state"
         (andb abi_lex_parse_resolve
-          (andb abi_resolver_import_classification
-            (andb abi_resolver_import_path_projection abi_resolver_nonimport_step)))
+          (andb abi_carried_units (andb abi_resolver_import_classification
+            (andb abi_resolver_import_path_projection abi_resolver_nonimport_step))))
     , MkAbiLaw "closed checked parser retains private metadata and AST projection" abi_closed_parser_projection
     , MkAbiLaw "private declaration metadata keeps its parsed member identity" abi_private_metadata
     , MkAbiLaw "private effect metadata includes its operation" abi_private_effect_metadata
@@ -752,6 +986,46 @@ def abi_laws : List AbiLaw :=
     , MkAbiLaw "checked erasure keeps repeated runtime lets without expansion" erasure_case_repeated_runtime
     , MkAbiLaw "checked erasure drops repeated type lets without expansion" erasure_case_repeated_type
     , MkAbiLaw "checked erasure bounds deferred type expansion" erasure_case_expansion_exhausted
+    , MkAbiLaw "path-only DFS matches full closure order across diamond and duplicate edges"
+        abi_import_paths_diamond
+    , MkAbiLaw "path-only DFS keeps first duplicate unit lookup"
+        (abi_import_paths_case
+          [mk_src_unit 1 [DImport 2] [], mk_src_unit 2 [] [],
+           mk_src_unit 2 [DImport 99] []] 1 (ROk (List Nat) [2, 1]))
+    , MkAbiLaw "path-only DFS does not visit unreachable missing or cyclic units"
+        (abi_import_paths_case
+          [mk_src_unit 1 [DAxiom 7 (ESort 0)] [], mk_src_unit 8 [DImport 8] [],
+           mk_src_unit 9 [DImport 99] []] 1 (ROk (List Nat) [1]))
+    , MkAbiLaw "path-only DFS retains missing entry and dependency details"
+        abi_import_paths_missing
+    , MkAbiLaw "path-only DFS retains self and nested cycle details"
+        abi_import_paths_cycles
+    , MkAbiLaw "path-only DFS preserves the first missing or cyclic sibling failure"
+        abi_import_paths_failure_order
+    , MkAbiLaw "path-only DFS retains exact graph fuel transitions"
+        abi_import_paths_fuel_boundaries
+    , MkAbiLaw "path-only visit checks fuel then imported paths before stack and lookup"
+        abi_import_paths_visit_priority
+    , MkAbiLaw "path-only import mode preserves nonimport and empty-mode fuel"
+        abi_import_paths_nonimport_mode
+    , MkAbiLaw "path-only DFS spends no extra graph fuel on 256 local declarations"
+        abi_import_paths_many_locals
+    , MkAbiLaw "path-only DFS keeps root foreign and unreachable owner closures separate"
+        abi_import_paths_owner_closures
+    , MkAbiLaw "plain parsed import retains full-resolver path projection"
+        (abi_import_paths_source_mode
+          "import \"dep.ouro\"; def chosen : Type := Value;" False)
+    , MkAbiLaw "qualified parsed import retains full-resolver path projection"
+        (abi_import_paths_source_mode
+          "import \"dep.ouro\" as D; def chosen : Type := D.Value;" False)
+    , MkAbiLaw "selected imports and local opens retain full-resolver path projection"
+        (andb (abi_import_paths_source_mode
+          "import \"dep.ouro\" as D exposing (Value as Pick); def chosen : Type := Pick;" False)
+          (abi_import_paths_source_mode
+            "import \"dep.ouro\" as D; def chosen : Type := open D in Value;" False))
+    , MkAbiLaw "successful path projection does not authorize a private selected member"
+        (abi_import_paths_source_mode
+          "import \"dep.ouro\" exposing (Hidden); def chosen : Type := Type;" True)
     ];
 
 def abi_run : List AbiLaw -> Bool -> IO Unit :=

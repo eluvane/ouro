@@ -1,22 +1,23 @@
 # Effects and IO
 
-Ouro represents effects as checked Core. The compiler checks the complete
-declaration closure after supported handler lowering; console, filesystem, process, clock, and other
-host behavior are implemented by the standard library and runtime adapters.
+The compiler lowers supported effects and handlers to Core, then checks the
+complete declaration closure. The standard library and runtime adapters
+provide console, filesystem, process, clock, and other host operations.
 
 ## IO programs
 
-The [getting-started program](getting_started.md#run-a-native-program) shows
-`main : IO Unit`; the [syntax reference](syntax.md#io-and-do) owns `do` and
-`let!` spelling. These forms lower through the existing IO representation and
-do not add effectful computation to the pure typechecker.
+An IO program declares [`main : IO Unit`](getting_started.md#run-a-native-program).
+The compiler lowers [`do` and `let!`](syntax.md#io-and-do) through the IO
+representation. The typechecker remains pure.
 
 ## Runtime surface
 
-`std/runtime.ouro` declares checked String, standard-stream/exit, argument,
-environment, clock, filesystem, temporary-file and process-capture intrinsics.
-[TCB](tcb.md) describes their checking and execution boundaries. User-facing
-wrappers live primarily in:
+`std/string_prims.ouro` declares `String` and its checked string intrinsics.
+`std/runtime.ouro` imports those declarations and defines the checked stream,
+exit, argument, environment, clock, filesystem, temporary-file, and process
+intrinsics. [Trusted computing base](tcb.md)
+
+Use these standard-library modules for higher-level operations.
 
 - `std/io.ouro` for console IO, arguments, environment variables, time, exit,
   and child processes;
@@ -26,6 +27,8 @@ wrappers live primarily in:
 
 Programs built with `scripts/build_tool.sh` link the C runtime and IO host under
 `runtime/`.
+
+### Console streams and exit
 
 The experimental Windows native path preserves exact stdout/stderr bytes,
 including NUL, and performs no newline conversion. Writes and exit remain
@@ -40,10 +43,14 @@ consumes through LF or at most 8,191 bytes, removing only LF and retaining
 CR. Bytes beyond that limit remain for the next read. `readBytes n` waits
 for `n` bytes or EOF; a short result means EOF. Neither action reads ahead,
 and `readBytes 0` returns an empty string without inspecting stdin. Native
-input preserves NUL and other byte values; the transitional C String bridge
-retains its embedded-NUL limitation. Count overflow, invalid handles, OS
+input preserves NUL and other byte values. The transitional C byte reader
+also packs the actual byte count, including embedded NUL; its line reader
+still uses the text String bridge. C byte-read limits and allocation/stream
+failure reporting retain their legacy behavior. Native count overflow, invalid handles, OS
 errors, allocation failure, and failed staging cleanup terminate with
 status 73. The existing `IO String` signatures remain unchanged.
+
+### Clock, arguments, and environment
 
 Native `now` reads UTC on each execution of the action and returns decimal
 Unix-epoch milliseconds rounded down, including negative values before 1970.
@@ -64,10 +71,13 @@ calls, a NUL in the name, malformed Unicode, or a host/conversion failure
 terminates with status 73. A value changed to another of the same length
 is the value observed by the fill; lookup provides no atomic snapshot.
 
-Both adapters release owned raw buffers in reverse allocation order.
-The argv table is closed before its owner cell is freed. Failed cleanup
-still attempts every remaining owned release and terminates with status
-73. Managed results and captured names remain GC roots across raw calls.
+The argument and environment adapters release owned raw buffers in reverse
+allocation order. The argument adapter closes the argv table before freeing
+its owner cell. Failed cleanup still attempts every remaining owned release
+and terminates with status 73. Managed results and captured names remain GC
+roots across raw calls.
+
+### File reads and writes
 
 Native `fs_read` and `fs_write` preserve all file-content bytes, including NUL
 and non-UTF-8 bytes, without newline conversion. Paths are nonempty strict
@@ -93,8 +103,33 @@ String equality compares the full byte sequence, including bytes after NUL.
 Reads reject empty or NUL-containing paths, nonregular files, failed opens,
 sizes beyond the packed String limit, seeks, allocation, incomplete reads and
 failed closes with status 73. An empty String therefore denotes a successful
-empty read. C-host write failures can still return Unit; callers that publish
-artifacts must verify staged bytes before replacing an existing output.
+empty read. C writes return Unit only after a successful direct open,
+complete byte transfer and close. A null converted path, an open/preparation
+failure, a failed or short transfer, and a failed close terminate with
+status 73. Failed transfers still attempt to close the file and can leave a
+prefix or a truncated file. The C writer uses one transfer and does not
+promise native positive-partial retries. Publishers still verify staged
+bytes before replacing an existing output.
+
+The separate deferred `ouro.fs.read_file_status` operation returns ordinary
+`Pair Nat String`: zero carries exactly the captured file length, including
+all binary bytes; a nonzero status carries an empty body. Native statuses
+retain the full Win32 error; the transitional C host uses errno. Positive
+partial reads retry. Native EOF before the captured length is reached returns
+`ERROR_HANDLE_EOF` (38); any earlier prefix is discarded. This still does
+not provide an atomic snapshot. `fs_read_checked` retains its existing
+precheck errors and maps later OS open, length and read failures to
+`FsOperationFailed "read OS status=..." path`. Native and Windows C paths
+reject malformed UTF-8; other C hosts retain byte-path fopen rules. Path
+validation, compiler storage/progress guards, allocation exhaustion and failed close/release
+remain terminal status 73. Cleanup attempts every owned release; a cleanup
+failure dominates the recoverable read error. Legacy `fs_read` and writes
+keep their preceding contracts.
+The raw status channel does not distinguish provider validation from an OS
+verdict: for example, code 87 can originate from either. A nonzero code
+remains a failure and never supplies a partial body.
+
+### Source file replacement
 
 `ouro.fs.replace_file source stage backup` is a separate deferred three-path
 operation. It returns zero only after publication; nonzero retains the OS
@@ -135,6 +170,8 @@ guarantee, and process termination can leave private stage/recovery files.
 Callers must distinguish a completed replacement, a refused operation and a
 state requiring recovery; ordinary artifact rename does not provide this
 source-publication contract.
+
+### Directory queries and listing
 
 Native `fs_exists` and `fs_is_dir` query Win32 path attributes each time their
 action executes. Empty paths, missing entries and ordinary query errors return
@@ -184,6 +221,8 @@ behavior: it prepends names, returns an empty list after an open failure,
 ignores close status, and does not distinguish iteration errors from EOF.
 Its listability probe still returns a Boolean from opendir success. These
 hosts do not promise the same enumeration order or error handling.
+
+### Filesystem mutations and path resolution
 
 Native `fs_mkdir_p` attempts parent creation before the final directory;
 `fs_remove` removes a file entry or an empty directory without enumerating
@@ -245,6 +284,8 @@ transitional C host retains its previous error and cleanup behavior.
 Temporary-file and process-capture lowering also have native runtime owners;
 the compiler producer and compatibility launchers remain host-bound.
 
+### Child processes
+
 `prim_process_capture` returns an exit code and separate stdout/stderr strings
 as `Pair Nat (Pair String String)`. `prim_proc_exec` wraps that checked action
 into the existing `ProcResult`, preserving `proc_exec` consumers. Reusing a
@@ -264,6 +305,8 @@ The adapter closes the owned job and raw argument storage before returning.
 The temporary C host returns `(120, 0)` when this action executes. Construction
 and partial application do not create a child.
 
+### Bounded capture
+
 Bounded captured processes use a native Windows Job for the child tree. The
 capture limits require a positive finite timeout, a positive memory cap, one
 CPU, and explicit stdout/stderr byte caps; zero byte caps require empty
@@ -282,6 +325,28 @@ so absence of an event is not complete resource attribution. The Windows C
 host uses a narrow adapter with the same typed reply contract; the POSIX C
 host returns OS status 120 without launching a child. There is no streaming
 pipeline or separate cancellation token.
+
+### Bounded capture with a child directory
+
+The separate `ouro.process.capture_bounded_at` action adds a literal child cwd
+between argv and the existing request. Its request and tagged reply retain the
+bounded-capture representation. The checked `_at` APIs reject empty, relative,
+drive-relative, NUL-containing or malformed UTF-8 directories before launch;
+valid input must be drive-rooted or have a double-backslash Windows prefix
+(including UNC). The checked wrappers return
+`IO (Either ProcessDirectoryError ProcessCaptureResult)` and wrap capture
+failures in `ProcessDirectoryCapture`. Directory validation precedes limit
+validation. Windows checks existence and access at launch.
+
+The native owner stages an owned UTF-16 copy after argv and excludes it from
+the child's arguments. The C host passes an owned wide copy to
+`CreateProcessW`; neither adapter changes the parent's cwd. Each action
+execution creates fresh ownership. Existing tree containment, stream caps,
+full child exit codes and cleanup semantics apply. Existing native allocation,
+storage and final close/release boundaries can still terminate with status 73.
+Argument and cwd preparation remain outside the execution timeout. The POSIX C
+host returns OS status 120. The analyzer owns its scheduling and validation.
+[Native bounded analyzer](../tools/analyze/README.md#native-bounded-entry)
 
 ## Experimental handlers
 

@@ -123,7 +123,109 @@ expect_lex_reject preprocess-error "$FIXTURES/record-malformed.ouro" 999999 'OUR
 expect_lex_reject resolve-error "$FIXTURES/id.ouro" 999999 'CErr code=92' \
 	--unit "$FIXTURES/other.ouro"
 
+# These inputs establish a false source-scanner accusation independently of
+# the typed transport. The public producer must retain raw refusal and owner.
+TRACE_INPUTS="$OUT/lower-owner"
+mkdir -p "$TRACE_INPUTS"
+cat >"$TRACE_INPUTS/prefix.ouro" <<'EOF'
+inductive Nat : Type := | Z : Nat | S : Nat -> Nat;
+inductive List (A : Type) : Type := | Nil : List A | Cons : A -> List A -> List A;
+def values : List Nat := [Z,];
+EOF
+cp "$TRACE_INPUTS/prefix.ouro" "$TRACE_INPUTS/prior-list.ouro"
+printf '%s\n' 'def unrelated : Nat := missing;' >>"$TRACE_INPUTS/prior-list.ouro"
+cat >"$TRACE_INPUTS/no-list.ouro" <<'EOF'
+inductive Nat : Type := | Z : Nat | S : Nat -> Nat;
+def unrelated : Nat := missing;
+EOF
+cat >"$TRACE_INPUTS/bad-list.ouro" <<'EOF'
+inductive Nat : Type := | Z : Nat | S : Nat -> Nat;
+def bad : Nat := [];
+EOF
+cat >"$TRACE_INPUTS/nested.ouro" <<'EOF'
+inductive Nat : Type := | Z : Nat | S : Nat -> Nat;
+def nested (x : Nat) : Nat := [];
+EOF
+cat >"$TRACE_INPUTS/named.ouro" <<'EOF'
+inductive Nat : Type := | Z : Nat | S : Nat -> Nat;
+def goal : Nat := ?pending;
+EOF
+cat >"$TRACE_INPUTS/deep.ouro" <<'EOF'
+inductive Nat : Type := | Z : Nat | S : Nat -> Nat;
+def deep : Nat := 100;
+EOF
+cp "$TRACE_INPUTS/deep.ouro" "$TRACE_INPUTS/deep-named.ouro"
+printf '%s\n' 'def goal : Nat := ?pending;' >>"$TRACE_INPUTS/deep-named.ouro"
+cat >"$TRACE_INPUTS/deep-import.ouro" <<'EOF'
+import "deep.ouro";
+def bad : Nat := [];
+EOF
+cat >"$TRACE_INPUTS/import-unrelated.ouro" <<'EOF'
+import "prefix.ouro";
+def unrelated : Nat := missing;
+EOF
+cat >"$TRACE_INPUTS/import-bad.ouro" <<'EOF'
+import "bad-list.ouro";
+def value : Nat := Z;
+EOF
+
+expect_source_owner() {
+	label=$1
+	file=$2
+	want=$3
+	forbidden=$4
+	shift 4
+	out="$OUT/owner-$label.out"
+	err="$OUT/owner-$label.err"
+	set +e
+	"$COMPILER" check "$file" 999999 "$@" >"$out" 2>"$err"
+	status=$?
+	set -e
+	if [ "$status" -ne 1 ] || [ -s "$out" ] ||
+		! grep -Fq 'CErr code=2 det=0' "$err" || ! grep -Fq "$want" "$err" ||
+		grep -Fq "$forbidden" "$err"; then
+		cat "$out" >&2
+		cat "$err" >&2
+		echo "FRONTEND_SECURITY_FAIL owner-$label status=$status" >&2
+		exit 1
+	fi
+	rows=$((rows + 1))
+	echo "FRONTEND_SECURITY_OK owner-$label"
+}
+
+if ! "$COMPILER" check "$TRACE_INPUTS/prefix.ouro" 999999 \
+	>"$OUT/owner-prefix.out" 2>"$OUT/owner-prefix.err" ||
+	! grep -Fq 'CHECK_OK' "$OUT/owner-prefix.out"; then
+	cat "$OUT/owner-prefix.out" >&2
+	cat "$OUT/owner-prefix.err" >&2
+	echo "FRONTEND_SECURITY_FAIL owner-prefix" >&2
+	exit 1
+fi
+rows=$((rows + 1))
+echo "FRONTEND_SECURITY_OK owner-prefix"
+expect_source_owner prior-list "$TRACE_INPUTS/prior-list.ouro" \
+	'<input>: compilation failed in unrelated (surface); code=2 detail=0' 'OURO-LIST-001'
+expect_source_owner no-list "$TRACE_INPUTS/no-list.ouro" \
+	'<input>: compilation failed in unrelated (surface); code=2 detail=0' 'OURO-LIST-001'
+expect_source_owner root-list "$TRACE_INPUTS/bad-list.ouro" \
+	'<input>: OURO-LIST-001: list literal without known List A context in bad (surface)' '<input>:1:1'
+expect_source_owner nested "$TRACE_INPUTS/nested.ouro" \
+	'<input>: compilation failed in nested (surface); code=2 detail=0' 'OURO-LIST-001'
+expect_source_owner named "$TRACE_INPUTS/named.ouro" \
+	'<input>: OURO-HOLE-001: unresolved named hole in goal (surface)' '<input>:1:1'
+expect_source_owner deep-named "$TRACE_INPUTS/deep-named.ouro" \
+	'<input>: OURO-HOLE-001: unresolved named hole in goal (surface)' 'compilation failed in deep'
+expect_source_owner deep-import "$TRACE_INPUTS/deep-import.ouro" \
+	'deep-import.ouro: OURO-LIST-001: list literal without known List A context in bad (surface)' 'compilation failed in deep' \
+	--unit "$TRACE_INPUTS/deep.ouro" --unit "$TRACE_INPUTS/deep-import.ouro"
+expect_source_owner imported-prior-list "$TRACE_INPUTS/import-unrelated.ouro" \
+	'import-unrelated.ouro: compilation failed in unrelated (surface); code=2 detail=0' 'OURO-LIST-001' \
+	--unit "$TRACE_INPUTS/prefix.ouro" --unit "$TRACE_INPUTS/import-unrelated.ouro"
+expect_source_owner imported-bad "$TRACE_INPUTS/import-bad.ouro" \
+	'bad-list.ouro: OURO-LIST-001: list literal without known List A context in bad (surface)' 'import-bad.ouro: OURO-LIST-001' \
+	--unit "$TRACE_INPUTS/bad-list.ouro" --unit "$TRACE_INPUTS/import-bad.ouro"
+
 "$PYTHON" "$ROOT/scripts/frontend_host_suite.py" --compiler "$COMPILER" \
-	--out "$OUT/host" --jobs 1
+	--out "$OUT/host" --jobs "${OURO_JOBS:-1}"
 
 echo "FRONTEND_SECURITY_SUITE: PASS rows=$rows out=$OUT"

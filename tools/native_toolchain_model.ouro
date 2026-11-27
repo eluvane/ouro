@@ -1,0 +1,231 @@
+-- Native successor-stage policy and exact command/result predicates.
+import "native_sibling_model.ouro",
+  "native_build_args.ouro",
+  "../std/collections.ouro",
+  "../std/fs.ouro",
+  "../std/fs_bounded_model.ouro",
+  "../std/fs_create_model.ouro",
+  "../std/pathx.ouro",
+  "../std/process.ouro",
+  "test/native_pe_inspect.ouro";
+
+inductive NativeToolchainRequest : Type :=
+  | NativeToolchainRequestOf : String -> String -> NativeToolchainRequest;
+
+inductive NativeToolchainPolicy : Type :=
+  | NativeToolchainPolicyOf : Nat -> Nat -> ProcessCaptureLimits -> NativeToolchainPolicy;
+
+def native_toolchain_mib : Nat := mul(mul 32 32, mul 32 32);
+private def native_toolchain_source_limit_mib : Nat := 256;
+private def native_toolchain_image_limit_mib : Nat := 512;
+
+def native_toolchain_policy : NativeToolchainPolicy :=
+    NativeToolchainPolicyOf (mul native_toolchain_source_limit_mib native_toolchain_mib)
+      (mul native_toolchain_image_limit_mib native_toolchain_mib)
+      (native_sibling_limits (mul(mul 9 100, mul 10 100)));
+
+def native_toolchain_source_cap (policy : NativeToolchainPolicy) : Nat :=
+    match policy with | NativeToolchainPolicyOf source _ _ => source end;
+def native_toolchain_image_cap (policy : NativeToolchainPolicy) : Nat :=
+    match policy with | NativeToolchainPolicyOf _ image _ => image end;
+def native_toolchain_child_limits (policy : NativeToolchainPolicy) : ProcessCaptureLimits :=
+    match policy with | NativeToolchainPolicyOf _ _ limits => limits end;
+
+def native_toolchain_root : String := "tools/native_build.ouro";
+def native_toolchain_seed : String := "ouro-native-build.exe";
+def native_toolchain_usage : String :=
+    "usage: ouro-toolchain rebuild --source DIR --out NEW_DIR --stages 3 --no-cache";
+
+inductive NativeToolchainError : Type :=
+  | ToolchainArgumentError : String -> NativeToolchainError
+  | ToolchainInputError : String -> NativeToolchainError
+  | ToolchainReadError : String -> FsBoundedReadError -> NativeToolchainError
+  | ToolchainWriteError : String -> FsError -> NativeToolchainError
+  | ToolchainCreateError : String -> FsCreateDirError -> NativeToolchainError
+  | ToolchainImagePathError : NativeSiblingError -> NativeToolchainError
+  | ToolchainProcessError : String -> ProcessDirectoryError -> NativeToolchainError
+  | ToolchainStageExit : String -> Nat -> String -> String -> NativeToolchainError
+  | ToolchainStageProtocol : String -> String -> String -> NativeToolchainError
+  | ToolchainLogError : String -> String -> ProcResult -> FsError -> NativeToolchainError
+  | ToolchainImageError : String -> NativeToolchainError
+  | ToolchainImageMismatch : NativeToolchainError;
+
+def native_toolchain_error_message (error : NativeToolchainError) : String :=
+    match error with
+    | ToolchainArgumentError message => str_concat "arguments: " message
+    | ToolchainInputError message => str_concat "inputs: " message
+    | ToolchainReadError path cause => str_cat3 path ": " (fs_bounded_read_error_message cause)
+    | ToolchainWriteError path cause => str_cat3 path ": " (fs_error_message cause)
+    | ToolchainCreateError path cause => str_cat3 path ": " (fs_create_dir_error_message cause)
+    | ToolchainImagePathError cause => native_sibling_error_message cause
+    | ToolchainProcessError stage cause => str_cat3 stage ": " (process_directory_error_message cause)
+    | ToolchainStageExit stage code _ _ => str_cat3 stage " exit=" (str_of_nat code)
+    | ToolchainStageProtocol stage _ _ => str_concat stage ": unexpected build output"
+    | ToolchainLogError stage path _ cause => str_cat4 stage ": " path (str_concat ": " (fs_error_message cause))
+    | ToolchainImageError path => str_concat path ": unsupported or signed executable image"
+    | ToolchainImageMismatch => "complete unsigned N2/N3 images differ"
+    end;
+
+inductive NativeToolchainOptions : Type :=
+  | NativeToolchainOptionsOf : Maybe String -> Maybe String -> Bool -> Bool -> NativeToolchainOptions;
+
+def native_toolchain_directory_spelling (path : String) : Bool :=
+    let drive_relative : Bool := andb (path_has_drive path)
+      (notb (andb (leb_nat 3 (str_len path))
+        (elem Nat eq_nat (prim_string_byte_at path 2) [47, 92]))) in
+    andb (notb (str_null path))
+      (andb (notb (elem Nat eq_nat 0 (str_codes path))) (notb drive_relative));
+
+def native_toolchain_request_checked (source : String) (output : String)
+    : Either NativeToolchainError NativeToolchainRequest :=
+    match native_toolchain_directory_spelling source with
+    | False => Left NativeToolchainError NativeToolchainRequest (ToolchainArgumentError "invalid --source directory spelling")
+    | True => match andb (native_toolchain_directory_spelling output)
+        (andb (notb (str_ends (path_from_host output) "/"))
+          (notb (elem String str_eq (path_basename output) [".", ".."]))) with
+      | False => Left NativeToolchainError NativeToolchainRequest (ToolchainArgumentError "invalid --out directory spelling")
+      | True => Right NativeToolchainError NativeToolchainRequest (NativeToolchainRequestOf source output)
+      end
+    end;
+
+def native_toolchain_parse_options : List String -> NativeToolchainOptions ->
+    Either NativeToolchainError NativeToolchainRequest :=
+  fix parse (words : List String) (options : NativeToolchainOptions)
+      : Either NativeToolchainError NativeToolchainRequest :=
+    match options with | NativeToolchainOptionsOf source output stages cold =>
+      match words with
+      | Nil => match source with
+        | Nothing => Left NativeToolchainError NativeToolchainRequest (ToolchainArgumentError "missing --source")
+        | Just directory => match output with
+          | Nothing => Left NativeToolchainError NativeToolchainRequest (ToolchainArgumentError "missing --out")
+          | Just destination => match andb stages cold with
+            | False => Left NativeToolchainError NativeToolchainRequest (ToolchainArgumentError "require --stages 3 and --no-cache")
+            | True => native_toolchain_request_checked directory destination
+            end
+          end
+        end
+      | Cons word rest => match str_eq word "--no-cache" with
+        | True => match cold with
+          | True => Left NativeToolchainError NativeToolchainRequest (ToolchainArgumentError "duplicate --no-cache")
+          | False => parse rest (NativeToolchainOptionsOf source output stages True)
+          end
+        | False =>
+            let supported : Bool := elem String str_eq word ["--source", "--out", "--stages"] in
+            let duplicate : Bool := if str_eq word "--source" then
+              (match source with | Nothing => False | Just _ => True end)
+              else if str_eq word "--out" then
+                (match output with | Nothing => False | Just _ => True end) else stages in
+            match supported with
+            | False => Left NativeToolchainError NativeToolchainRequest
+                (ToolchainArgumentError (str_concat "unknown option: " word))
+            | True => match duplicate with
+              | True => Left NativeToolchainError NativeToolchainRequest
+                  (ToolchainArgumentError (str_concat "duplicate " word))
+              | False => match rest with
+                | Nil => Left NativeToolchainError NativeToolchainRequest
+                    (ToolchainArgumentError (str_concat "missing value for " word))
+                | Cons value tail => match orb (str_null value) (is_dashed value) with
+                  | True => Left NativeToolchainError NativeToolchainRequest
+                      (ToolchainArgumentError (str_concat "missing value for " word))
+                  | False => match str_eq word "--source" with
+                    | True => parse tail (NativeToolchainOptionsOf (Just String value) output stages cold)
+                    | False => match str_eq word "--out" with
+                      | True => parse tail (NativeToolchainOptionsOf source (Just String value) stages cold)
+                      | False => match str_eq value "3" with
+                        | False => Left NativeToolchainError NativeToolchainRequest (ToolchainArgumentError "--stages must be 3")
+                        | True => parse tail (NativeToolchainOptionsOf source output True cold)
+                        end
+                      end
+                    end
+                  end
+                end
+              end
+            end
+        end
+      end
+    end;
+
+def native_toolchain_parse (words : List String) : Either NativeToolchainError NativeToolchainRequest :=
+    match words with
+    | Nil => Left NativeToolchainError NativeToolchainRequest (ToolchainArgumentError "missing rebuild")
+    | Cons command rest => match str_eq command "rebuild" with
+      | False => Left NativeToolchainError NativeToolchainRequest (ToolchainArgumentError "expected rebuild")
+      | True => native_toolchain_parse_options rest
+          (NativeToolchainOptionsOf (Nothing String) (Nothing String) False False)
+      end
+    end;
+
+def native_toolchain_relative_unit (path : String) : Bool :=
+    andb (notb (str_null path))
+      (andb (notb (path_is_abs path))
+        (andb (notb (str_contains path ":"))
+          (andb (notb (elem Nat eq_nat 0 (str_codes path)))
+            (andb (str_eq(path, path_normalize path))
+              (notb (elem String str_eq ".." (path_split path)))))));
+
+def native_toolchain_parent_inside (directory : String) (parent : String) : Bool :=
+    andb (notb (str_null parent)) (path_under directory parent);
+
+def native_toolchain_inventory (units : List String) : Bool :=
+    andb (elem String str_eq native_toolchain_root units)
+      ((fix check (rest : List String) (seen : List String) : Bool :=
+         match rest with
+         | Nil => True
+         | Cons unit tail => andb (native_toolchain_relative_unit unit)
+             (andb (notb (elem String str_eq unit seen)) (check tail (Cons String unit seen)))
+         end) units (Nil String));
+
+def native_toolchain_stage_args (output : String) (units : List String) : List String :=
+    [native_toolchain_root, output, ..units];
+
+def native_toolchain_stage_result (stage : String) (output : String) (result : ProcResult)
+    : Either NativeToolchainError Unit :=
+    match proc_ok result with
+    | False => Left NativeToolchainError Unit
+        (ToolchainStageExit stage (proc_code result) (proc_stdout result) (proc_stderr result))
+    | True => match andb (str_eq(proc_stdout result, str_concat output "\n")) (str_null (proc_stderr result)) with
+      | False => Left NativeToolchainError Unit (ToolchainStageProtocol stage (proc_stdout result) (proc_stderr result))
+      | True => Right NativeToolchainError Unit MkUnit
+      end
+    end;
+
+def native_toolchain_unsigned_image (image : String) : Bool :=
+    match native_pe_inspect_headers image with
+    | Left _ => False
+    | Right _ =>
+        let optional : Nat := add(native_pe_inspect_u32 image 60, 24) in
+        match leb_nat 5 (native_pe_inspect_u32(image, add optional 108)) with
+        | False => False
+        | True => andb (eq_nat(native_pe_inspect_u32(image, add optional 144), 0))
+            (eq_nat(native_pe_inspect_u32(image, add optional 148), 0))
+        end
+    end;
+
+def native_toolchain_os_imports (image : String) : Bool :=
+    match native_pe_inspect_imports image with
+    | Left _ => False
+    | Right libraries => all NativePeImportLibrary
+        (fun (library : NativePeImportLibrary) =>
+          elem String str_eq (str_lower (native_pe_import_library_name library)) ["kernel32.dll", "shell32.dll", "advapi32.dll", "bcrypt.dll", "winhttp.dll"])
+        libraries
+    end;
+
+def native_toolchain_compare (left : String) (right : String) : Bool :=
+    andb (notb (str_null left)) (prim_string_eq left right);
+
+def native_toolchain_paths_equal : List String -> List String -> Bool :=
+    list_eq String prim_string_eq;
+
+def native_toolchain_process_streams (error : ProcessDirectoryError) : Maybe (Pair String String) :=
+    match error with
+    | ProcessInvalidDirectory _ => Nothing (Pair String String)
+    | ProcessDirectoryCapture cause => match cause with
+      | ProcessCaptureTimedOut _ output errors => Just (Pair String String) (MkPair String String output errors)
+      | ProcessCaptureResourceLimit _ _ output errors => Just (Pair String String) (MkPair String String output errors)
+      | ProcessCaptureInvalidLimits _ => Nothing (Pair String String)
+      | ProcessCaptureOsError _ => Nothing (Pair String String)
+      | ProcessCaptureCleanupFailed _ => Nothing (Pair String String)
+      | ProcessCaptureOutputLimit _ _ _ => Nothing (Pair String String)
+      | ProcessCaptureProtocolError _ => Nothing (Pair String String)
+      end
+    end;

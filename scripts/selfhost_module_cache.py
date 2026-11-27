@@ -16,10 +16,11 @@ import re
 import sys
 import time
 from dataclasses import asdict, dataclass
+from itertools import chain
 from pathlib import Path
-from typing import Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
+from typing import Callable, Dict, Iterable, Iterator, List, Mapping, Optional, Sequence, Tuple
 
-from repo_support import read_required_text
+from repo_support import decode_source_text, read_required_text
 from repo_support import filename_fragment
 from repo_support import hash_json, sha256_bytes, Timer
 from repo_support import read_json_object_or_none
@@ -30,6 +31,7 @@ ROOT = Path(__file__).resolve().parents[1]
 rel = bind_relative_path(ROOT, resolve=True)
 
 DECL_RE = re.compile(r"^\s*(def|inductive|record|axiom|theorem|lemma|effect|handler)\s+([A-Za-z_][A-Za-z0-9_']*)")
+_IMPORT_IDENTIFIER_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_']*")
 
 
 @dataclass(frozen=True)
@@ -138,47 +140,57 @@ def _multiline_end(source: str, start: int) -> int | None:
 
 def quoted_import_targets(source_text: str, source_path: str) -> list[str]:
     """Discover quoted dependencies; source acceptance remains compiler-owned."""
-    tokens: list[tuple[str, str]] = []
+    paths: list[str] = []
+    state = "scan"
+    previous_dot = False
     index = 0
-    while index < len(source_text):
+    source_length = len(source_text)
+    while index < source_length:
         char = source_text[index]
         if char.isspace():
             index += 1
-        elif source_text.startswith("--", index):
+            continue
+        if char == "-" and source_text.startswith("--", index):
             end = source_text.find("\n", index)
-            index = len(source_text) if end < 0 else end + 1
-        elif source_text.startswith('"""', index):
+            index = source_length if end < 0 else end + 1
+            continue
+        word = ""
+        path = None
+        wants_path = state in ("path", "group")
+        if char == '"' and source_text.startswith('"""', index):
             close = _multiline_end(source_text, index)
-            tokens.append(("multiline" if close is not None else "unterminated", ""))
-            index = close if close is not None else len(source_text)
-        elif source_text.startswith('r#"', index):
+            index = close if close is not None else source_length
+        elif char == "r" and source_text.startswith('r#"', index):
             close = source_text.find('"#', index + 3)
             if close < 0:
-                tokens.append(("unterminated", ""))
-                index = len(source_text)
+                index = source_length
             else:
-                tokens.append(("string", source_text[index + 3:close]))
+                if wants_path:
+                    path = source_text[index + 3:close]
                 index = close + 2
         elif char == "'":
             # Identifier words consume their primes; this delimiter begins an opaque scalar.
             index += 1
-            while index < len(source_text) and source_text[index] != "'":
+            while index < source_length and source_text[index] != "'":
                 index += 2 if source_text[index] == "\\" else 1
-            if index < len(source_text):
+            if index < source_length:
                 index += 1
-                tokens.append(("character", ""))
-            else:
-                tokens.append(("unterminated", ""))
         elif char == '"':
             index += 1
-            value: list[str] = []
-            while index < len(source_text) and source_text[index] != '"':
+            close = source_text.find('"', index)
+            plain_end = close if close >= 0 else source_length
+            escape = source_text.find("\\", index, plain_end)
+            if escape >= 0:
+                plain_end = escape
+            value: list[str] | None = [source_text[index:plain_end]] if wants_path else None
+            index = plain_end
+            while index < source_length and source_text[index] != '"':
                 char = source_text[index]
                 index += 1
-                if char == "\\" and index < len(source_text):
+                if char == "\\" and index < source_length:
                     escaped = source_text[index]
                     index += 1
-                    if escaped == "u" and index < len(source_text) and source_text[index] == "{":
+                    if escaped == "u" and index < source_length and source_text[index] == "{":
                         close = source_text.find("}", index + 1)
                         digits = source_text[index + 1:close] if close >= 0 else ""
                         if (not 1 <= len(digits) <= 6
@@ -187,41 +199,86 @@ def quoted_import_targets(source_text: str, source_path: str) -> list[str]:
                         scalar = int(digits, 16)
                         if scalar > 0x10FFFF or 0xD800 <= scalar <= 0xDFFF:
                             raise ValueError(f"malformed Unicode escape in {source_path}")
-                        value.append(chr(scalar))
+                        if value is not None:
+                            value.append(chr(scalar))
                         index = close + 1
-                    else:
+                    elif value is not None:
                         value.append({"n": "\n", "r": "\r", "t": "\t", '"': '"', "\\": "\\"}
                                      .get(escaped, "\\" + escaped))
-                else:
+                elif value is not None:
                     value.append(char)
-            closed = index < len(source_text)
-            tokens.append(("string" if closed else "unterminated", "".join(value)))
+            closed = index < source_length
+            if closed and value is not None:
+                path = "".join(value)
             index += int(closed)
         else:
-            ident = re.match(r"[A-Za-z_][A-Za-z0-9_']*", source_text[index:])
-            value = ident.group(0) if ident else char
-            tokens.append(("word", value))
-            index += len(value)
-
-    imports: list[str] = []
-    index = 0
-    while index < len(tokens):
-        token = tokens[index]
-        index += 1
-        if token != ("word", "import") or (index > 1 and tokens[index - 2] == ("word", ".")):
-            continue
-        while True:
-            if index >= len(tokens) or tokens[index][0] != "string":
-                raise ValueError(f"malformed quoted import in {source_path}")
-            imports.append(canon_import(source_path, tokens[index][1]))
-            index += 1
-            if index >= len(tokens) or tokens[index] != ("word", ","):
-                break
-            index += 1
-            if index < len(tokens) and tokens[index] == ("word", ";"):
+            ident = _IMPORT_IDENTIFIER_RE.match(source_text, index)
+            if ident:
+                end = ident.end()
+                if end - index == 6 and source_text.startswith("import", index):
+                    word = "import"
+                index = end
+            else:
+                word = char
                 index += 1
-                break
-    return imports
+
+        if wants_path:
+            if path is not None:
+                paths.append(path)
+                state = "after-path"
+            elif state == "group" and word == ";":
+                state = "scan"
+            else:
+                state = "malformed"
+        elif state == "after-path" and word == ",":
+            state = "group"
+        elif state != "malformed":
+            state = "path" if word == "import" and not previous_dot else "scan"
+        previous_dot = word == "."
+
+    # Finish lexical checks before reporting an invalid import group.
+    if state in ("path", "group", "malformed"):
+        raise ValueError(f"malformed quoted import in {source_path}")
+    return [canon_import(source_path, path) for path in paths]
+
+
+ImportBytesParser = Callable[[bytes, str], list[str]]
+
+
+@dataclass(slots=True)
+class _ParsedImportSource:
+    data: bytes
+    targets: list[str]
+    sha256: str | None = None
+
+
+class CachedImportParser:
+    """Keep one source version per importer for a verification scope."""
+
+    def __init__(self) -> None:
+        self._parsed: dict[str, _ParsedImportSource] = {}
+
+    def _source(self, data: bytes, path: str) -> _ParsedImportSource:
+        previous = self._parsed.get(path)
+        if previous is not None and previous.data == data:
+            return previous
+        source = _ParsedImportSource(data, quoted_import_targets(decode_source_text(data), path))
+        self._parsed[path] = source
+        return source
+
+    def __call__(self, data: bytes, path: str) -> list[str]:
+        return self._source(data, path).targets
+
+    def parse_and_digest(self, data: bytes, path: str) -> tuple[list[str], str]:
+        source = self._source(data, path)
+        # Another reader may replace the path entry while this snapshot is being hashed.
+        if source.sha256 is None:
+            source.sha256 = sha256_bytes(source.data)
+        return source.targets, source.sha256
+
+
+def cached_import_parser() -> CachedImportParser:
+    return CachedImportParser()
 
 
 def import_targets(path: str) -> List[str]:
@@ -231,14 +288,23 @@ def import_targets(path: str) -> List[str]:
     return quoted_import_targets(read_required_text(p, "MODULE_CACHE"), path)
 
 
-def declaration_names(path: str) -> Tuple[str, ...]:
-    p = ROOT / path if not Path(path).is_absolute() else Path(path)
+def declarations_in_source(source: str) -> Tuple[str, ...]:
     names: List[str] = []
-    for line in read_required_text(p, "MODULE_CACHE").splitlines():
+    for line in source.splitlines():
         m = DECL_RE.match(line)
         if m:
             names.append(f"{m.group(1)}:{m.group(2)}")
     return tuple(names)
+
+
+def declaration_names(path: str) -> Tuple[str, ...]:
+    p = ROOT / path if not Path(path).is_absolute() else Path(path)
+    return declarations_in_source(read_required_text(p, "MODULE_CACHE"))
+
+
+def _import_cycle(root: str, visiting: set[str], path: str) -> SystemExit:
+    cycle = " -> ".join([*sorted(visiting), path])
+    return SystemExit(f"MODULE_CACHE: FAIL import cycle while collecting {root}: {cycle}")
 
 
 def collect_units(root: str, *, imports=None, cycle_error=None, normalize=normalize_path) -> List[str]:
@@ -254,8 +320,7 @@ def collect_units(root: str, *, imports=None, cycle_error=None, normalize=normal
         if norm in visiting:
             if cycle_error is not None:
                 raise SystemExit(cycle_error(norm))
-            cycle = " -> ".join([*sorted(visiting), norm])
-            raise SystemExit(f"MODULE_CACHE: FAIL import cycle while collecting {root}: {cycle}")
+            raise _import_cycle(root, visiting, norm)
         visiting.add(norm)
         for imp in read_imports(norm):
             walk(imp)
@@ -265,6 +330,43 @@ def collect_units(root: str, *, imports=None, cycle_error=None, normalize=normal
 
     walk(root)
     return seen
+
+
+def _iter_planned_closures(
+    modules: Sequence[str], plans: Mapping[str, ModulePlan]
+) -> Iterator[Tuple[str, List[str]]]:
+    def planned_imports(path: str) -> Tuple[str, ...]:
+        if path not in plans:
+            raise SystemExit(f"MODULE_CACHE: FAIL import closure references unplanned module {path}")
+        return plans[path].imports
+
+    # Absolute paths can resolve through links afresh on each walk.
+    if any(Path(path).is_absolute() or any(Path(imp).is_absolute() for imp in plan.imports)
+           for path, plan in plans.items()):
+        for mod in modules:
+            yield mod, collect_units(mod, imports=planned_imports)
+        return
+
+    closures: Dict[str, List[str]] = {}
+    visiting: set[str] = set()
+
+    def walk(path: str, root: str) -> List[str]:
+        norm = normalize_path(path)
+        if norm in closures:
+            return closures[norm]
+        if norm in visiting:
+            raise _import_cycle(root, visiting, norm)
+        visiting.add(norm)
+        children = []
+        for imp in planned_imports(norm):
+            children.append(walk(imp, root))
+        visiting.remove(norm)
+        # A previously emitted module also has all its dependencies emitted.
+        closures[norm] = [*dict.fromkeys(chain.from_iterable(children)), norm]
+        return closures[norm]
+
+    for mod in modules:
+        yield mod, walk(mod, mod)
 
 
 def ordered_union(seqs: Iterable[Sequence[str]]) -> List[str]:
@@ -294,13 +396,25 @@ def tool_digest(tool_inputs: Sequence[Path], *, schema: str) -> Tuple[str, dict]
     return hash_json(meta), meta
 
 
-def make_module_plans(modules: Sequence[str], tool_hash: str) -> Dict[str, ModulePlan]:
+def make_module_plans(modules: Sequence[str], tool_hash: str, *,
+                      parse_bytes: ImportBytesParser | None = None) -> Dict[str, ModulePlan]:
     plans: Dict[str, ModulePlan] = {}
     for path in modules:
         p = ROOT / path if not Path(path).is_absolute() else Path(path)
-        src = file_digest(p)
-        imports = tuple(import_targets(path))
-        decls = declaration_names(path)
+        try:
+            data = p.read_bytes()
+            text = decode_source_text(data)
+        except (OSError, UnicodeError) as exc:
+            raise SystemExit(f"MODULE_CACHE: FAIL unreadable {p}: {exc}") from exc
+        source_path = rel(p)
+        if type(parse_bytes) is CachedImportParser:
+            targets, source_hash = parse_bytes.parse_and_digest(data, path)
+        else:
+            source_hash = sha256_bytes(data)
+            targets = quoted_import_targets(text, path) if parse_bytes is None else parse_bytes(data, path)
+        src = FileDigest(source_path, source_hash, len(data))
+        imports = tuple(targets)
+        decls = declarations_in_source(text)
         direct_key = hash_json(
             {
                 "kind": "ouro.selfhost-module.direct.v1",
@@ -326,13 +440,9 @@ def artifact_cache_state(path: Path, expected_hash: str, expected_kind: str) -> 
     return True, "hit"
 
 
-def artifact_text(payload: Mapping[str, object]) -> Tuple[str, str]:
-    bare = dict(payload)
-    text_no_hash = json.dumps(bare, indent=2, sort_keys=True) + "\n"
-    artifact_hash = sha256_bytes(text_no_hash.encode("utf-8"))
-    full = dict(bare)
-    full["artifact_sha256"] = artifact_hash
-    return json.dumps(full, indent=2, sort_keys=True) + "\n", artifact_hash
+def artifact_digest(payload: Dict[str, object]) -> str:
+    text = json.dumps(payload, indent=2, sort_keys=True) + "\n"
+    return sha256_bytes(text.encode("utf-8"))
 
 
 def closure_key_for(
@@ -356,31 +466,21 @@ def closure_key_for(
     )
 
 
-def closure_of(path: str, unit_graph: Mapping[str, Sequence[str]]) -> List[str]:
-    if path in unit_graph:
-        return list(unit_graph[path])
-    return collect_units(path)
-
-
 def reverse_dependency_closure(changed: Sequence[str], modules: Sequence[str], plans: Mapping[str, ModulePlan]) -> List[str]:
     rev: Dict[str, List[str]] = {m: [] for m in modules}
     for mod in modules:
         for imp in plans[mod].imports:
             rev.setdefault(imp, []).append(mod)
-    impacted: List[str] = []
     seen = set(changed)
     stack = list(changed)
     while stack:
-        cur = stack.pop(0)
-        for user in sorted(rev.get(cur, [])):
+        cur = stack.pop()
+        for user in rev.get(cur, ()):
             if user in seen:
                 continue
             seen.add(user)
             stack.append(user)
-    for mod in modules:
-        if mod in seen:
-            impacted.append(mod)
-    return impacted
+    return [mod for mod in modules if mod in seen]
 
 
 def phase_keys_for(path: str, direct_key: str, closure_key: str) -> dict:
@@ -405,6 +505,7 @@ def materialize_module_artifacts(
     seed: Optional[Path] = None,
     fuel: str = "",
     tool_inputs: Sequence[Path] = (),
+    parse_bytes: ImportBytesParser | None = None,
 ) -> dict:
     started = Timer()
     roots_norm = [normalize_path(r) for r in roots]
@@ -415,13 +516,18 @@ def materialize_module_artifacts(
         for k, v in unit_graph.items():
             graph[normalize_path(k)] = [normalize_path(x) for x in v]
     for root in roots_norm:
-        graph.setdefault(root, collect_units(root))
+        if root not in graph:
+            graph[root] = collect_units(root)
     modules = ordered_union(graph[root] for root in roots_norm)
     work.mkdir(parents=True, exist_ok=True)
     schema = "v1"
     tool_hash, tool_meta = tool_digest(tool_inputs, schema=schema)
     seed_digest = file_digest(seed) if seed is not None and seed.exists() else None
-    plans = make_module_plans(modules, tool_hash)
+    plans = make_module_plans(modules, tool_hash, parse_bytes=parse_bytes)
+
+    for root in roots_norm:
+        if root not in plans:
+            raise SystemExit(f"MODULE_CACHE: FAIL import closure omits root {root}")
     old_manifest = read_json_object_or_none(work / "selfhost-module-cache.json")
     old_modules = old_manifest.get("modules", []) if isinstance(old_manifest, dict) else []
     old_by_path: Dict[str, dict] = {m.get("path"): m for m in old_modules if isinstance(m, dict) and isinstance(m.get("path"), str)}
@@ -444,35 +550,38 @@ def materialize_module_artifacts(
 
     closure_keys: Dict[str, str] = {}
     closure_lists: Dict[str, List[str]] = {}
-    for mod in modules:
-        closure = closure_of(mod, graph)
-        # A standalone imported module can be absent from graph if it only appears
-        # through caller-provided roots.  Ensure closure contains only planned modules.
-        for u in closure:
-            if u not in plans:
-                raise SystemExit(f"MODULE_CACHE: FAIL closure of {mod} references unplanned module {u}")
+    for mod, closure in _iter_planned_closures(modules, plans):
+        if mod in graph and closure != graph[mod]:
+            raise SystemExit(f"MODULE_CACHE: FAIL ordered import closure changed for {mod}")
         closure_lists[mod] = closure
         closure_keys[mod] = closure_key_for(path=mod, closure=closure, plans=plans, tool_hash=tool_hash, seed_digest=seed_digest, fuel=fuel)
 
+    closure_entries = {}
+    if cache_enabled:
+        closure_entries = {
+            mod: {"path": mod, "direct_key": plan.direct_key, "source": asdict(plan.source)}
+            for mod, plan in plans.items()
+        }
+    seed_entry = asdict(seed_digest) if seed_digest else None
     for mod in modules:
         t0 = Timer()
         plan = plans[mod]
         old = old_by_path.get(mod, {})
-        direct_payload: Dict[str, object] = {
-            "kind": "ouro.selfhost-module-direct-artifact.v1",
-            "label": label,
-            "path": mod,
-            "source": asdict(plan.source),
-            "imports": list(plan.imports),
-            "decls": list(plan.decls),
-            "direct_key": plan.direct_key,
-            "tool_hash": tool_hash,
-        }
-        direct_text, direct_artifact_hash = artifact_text(direct_payload)
         direct_cache_path = direct_dir / f"{filename_fragment(mod, 24, 'module')}__{plan.direct_key}.json"
         direct_cache = "disabled"
         direct_reason = "cache-disabled"
         if cache_enabled:
+            direct_payload: Dict[str, object] = {
+                "kind": "ouro.selfhost-module-direct-artifact.v1",
+                "label": label,
+                "path": mod,
+                "source": closure_entries[mod]["source"],
+                "imports": list(plan.imports),
+                "decls": list(plan.decls),
+                "direct_key": plan.direct_key,
+                "tool_hash": tool_hash,
+            }
+            direct_artifact_hash = artifact_digest(direct_payload)
             ok, reason = artifact_cache_state(direct_cache_path, direct_artifact_hash, "ouro.selfhost-module-direct-artifact.v1")
             if ok:
                 direct_cache = "hit"
@@ -481,7 +590,7 @@ def materialize_module_artifacts(
             else:
                 direct_cache = "miss"
                 direct_reason = "source-or-import-changed" if old.get("direct_key") and old.get("direct_key") != plan.direct_key else reason
-                write_text_if_changed(direct_cache_path, direct_text)
+                write_json_if_changed(direct_cache_path, {**direct_payload, "artifact_sha256": direct_artifact_hash})
                 direct_misses += 1
         else:
             direct_misses += 1
@@ -490,23 +599,23 @@ def materialize_module_artifacts(
 
         ckey = closure_keys[mod]
         phase_keys = phase_keys_for(mod, plan.direct_key, ckey)
-        closure_payload: Dict[str, object] = {
-            "kind": "ouro.selfhost-module-closure-artifact.v1",
-            "label": label,
-            "path": mod,
-            "root": mod,
-            "closure": [{"path": u, "direct_key": plans[u].direct_key, "source": asdict(plans[u].source)} for u in closure_lists[mod]],
-            "closure_key": ckey,
-            "phase_keys": phase_keys,
-            "tool_hash": tool_hash,
-            "seed": asdict(seed_digest) if seed_digest else None,
-            "fuel": fuel,
-        }
-        closure_text, closure_artifact_hash = artifact_text(closure_payload)
         closure_cache_path = closure_dir / f"{filename_fragment(mod, 24, 'module')}__{ckey}.json"
         closure_cache = "disabled"
         closure_reason = "cache-disabled"
         if cache_enabled:
+            closure_payload: Dict[str, object] = {
+                "kind": "ouro.selfhost-module-closure-artifact.v1",
+                "label": label,
+                "path": mod,
+                "root": mod,
+                "closure": [closure_entries[u] for u in closure_lists[mod]],
+                "closure_key": ckey,
+                "phase_keys": phase_keys,
+                "tool_hash": tool_hash,
+                "seed": seed_entry,
+                "fuel": fuel,
+            }
+            closure_artifact_hash = artifact_digest(closure_payload)
             ok, reason = artifact_cache_state(closure_cache_path, closure_artifact_hash, "ouro.selfhost-module-closure-artifact.v1")
             if ok:
                 closure_cache = "hit"
@@ -515,7 +624,7 @@ def materialize_module_artifacts(
             else:
                 closure_cache = "miss"
                 closure_reason = "import-closure-changed" if old.get("closure_key") and old.get("closure_key") != ckey else reason
-                write_text_if_changed(closure_cache_path, closure_text)
+                write_json_if_changed(closure_cache_path, {**closure_payload, "artifact_sha256": closure_artifact_hash})
                 closure_misses += 1
         else:
             closure_misses += 1
@@ -550,12 +659,14 @@ def materialize_module_artifacts(
         )
 
     impacted = reverse_dependency_closure(direct_changed, modules, plans) if direct_changed else []
+    direct_changed_paths = set(direct_changed)
+    closure_changed_paths = set(closure_changed)
     root_reports: List[dict] = []
     affected_roots: List[str] = []
     for root in roots_norm:
         closure = graph[root]
-        direct_changes = [m for m in closure if m in direct_changed]
-        closure_changes = [m for m in closure if m in closure_changed]
+        direct_changes = [m for m in closure if m in direct_changed_paths]
+        closure_changes = [m for m in closure if m in closure_changed_paths]
         affected = bool(direct_changes or closure_changes)
         if affected:
             affected_roots.append(root)
@@ -579,7 +690,7 @@ def materialize_module_artifacts(
         "cache_root": rel(cache_dir),
         "tool_hash": tool_hash,
         "tool_meta": tool_meta,
-        "seed": asdict(seed_digest) if seed_digest else None,
+        "seed": seed_entry,
         "fuel": fuel,
         "summary": {
             "modules": len(modules),

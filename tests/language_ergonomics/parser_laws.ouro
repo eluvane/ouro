@@ -4,6 +4,7 @@ import "../../compiler/parser.ouro";
 import "parser_test_budget.ouro";
 import "../../std/io.ouro";
 import "../../std/listx.ouro";
+import "../compiler_test_list_equal.ouro";
 
 def erg_import_id (decl : Decl) : Nat :=
     match decl with
@@ -18,15 +19,7 @@ def erg_import_id (decl : Decl) : Nat :=
     end;
 
 def erg_same_ids : List Nat -> List Nat -> Bool :=
-  fix same (left : List Nat) (right : List Nat) : Bool :=
-    match left with
-    | Nil => match right with | Nil => True | Cons _ _ => False end
-    | Cons x xs =>
-        match right with
-        | Nil => False
-        | Cons y ys => andb(eqNat x y, same xs ys)
-        end
-    end;
+  compiler_test_list_equal Nat eqNat;
 
 -- Keep parser fuel opaque to native C emission so it cannot unroll the parser.
 def erg_parser_fuel : Nat := parser_test_fuel;
@@ -49,9 +42,51 @@ def erg_parse_error
     | POk _ _ _ => False
     end;
 
+def erg_atom_start_laws : Bool :=
+    let starts : List Token :=
+      [TIdent Z, TNat 42, TType Z, TLparen, TBracketL, THole (Nothing Nat),
+       THole (Just Nat Z), TString Z, TByteString [], TByteString [256],
+       TKeyword kwIf, TKeyword kwFun, TKeyword kwLet, TKeyword kwMatch, TKeyword kwFix] in
+    let stops : List Token :=
+      [TColon, TColonEq, TArrow, TFatArrow, TBar, TRparen, TSemi, TComma,
+       TBraceL, TBraceR, TExclam, TEof, TBind, TPipe, TBracketR, TDotDot, TDotDotEq, TCoalesce] in
+    let keywords : List Nat :=
+      [kwDef, kwAxiom, kwInductive, kwWith, kwEnd, kwIn, kwImport, kwEffect, kwWhere,
+       kwRecord, kwIntrinsic, kwExtern, kwRepresentation, kwOpen, kwThen, kwElse, kwPrivate, 25, 99] in
+    let neither (token : Token) : Bool := notb (orb (is_atom_start token) (is_comma_list_start token)) in
+    andb (all Token (fun (token : Token) => andb (is_atom_start token) (is_comma_list_start token)) starts)
+      (andb (all Token neither stops)
+        (andb (all Nat (fun (key : Nat) => neither (TKeyword key)) keywords)
+          (all Nat (fun (key : Nat) =>
+            andb (notb (is_atom_start (TKeyword key))) (is_comma_list_start (TKeyword key)))
+            [kwDo, kwPerform, kwHandle])));
+
+def erg_atom_callback_laws : Bool :=
+    let forwards (token : Token) (fuel : Nat) (expected : Nat) : Bool :=
+      let observe (received : Nat) (_ : Mode) (rest : List Token) (pos : Nat) (extra : Value)
+          : ParseResult Value :=
+        match andb (eqNat received fuel) (andb (eqNat pos 9)
+          (andb (eqNat (length Token rest) 1) (is_semi (peek rest)))) with
+        | True => POk Value extra rest pos | False => PErr Value pos
+        end in
+      match parse_a_atom observe fuel [token, TSemi] 8 (VNat 31) with
+      | PErr _ => False
+      | POk value _ _ => maybe Nat Bool False (eqNat expected) (asNat value)
+      end in
+    andb (forwards TLparen Z 31)
+      (andb (forwards TBracketL 7 31) (forwards (TKeyword 99) 17 99));
+
 def erg_parser_laws
     (frontend : Nat -> List Token -> Nat -> ParseResult (List Decl)) : Bool :=
-    andb (erg_parse_imports frontend
+    let tail_errors : Bool := all Nat (fun (key : Nat) => erg_parse_error frontend
+      [TKeyword kwDef, TIdent 10, TColon, TIdent 20, TColonEq, TIdent 11,
+       TKeyword key, TSemi, TEof] 6) [kwDo, kwPerform, kwHandle, kwOpen, 25] in
+    let atom_errors : Bool := andb (erg_parse_error frontend
+      [TKeyword kwDef, TIdent 10, TColon, TIdent 20, TColonEq, TKeyword 99, TSemi, TEof] 6)
+      (all Token (fun (separator : Token) => erg_parse_error frontend
+        [TKeyword kwDef, TIdent 10, TColon, TIdent 20, TColonEq, TNat 4, separator, TSemi, TEof] 7)
+        [TDotDot, TDotDotEq]) in
+    andb (andb tail_errors atom_errors) (andb (erg_parse_imports frontend
       [TKeyword kwImport, TString 11, TComma, TString 12, TSemi, TEof] [11, 12])
     (andb (erg_parse_imports frontend
       [TKeyword kwImport, TString 11, TComma, TString 12, TComma, TSemi, TEof] [11, 12])
@@ -70,7 +105,7 @@ def erg_parser_laws
     (andb (erg_parse_error frontend
       [TKeyword kwImport, TString 11, TString 12, TSemi, TEof] 2)
       (erg_parse_error frontend
-        [TKeyword kwImport, TString 11, TComma, TString 12, TComma, TEof] 5)))))))));
+        [TKeyword kwImport, TString 11, TComma, TString 12, TComma, TEof] 5))))))))));
 
 def erg_var_name (expr : Expr) : Maybe Nat :=
     match expr with
@@ -509,6 +544,52 @@ def erg_do_pure_laws
     let rejected : Bool := andb no_tail
       (andb trailing_let no_separator) in
     andb accepted rejected;
+
+def erg_do_items_laws
+    (frontend : Nat -> Mode -> List Token -> Nat -> Value -> ParseResult Value) : Bool :=
+    let earlier_count : Nat := 64 in
+    let last_name : Nat := S earlier_count in
+    let tokens (tail : List Token) : List Token :=
+      (fix prepend (name : Nat) (out : List Token) : List Token :=
+        match name with
+        | Z => out
+        | S earlier => prepend earlier (Cons Token (TIdent name) (Cons Token TSemi out))
+        end) earlier_count (Cons Token (TIdent last_name) tail) in
+    let in_order : List Expr -> Nat -> Bool :=
+      fix check_order (statements : List Expr) (expected : Nat) : Bool :=
+        match statements with
+        | Nil => eqNat expected (S last_name)
+        | Cons stmt rest =>
+            andb (maybe Nat Bool False (eqNat expected) (erg_var_name stmt))
+              (check_order rest (S expected))
+        end in
+    let completes (tail : List Token) : Bool :=
+      match parse_b_do_items frontend erg_parser_fuel (tokens tail) Z (VNat Z) [] with
+      | PErr _ => False
+      | POk parsed rest position =>
+          andb (eqNat position (S (mul earlier_count 2)))
+            (andb (compiler_test_list_equal Token
+                (fun (left : Token) (right : Token) => eqNat (token_tag left) (token_tag right)) rest tail)
+              (if let VExpr body := (parsed : Value) then
+                 if let EDo statements := body then in_order statements 1 else False
+               else False))
+      end in
+    andb (completes [TEof]) (completes [TSemi, TEof]);
+
+def erg_do_items_fuel_law : Bool :=
+    let take_stmt (fuel : Nat) (_mode : Mode) (tokens : List Token) (position : Nat)
+        (_extra : Value) : ParseResult Value :=
+      match fuel with
+      | S _ => PErr Value position
+      | Z => match tokens with
+        | Nil => PErr Value position
+        | Cons _ tail => okExpr (EVar 1) tail (S position)
+        end
+      end in
+    match parse_b_do_items take_stmt 1 [TIdent 1, TSemi, TIdent 2, TEof] Z (VNat Z) [] with
+    | PErr position => eqNat position 2
+    | POk _ _ _ => False
+    end;
 
 def erg_if_parser_laws
     (frontend : Nat -> List Token -> Nat -> ParseResult (List Decl)) : Bool :=
@@ -1440,7 +1521,7 @@ def erg_trailing_lambda_laws
            TIdent 12, TLparen, TIdent 13, TRparen, TBraceL,
            TIdent 14, TIdent 15, TArrow, TIdent 14, TBraceR,
            TSemi, TEof]))));
-def erg_coalesce_decl_body (decls : List Decl) : Maybe Expr :=
+def erg_single_def_body (decls : List Decl) : Maybe Expr :=
   match decls with
   | Nil => Nothing Expr
   | Cons declaration remaining =>
@@ -1568,7 +1649,7 @@ def erg_coalesce_app_parts (term : Expr) : Maybe (Pair Expr Expr) :=
   end;
 
 def erg_coalesce_shape (decls : List Decl) : Bool :=
-  match erg_coalesce_decl_body decls with
+  match erg_single_def_body decls with
   | Nothing => False
   | Just body => match erg_coalesce_parts body with
     | Nothing => False
@@ -1595,7 +1676,7 @@ def erg_coalesce_shape (decls : List Decl) : Bool :=
   end;
 
 def erg_coalesce_pipe_shape (decls : List Decl) : Bool :=
-  match erg_coalesce_decl_body decls with
+  match erg_single_def_body decls with
   | Nothing => False
   | Just body => match erg_coalesce_parts body with
     | Nothing => False
@@ -1644,6 +1725,88 @@ def erg_coalesce_laws
        TIdent 11, TCoalesce, TSemi, TEof] in
     andb nested (andb pipe missing_rhs);
 
+def erg_match_bang_shape (term : Expr) : Bool :=
+    if let EDo items := term then
+      match items with
+      | Nil => False
+      | Cons binding rest => match rest with
+        | Nil => False
+        | Cons dispatch tail =>
+            andb (nullb Expr tail)
+              (if let EDoBind name action := (binding : Expr) then
+                 if let EMatch subject _ := (dispatch : Expr) then
+                   andb (maybe Nat Bool False (eqNat 11) (erg_var_name action))
+                     (maybe Nat Bool False (eqNat name) (erg_var_name subject))
+                 else False
+               else False)
+        end
+      end
+    else False;
+
+def erg_match_bang_laws
+    (frontend : Nat -> List Token -> Nat -> ParseResult (List Decl)) : Bool :=
+    let expanded : Bool :=
+      match frontend erg_parser_fuel
+        [TKeyword kwDef, TIdent 10, TColon, TIdent 20, TColonEq,
+         TKeyword kwMatch, TExclam, TIdent 11, TKeyword kwWith,
+         TBar, TIdent 12, TFatArrow, TIdent 13, TKeyword kwEnd, TSemi, TEof] Z with
+      | PErr _ => False
+      | POk decls rest _ =>
+          andb (is_eof (peek rest))
+            (maybe Expr Bool False erg_match_bang_shape (erg_single_def_body decls))
+      end in
+    let missing_with : Bool := erg_parse_error frontend
+      [TKeyword kwDef, TIdent 10, TColon, TIdent 20, TColonEq,
+       TKeyword kwMatch, TExclam, TIdent 11, TBar, TIdent 12, TFatArrow,
+       TIdent 13, TKeyword kwEnd, TSemi, TEof] 8 in
+    andb expanded missing_with;
+
+def erg_call_argument_laws
+    (frontend : Nat -> Mode -> List Token -> Nat -> Value -> ParseResult Value) : Bool :=
+    let call (tokens : List Token) : ParseResult Value :=
+      parse_a_call_arguments frontend erg_parser_fuel (EVar 10) tokens Z (VNat Z) in
+    let consumed (rest : List Token) (position : Nat) (expected : Nat) : Bool :=
+      andb (eqNat position expected) (andb (is_semi (peek rest)) (eqNat (length Token rest) 1)) in
+    let numeral (expected : Nat) (term : Expr) : Bool :=
+      if let ENat value := term then eqNat value expected else False in
+    let positional : Bool := match call [TNat 21, TComma, TNat 22, TRparen, TSemi] with
+      | PErr _ => False
+      | POk value rest position =>
+          andb (consumed rest position 4)
+            (if let VExpr term := (value : Value) then
+               if let EApp prefix second := term then
+                 if let EApp head first := prefix then
+                   andb (maybe Nat Bool False (eqNat 10) (erg_var_name head))
+                     (andb (numeral 21 first) (numeral 22 second))
+                 else False
+               else False
+             else False)
+      end in
+    let row_values (row : Pair Nat Expr) : List Nat :=
+      let (MkPair label argument) := row in
+      if let ENat value := (argument : Expr) then [label, value] else [] in
+    let named_trailing : Bool := match call
+      [TNat 21, TComma, TIdent 11, TColonEq, TNat 22,
+       TComma, TIdent 12, TColonEq, TNat 23, TComma, TRparen, TSemi] with
+      | PErr _ => False
+      | POk value rest position =>
+          andb (consumed rest position 11)
+            (if let VExpr term := (value : Value) then
+               if let ENamedCall head rows := term then
+                 andb (maybe Nat Bool False (eqNat 10) (erg_var_name head))
+                   (compiler_test_list_equal (List Nat) erg_same_ids
+                     (map (Pair Nat Expr) (List Nat) row_values rows)
+                     ([[Z, 21], [11, 22], [12, 23]] : List (List Nat)))
+               else False
+             else False)
+      end in
+    let misordered : Bool := match call
+      [TIdent 11, TColonEq, TNat 22, TComma, TNat 23, TRparen, TSemi] with
+      | PErr position => eqNat position 4
+      | POk _ _ _ => False
+      end in
+    andb positional (andb named_trailing misordered);
+
 -- @entry main
 def main : IO Unit :=
     let destructure : Bool := andb (erg_destructure_laws (parse_file parse))
@@ -1659,18 +1822,25 @@ def main : IO Unit :=
     let trailing : Bool := andb
       (erg_trailing_lambda_laws (parse_file parse))
       (erg_trailing_lambda_laws (closed_parse_file parse_a parse_b)) in
+    let call_arguments : Bool := andb (erg_call_argument_laws parse)
+      (erg_call_argument_laws (close_parse parse_a parse_b)) in
     let coalesce : Bool := andb (erg_coalesce_laws (parse_file parse))
       (erg_coalesce_laws (closed_parse_file parse_a parse_b)) in
+    let match_bang : Bool := andb (erg_match_bang_laws (parse_file parse))
+      (erg_match_bang_laws (closed_parse_file parse_a parse_b)) in
     let do_pure : Bool := andb (erg_do_pure_laws (parse_file parse))
       (erg_do_pure_laws (closed_parse_file parse_a parse_b)) in
-    let prior : Bool := andb do_pure (andb destructure (andb (andb direct closed)
+    let do_items : Bool := andb (erg_do_items_laws parse)
+      (andb (erg_do_items_laws (close_parse parse_a parse_b)) erg_do_items_fuel_law) in
+    let prior : Bool := andb (andb (andb do_pure do_items) erg_atom_callback_laws) (andb destructure (andb (andb direct closed)
         (andb (erg_fallible_laws (parse_file parse))
           (andb (erg_fallible_laws (closed_parse_file parse_a parse_b))
             (andb (erg_implicit_laws (parse_file parse))
               (andb (erg_implicit_laws (closed_parse_file parse_a parse_b))
                 (andb (erg_marked_def_laws (parse_file parse))
                   (erg_marked_def_laws (closed_parse_file parse_a parse_b))))))))) in
-    match andb (andb trailing (andb coalesce prior))
+    match andb (andb match_bang
+          (andb erg_atom_start_laws (andb (andb trailing call_arguments) (andb coalesce prior))))
         (andb (erg_if_parser_laws (parse_file parse))
           (andb (erg_if_parser_laws (closed_parse_file parse_a parse_b))
             (andb (erg_iflet_parser_laws (parse_file parse))

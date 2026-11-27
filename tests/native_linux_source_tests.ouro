@@ -1,0 +1,243 @@
+-- Compiler-owned source/import/replay laws; ELF execution remains separate.
+import "../compiler/native/lower_linux_source.ouro",
+  "native_lower_error_code.ouro",
+  "../std/test.ouro";
+
+def linux_source_test_fuel : Nat := mul 100 60;
+def linux_source_test_root : List Nat := prim_string_to_char_codes "main.ouro";
+def linux_source_test_entry : List Nat := prim_string_to_char_codes "main";
+
+def linux_source_test_prelude : String :=
+    str_join "" [
+      "intrinsic W : Type := \"ouro.u32\"; intrinsic Wide : Type := \"ouro.u64\"; intrinsic Size : Type := \"ouro.usize\"; ",
+      "intrinsic Pointer : Type -> Type := \"ouro.raw_ptr\"; intrinsic Runtime : Type -> Type := \"ouro.runtime\"; ",
+      "intrinsic pure : (A : Type) -> A -> Runtime A := \"ouro.runtime.pure\"; ",
+      "intrinsic bind : (A : Type) -> (B : Type) -> Runtime A -> (A -> Runtime B) -> Runtime B := \"ouro.runtime.bind\"; ",
+      "intrinsic null : (A : Type) -> Pointer A := \"ouro.raw.null\"; intrinsic bits : (A : Type) -> Pointer A -> Runtime Size := \"ouro.raw.to_bits\"; ",
+      "intrinsic as_wide : Size -> Wide := \"ouro.convert.usize.u64.reinterpret\"; intrinsic narrow : Wide -> W := \"ouro.convert.u64.u32.narrow.wrap\"; ",
+      "inductive Nat : Type := | Z : Nat | S : Nat -> Nat; representation Nat := \"ouro.nat\"; ",
+      "inductive Choice (A : Type) : Type := | None : Choice A | Some : A -> Choice A; representation Choice := \"ouro.maybe\"; ",
+      "intrinsic from_word : Nat -> Choice W := \"ouro.u32.from_nat.checked\"; "];
+
+def linux_source_test_action : String :=
+    "bind Size W (bits W (null W)) (fun (raw : Size) => let zero : W := narrow (as_wide raw) in match from_word 42 with | None => pure W zero | Some value => pure W value end)";
+
+def linux_source_test_source : String :=
+    str_join "" [linux_source_test_prelude, "def main : Runtime W := ", linux_source_test_action, ";"];
+
+def linux_source_test_files (source : String) : List (Pair (List Nat) (List Nat)) :=
+    [MkPair (List Nat) (List Nat) linux_source_test_root (prim_string_to_char_codes source)];
+
+def linux_source_test_imported (library : String) : List (Pair (List Nat) (List Nat)) :=
+    [MkPair (List Nat) (List Nat) (prim_string_to_char_codes "lib.ouro") (prim_string_to_char_codes library),
+     MkPair (List Nat) (List Nat) linux_source_test_root
+       (prim_string_to_char_codes "import \"lib.ouro\"; def main : Runtime W := answer;")];
+
+def linux_source_test_compile (files : List (Pair (List Nat) (List Nat)))
+    : Either LinuxSourceError (List Nat) :=
+    native_compile_linux_units linux_source_test_fuel mir_default_limits
+      linux_source_test_entry linux_source_test_root files;
+
+def linux_source_test_image (result : Either LinuxSourceError (List Nat)) : Bool :=
+    match result with
+    | Left _ => False
+    | Right bytes => andb (pe_bytes_equal (take Nat 8 bytes) [127,69,76,70,2,1,1,0])
+        (andb (ltb_nat elf_text_offset (length Nat bytes))
+          (all Nat (fun (byte : Nat) => ltb_nat byte 256) bytes))
+    end;
+
+def linux_source_test_entry_preserved : Bool :=
+    match native_lower_linux_units linux_source_test_fuel mir_default_limits linux_source_test_entry
+        linux_source_test_root (linux_source_test_files linux_source_test_source) with
+    | Left _ => False
+    | Right lowered => let (NativeLoweredOf checked _ mir) := lowered in
+      let (MkIntern names _ _ _) := checked_program_intern checked in
+      match source_lookup_id names linux_source_test_entry with
+      | Nothing => False
+      | Just main_id => let (MirProgramDef functions data libraries entry) := mir in
+        andb (eq_nat entry main_id) (andb (eq_nat (length MirFunction functions) 1)
+          (andb (nullb MirData data) (nullb MirLibrary libraries)))
+      end
+    end;
+
+def linux_source_test_windows_startup : Bool :=
+    match native_lower_units linux_source_test_fuel mir_default_limits linux_source_test_entry
+        linux_source_test_root (linux_source_test_files linux_source_test_source) with
+    | Left _ => False
+    | Right lowered => let (NativeLoweredOf checked _ mir) := lowered in
+      let (MkIntern names _ _ _) := checked_program_intern checked in
+      match source_lookup_id names linux_source_test_entry with
+      | Nothing => False
+      | Just main_id => let (MirProgramDef functions _ libraries entry) := mir in
+        andb (notb (eq_nat entry main_id))
+          (andb (eq_nat (length MirFunction functions) 2)
+            (match libraries with
+             | Nil => False
+             | Cons library rest => let (MirLibraryDef name externs) := library in
+               andb (pe_library_equal name lower_kernel_library)
+                 (andb (eq_nat (length MirExtern externs) 1) (nullb MirLibrary rest))
+             end))
+      end
+    end;
+
+def linux_source_test_exact_check_error (files : List (Pair (List Nat) (List Nat))) : Bool :=
+    match compile_checked_units linux_source_test_fuel linux_source_test_root files with
+    | COk _ => False
+    | CErr expected => let (ErrCode code detail) := expected in
+      match linux_source_test_compile files with
+      | Right _ => False
+      | Left error => match error with
+        | LinuxSourceBackend _ => False
+        | LinuxSourceFrontend frontend => match frontend with
+          | NativeSourceLowerError _ => False
+          | NativeSourceCheckError actual => let (ErrCode actual_code actual_detail) := actual in
+            andb (eq_nat code actual_code) (eq_nat detail actual_detail)
+          end
+        end
+      end
+    end;
+
+def linux_source_test_lower_error (code : Nat) (source : String) : Bool :=
+    match linux_source_test_compile (linux_source_test_files source) with
+    | Right _ => False
+    | Left error => match error with
+      | LinuxSourceBackend _ => False
+      | LinuxSourceFrontend frontend => match frontend with
+        | NativeSourceCheckError _ => False
+        | NativeSourceLowerError failure => eq_nat code (native_lower_error_code failure)
+        end
+      end
+    end;
+
+def linux_source_test_reject_extern : Bool :=
+    match linux_source_test_compile (linux_source_test_files
+        (str_join "" [linux_source_test_prelude,
+          "extern unused : Runtime W := \"windows-x86_64\" \"win64\" \"kernel32.dll\" \"GetCurrentProcessId\" \"maygc\"; ",
+          "def main : Runtime W := ", linux_source_test_action, ";"])) with
+    | Right _ => False
+    | Left error => match error with
+      | LinuxSourceFrontend _ => False
+      | LinuxSourceBackend backend => if let LinuxImportsUnsupported name := (backend : LinuxCodegenError) then
+          pe_library_equal name lower_kernel_library
+        else False
+      end
+    end;
+
+def linux_source_test_reject_io : Bool :=
+    match linux_source_test_compile (linux_source_test_files
+        (str_join "" [linux_source_test_prelude,
+          "inductive UnitValue : Type := | UnitCtor : UnitValue; representation UnitValue := \"ouro.unit\"; ",
+          "intrinsic String : Type := \"ouro.string\"; intrinsic write : String -> Runtime UnitValue := \"ouro.runtime.stdout.write\"; ",
+          "def unusedIO : Runtime UnitValue := write \"hidden\"; def main : Runtime W := ", linux_source_test_action, ";"])) with
+    | Right _ => False
+    | Left error => match error with
+      | LinuxSourceBackend _ => False
+      | LinuxSourceFrontend frontend => match frontend with
+        | NativeSourceCheckError _ => False
+        | NativeSourceLowerError failure => if let LowerUnsupportedPrimitive primitive := (failure : NativeLowerError) then
+            primitive_id_equal primitive PrimitiveStdoutWrite
+          else False
+        end
+      end
+    end;
+
+def linux_source_test_gc_metadata : Bool :=
+    match compile_checked_units linux_source_test_fuel linux_source_test_root
+        (linux_source_test_files linux_source_test_source) with
+    | CErr _ => False
+    | COk checked => let (CheckedProgramOf state entries bodies) := checked in
+      let (MkIntern names _ _ _) := state in
+      match source_lookup_id names linux_source_test_entry with
+      | Nothing => False
+      | Just main_id => match source_lookup_id names (prim_string_to_char_codes "from_word") with
+        | Nothing => False
+        | Just intrinsic_id =>
+            let forged : List Entry := map Entry Entry (fun (item : Entry) => match item with
+              | MkBoundEntry id typ binding => match binding with
+                | PrimitiveExternBinding _ => item
+                | PrimitiveIntrinsicBinding primitive execution _ specialization =>
+                    if primitive_id_equal primitive (PrimitiveWordFromNat PrimitiveWordU32) then
+                      MkBoundEntry id typ
+                        (PrimitiveIntrinsicBinding primitive execution PrimitiveNoGc specialization)
+                    else item
+                end
+              | MkEntry _ _ _ => item | MkIndEntry _ _ => item | MkRoleEntry _ => item
+              end) entries in
+            match native_lower_linux_checked linux_source_test_fuel mir_default_limits main_id
+                (CheckedProgramOf state forged bodies) with
+            | Right _ => False
+            | Left error => andb (eq_nat 2 (native_lower_error_code error))
+                (if let LowerMetadataMismatch id := (error : NativeLowerError) then eq_nat id intrinsic_id else False)
+            end
+        end
+      end
+    end;
+
+def linux_source_test_replay (fuel : Nat) (code : Nat) : Bool :=
+    match compile_checked_units linux_source_test_fuel linux_source_test_root
+        (linux_source_test_files linux_source_test_source) with
+    | CErr _ => False
+    | COk checked => let (CheckedProgramOf state entries _) := checked in
+      let (MkIntern names _ _ _) := state in
+      match source_lookup_id names linux_source_test_entry with
+      | Nothing => False
+      | Just main_id => match native_lower_linux_checked fuel mir_default_limits (S main_id)
+          (CheckedProgramOf state entries ([] : List (Pair Nat CoreTerm))) with
+        | Right _ => False
+        | Left error => andb (eq_nat code (native_lower_error_code error))
+            (match code with
+             | Z => True
+             | S _ => if let LowerBodyMismatch id := (error : NativeLowerError) then eq_nat id main_id else False
+             end)
+        end
+      end
+    end;
+
+def linux_source_test_laws : List Test :=
+    [assert_true "linux-source/checked-word-ELF"
+       (linux_source_test_image (linux_source_test_compile (linux_source_test_files linux_source_test_source))),
+     assert_true "linux-source/full-imported-closure-ELF"
+       (linux_source_test_image (linux_source_test_compile (linux_source_test_imported
+         (str_join "" [linux_source_test_prelude, "def answer : Runtime W := ", linux_source_test_action, ";"])))),
+     assert_true "linux-source/user-entry-no-Windows-startup" linux_source_test_entry_preserved,
+     assert_true "linux-source/Windows-startup-import-retained" linux_source_test_windows_startup,
+     assert_true "linux-source/reject-even-unused-Windows-extern" linux_source_test_reject_extern,
+     assert_true "linux-source/reject-even-unused-IO-operation" linux_source_test_reject_io,
+     assert_true "linux-source/replay-intrinsic-GC-metadata" linux_source_test_gc_metadata,
+     assert_true "linux-source/imported-unused-type-error-preserves-payload"
+       (linux_source_test_exact_check_error (linux_source_test_imported
+         (str_join "" [linux_source_test_prelude, "def unused : W := Type; def answer : Runtime W := ", linux_source_test_action, ";"]))),
+     assert_true "linux-source/unsupported-Linux-extern-stays-checker-error"
+       (linux_source_test_exact_check_error (linux_source_test_files
+         (str_join "" [linux_source_test_prelude,
+           "extern unsupported : Runtime W := \"linux-x86_64\" \"sysv\" \"libc.so.6\" \"getpid\" \"maygc\"; ",
+           "def main : Runtime W := ", linux_source_test_action, ";"]))),
+     assert_true "linux-source/unused-boxed-value-refused"
+       (linux_source_test_lower_error 4
+         (str_join "" [linux_source_test_prelude,
+           "inductive Box : Type := | Packed : Box; def unused : Runtime Box := pure Box Packed; ",
+           "def main : Runtime W := ", linux_source_test_action, ";"])),
+     assert_true "linux-source/unit-IO-entry-not-exit-word"
+       (linux_source_test_lower_error 11
+         (str_join "" [linux_source_test_prelude,
+           "inductive UnitValue : Type := | UnitCtor : UnitValue; representation UnitValue := \"ouro.unit\"; ",
+           "def IOUnit : Type := Runtime UnitValue; def main : IOUnit := pure UnitValue UnitCtor;"])),
+     assert_true "linux-source/forged-body-refused-before-invalid-entry"
+       (linux_source_test_replay linux_source_test_fuel 3),
+     assert_true "linux-source/zero-fuel-before-forged-body"
+       (linux_source_test_replay 0 0)];
+
+-- @entry main
+def main : IO Unit :=
+    do let! arguments := argv;
+       (if eq_nat (length String arguments) 1 then test_run linux_source_test_laws
+       else
+         if
+           andb (eq_nat (length String arguments) 3)
+             (andb (str_eq (nth String "" 1 arguments) "--image")
+               (str_eq (nth String "" 2 arguments) "exit42")) then
+           match linux_source_test_compile (linux_source_test_files linux_source_test_source) with
+           | Left _ => do eprintln "LINUX_SOURCE_ERROR exit42"; exit 1
+           | Right bytes => println (str_join "," (map Nat String str_of_nat bytes))
+           end
+         else do eprintln "usage: native_linux_source_tests [--image exit42]"; exit 2);

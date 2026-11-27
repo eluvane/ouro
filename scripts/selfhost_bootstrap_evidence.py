@@ -9,13 +9,14 @@ import json
 import platform
 import re
 import shlex
+import struct
 import subprocess
 import sys
 import time
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Optional, Sequence
 
-from repo_support import read_json_value, sha256_file, write_json_atomic
+from repo_support import hash_json, read_json_value, sha256_file, write_json_atomic
 
 try:
     import resource
@@ -30,6 +31,13 @@ DEFAULT_WORK_DIR = Path("_build/bootstrap")
 DEFAULT_STAGE_LOOP_RESULT = Path("_build/stage_loop/result.json")
 DEFAULT_STAGE_LOOP_COMMAND = "sh scripts/stage_loop.sh"
 DEFAULT_LOG_BYTES = 16 * 1024
+NATIVE_REPORT_KIND = "ouro.native-selfhost-evidence.v1"
+NATIVE_RESULT_KIND = "ouro.native-selfhost-observation.v1"
+NATIVE_ENTRY = "tools/native_build.ouro"
+NATIVE_CONFIG = {"target": "x86_64-windows", "entry": "main", "fuel": 200000, "mir_limits": 16777216}
+NATIVE_IMPORTS = {"advapi32.dll", "bcrypt.dll", "kernel32.dll", "shell32.dll", "winhttp.dll"}
+NATIVE_WINDOWS_PATHS = sys.platform == "win32"
+DEFAULT_NATIVE_OUT = Path("_build/bootstrap/native-evidence.json")
 STAGE_RE = re.compile(r"(?<![A-Za-z0-9])stage([0-9]+)(?![A-Za-z0-9])")
 PATH_KEYS = ("artifact", "compiler", "dir", "file", "generated", "log", "manifest", "output", "path", "stamp")
 
@@ -583,10 +591,418 @@ def build_report(
     return report, 0 if report["summary"]["status"] == "pass" else 1
 
 
+def native_require(condition: bool, message: str) -> None:
+    if not condition:
+        raise ValueError(message)
+
+
+def native_path(root: Path, name: Any) -> Path:
+    native_require(isinstance(name, str) and bool(name) and "\\" not in name
+                   and ":" not in name and not name.startswith("/")
+                   and all(part not in {"", ".", ".."} for part in name.split("/")),
+                   "native evidence path must be repository-relative")
+    path = (root / name).resolve(strict=True)
+    native_require(path.is_relative_to(root.resolve()) and path.is_file(),
+                   f"native evidence file escapes the repository or is missing: {name}")
+    return path
+
+
+def native_json(path: Path) -> dict[str, Any]:
+    native_require(path.stat().st_size <= 16 * 1024 * 1024, "native evidence JSON exceeds 16 MiB")
+
+    def unique(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+        value: dict[str, Any] = {}
+        for key, child in pairs:
+            native_require(key not in value, f"duplicate native evidence field: {key}")
+            value[key] = child
+        return value
+
+    def nonfinite(value: str) -> None:
+        raise ValueError(f"non-finite native evidence value: {value}")
+
+    value = json.loads(path.read_text(encoding="utf-8"), object_pairs_hook=unique, parse_constant=nonfinite)
+    native_require(isinstance(value, dict), "native evidence JSON must be an object")
+    return value
+
+
+def native_units(root: Path, entry: str) -> list[str]:
+    from selfhost_module_cache import collect_units, quoted_import_targets
+
+    def imports(name: str) -> list[str]:
+        path = native_path(root, name)
+        native_require(path.stat().st_size <= 16 * 1024 * 1024, "native source exceeds 16 MiB")
+        return quoted_import_targets(path.read_text(encoding="utf-8"), name)
+
+    try:
+        return collect_units(entry, imports=imports,
+                             cycle_error=lambda name: f"native evidence import cycle: {name}")
+    except SystemExit as exc:
+        raise ValueError(str(exc)) from exc
+
+
+def native_output_guard(root: Path, out: Path, values: Any) -> None:
+    root, target = root.resolve(), out.resolve()
+    target_identity = None
+    if target.is_file():
+        metadata = target.stat()
+        native_require(metadata.st_ino != 0, "native output file identity is unavailable")
+        target_identity = metadata.st_dev, metadata.st_ino
+    pending = [values]
+    while pending:
+        value = pending.pop()
+        if isinstance(value, dict):
+            names = [value["path"]] if isinstance(value.get("path"), str) else []
+            for field in ("sources", "stage0"):
+                if isinstance(value.get(field), dict):
+                    names.extend(value[field])
+            for name in names:
+                candidate = (root / name).resolve()
+                if not candidate.is_relative_to(root):
+                    continue
+                native_require(candidate != target, "native output aliases an input artifact")
+                if target_identity is not None and candidate.is_file():
+                    metadata = candidate.stat()
+                    native_require(metadata.st_ino != 0, "native input file identity is unavailable")
+                    native_require((metadata.st_dev, metadata.st_ino) != target_identity,
+                                   "native output aliases an input artifact")
+            pending.extend(value.values())
+        elif isinstance(value, list):
+            pending.extend(value)
+
+
+def build_native_report(*, root: Path, out: Path, result_path: Path) -> tuple[dict[str, Any], int]:
+    """Validate host observations; never execute a stage or infer behavior from equality."""
+    root = root.resolve()
+    report = empty_report(root, out=out)
+    report["kind"] = NATIVE_REPORT_KIND
+    report["acceptance_scope"] = "native-stage-chain-and-declared-behavior"
+    report["summary"].update(status="fail", converged=None, logs=None, hard_errors=[],
+                             partial_reasons=[], provenance_accepted=False, behavior_accepted=False,
+                             native_seed_promoted=False, isolated_host_accepted=False)
+    pinned: dict[Path, str] = {}
+    output_identities: set[tuple[int, int]] = set()
+    image_identities: dict[tuple[int, int], Path] = {}
+
+    def generated(path: Path) -> bool:
+        owner = path.relative_to(root).parts[0]
+        return (owner.casefold() if NATIVE_WINDOWS_PATHS else owner) in {"_build", "_cache"}
+
+    def file_identity(path: Path) -> tuple[int, int]:
+        metadata = path.stat()
+        native_require(metadata.st_ino != 0, "native output file identity is unavailable")
+        return metadata.st_dev, metadata.st_ino
+
+    def mark_output(path: Path) -> Path:
+        output_identities.add(file_identity(path))
+        return path
+
+    def distinct_image(path: Path, label: str) -> Path:
+        identity = file_identity(path)
+        native_require(identity not in image_identities,
+                       f"native {label} image aliases another seed, producer, stage, or program")
+        image_identities[identity] = path
+        return mark_output(path)
+
+    def pin(ref: Any) -> Path:
+        native_require(isinstance(ref, dict) and set(ref) == {"path", "sha256"},
+                       "native file reference requires path and sha256")
+        path = native_path(root, ref["path"])
+        size = path.stat().st_size
+        artifact = None
+        if path not in pinned:
+            artifact = {**ref, "path": path.relative_to(root).as_posix(), "status": "unverified", "required": True, "bytes": size}
+            report["artifacts"].append(artifact)
+        native_require(size <= 256 * 1024 * 1024, "native evidence file exceeds 256 MiB")
+        native_require(isinstance(ref["sha256"], str) and re.fullmatch(r"[0-9a-f]{64}", ref["sha256"]) is not None
+                       and sha256_file(path) == ref["sha256"], f"stale native evidence file: {ref['path']}")
+        native_require(path not in pinned or pinned[path] == ref["sha256"], "conflicting native file identities")
+        if artifact is not None:
+            pinned[path] = ref["sha256"]
+            artifact["status"] = "present"
+        if generated(path):
+            mark_output(path)
+        return path
+
+    def sources(value: Any) -> None:
+        native_require(isinstance(value, dict) and bool(value), "native source inventory is missing")
+        for name, digest in value.items():
+            pin({"path": name, "sha256": digest})
+
+    def image(value: Any) -> Path:
+        from frontend_native_process import inspect_image
+
+        native_require(isinstance(value, dict) and set(value) == {"path", "sha256", "imports"},
+                       "native image reference requires path, sha256, and imports")
+        path = pin({key: value[key] for key in ("path", "sha256")})
+        imports = value["imports"]
+        native_require(isinstance(imports, list) and all(isinstance(name, str) for name in imports)
+                       and len(imports) == len(set(imports)) and bool(imports) and set(imports) <= NATIVE_IMPORTS,
+                       "native image has undeclared or legacy imports")
+        native_require(64 <= path.stat().st_size <= 256 * 1024 * 1024, "native image exceeds 256 MiB")
+        inspect_image(path, imports, required_symbols={})
+        with path.open("rb") as stream:
+            stream.seek(0x3C)
+            pe, = struct.unpack("<I", stream.read(4))
+            stream.seek(pe + 20)
+            optional_size, = struct.unpack("<H", stream.read(2))
+            stream.seek(pe + 24 + 108)
+            count, = struct.unpack("<I", stream.read(4))
+            native_require(optional_size >= 152 and count >= 5, "native PE has no certificate directory field")
+            stream.seek(pe + 24 + 144)
+            native_require(stream.read(8) == bytes(8), "native evidence requires complete unsigned PE images")
+        return mark_output(path)
+
+    def passed(row: Any, label: str) -> None:
+        native_require(isinstance(row, dict) and row.get("status") == "pass" and row.get("process_status") == "ok"
+                       and type(row.get("exit_code")) is int and row["exit_code"] == 0,
+                       f"native {label} failed, skipped, or incomplete")
+        for stream in ("stdout", "stderr"):
+            mark_output(pin(row.get(stream)))
+
+    def emission(row: Any, declared: dict[str, Any], producer_path: Path, label: str) -> Path:
+        passed(row, label)
+        native_require(row.get("backend") == "ouro-native" and row.get("runtime") == "ouro-native",
+                       f"native {label} lacks native backend/runtime provenance")
+        native_require(isinstance(declared, dict) and set(declared) == {"entry", "units", "sources", "config"}
+                       and isinstance(declared["entry"], str) and declared["config"] == NATIVE_CONFIG
+                       and all(type(declared["config"][name]) is type(value) for name, value in NATIVE_CONFIG.items()),
+                       f"native {label} compiler inputs differ")
+        ordered = native_units(root, declared["entry"])
+        native_require(declared["units"] == ordered and isinstance(declared["sources"], dict)
+                       and set(declared["sources"]) == set(ordered), f"native {label} source closure differs")
+        sources(declared["sources"])
+        digest = hash_json(declared)
+        native_require(row.get("inputs_sha256") == digest == row.get("inputs_after_sha256"), f"native {label} input identity changed")
+        native_require(pin(row.get("producer")) == producer_path
+                       and row.get("producer_after_sha256") == pinned[producer_path], f"native {label} producer changed")
+        output = image(row.get("image"))
+        argv = row.get("argv")
+        native_require(isinstance(argv, list) and all(isinstance(word, str) for word in argv)
+                       and len(argv) == len(ordered) + 3 and abs_path(root, argv[0]).resolve() == producer_path
+                       and argv[1:] == [declared["entry"], row["image"]["path"], *ordered]
+                       and isinstance(row.get("cwd"), str) and abs_path(root, row["cwd"]).resolve() == root.resolve(),
+                       f"native {label} command does not bind the exact source closure")
+        stdout = pin(row["stdout"])
+        expected_stdout = (row["image"]["path"] + "\n").encode("utf-8")
+        native_require(stdout.stat().st_size == len(expected_stdout) and stdout.read_bytes() == expected_stdout,
+                       f"native {label} stdout does not name the emitted image exactly")
+        return output
+
+    try:
+        path = abs_path(root, result_path).resolve(strict=True)
+        native_require(path.is_relative_to(root.resolve()), "native result escapes the repository")
+        native_require(path.stat().st_size <= 16 * 1024 * 1024, "native evidence JSON exceeds 16 MiB")
+        result = native_json(pin({"path": path.relative_to(root.resolve()).as_posix(), "sha256": sha256_file(path)}))
+        native_require(result.get("kind") == NATIVE_RESULT_KIND and type(result.get("schema_version")) is int
+                       and result["schema_version"] == 1, "unsupported native observation schema")
+        native_require(report["repo"]["git_available"] and result.get("source_revision") == report["repo"]["git_head"],
+                       "native source revision is missing or stale")
+        inputs = result.get("inputs")
+        native_require(isinstance(inputs, dict) and set(inputs) == {"entry", "units", "sources", "config"}
+                       and inputs["entry"] == NATIVE_ENTRY and inputs["config"] == NATIVE_CONFIG
+                       and all(type(inputs["config"][name]) is type(value) for name, value in NATIVE_CONFIG.items()),
+                       "native compiler inputs or positional configuration differ")
+        units = native_units(root, NATIVE_ENTRY)
+        native_require(inputs["units"] == units and set(inputs["sources"]) == set(units),
+                       "native ordered source closure is missing or stale")
+        sources(inputs["sources"])
+        key = hash_json(inputs)
+        native_require(result.get("inputs_sha256") == key, "native input digest differs")
+        report["inputs"] = inputs
+        report["inputs_sha256"] = key
+
+        from native_tool_build import BUILD_INPUTS, RUNTIME, tool_roots
+        import bootstrap_compiler as bootstrap
+        import bootstrap_inputs
+        from frontend_regen import FRONTEND_TUS
+        from ourosmith.native import INPUT_FIELDS
+
+        producer = result.get("producer")
+        native_require(isinstance(producer, dict) and producer.get("origin") == "c-hosted",
+                       "initial P must retain its C-hosted origin")
+        previous = distinct_image(pin(producer.get("image")), "P")
+        receipt = native_json(pin(producer.get("receipt")))
+        seed = distinct_image(pin(producer.get("seed")), "C seed")
+        seed_receipt_path = pin(producer.get("seed_receipt"))
+        seed_receipt = native_json(seed_receipt_path)
+        selected = seed_receipt.get("selected")
+        native_require(isinstance(selected, dict), "C seed input receipt is missing")
+        seed_roots = [source for _tag, _module, source, _file in FRONTEND_TUS] + ["compiler/backend.ouro"]
+        graph = {entry: native_units(root, entry) for entry in [*seed_roots, *bootstrap.ACCEPTANCE_ROOTS]}
+        names = set(bootstrap.HELPERS) | set(bootstrap.RUNTIME) | {name for units in graph.values() for name in units}
+        names.update(child.relative_to(root).as_posix() for child in (root / "runtime").glob("*.h"))
+        native_require(selected.get("roots") == seed_roots and selected.get("unit_graph") == graph
+                       and isinstance(selected.get("sources"), dict) and set(selected["sources"]) == names,
+                       "C seed source inventory is incomplete")
+        sources(selected.get("sources"))
+        native_require(isinstance(selected.get("stage0"), dict) and set(selected["stage0"]) == set(bootstrap_inputs.STAGE0),
+                       "C seed bootstrap input inventory is incomplete")
+        sources(selected["stage0"])
+        pin({"path": bootstrap_inputs.ARCHIVE, "sha256": selected.get("archive_sha256")})
+        pin({"path": bootstrap_inputs.MANIFEST, "sha256": selected.get("manifest_sha256")})
+        bridge2_paths = {bootstrap_inputs.BRIDGE2_ARCHIVE, bootstrap_inputs.BRIDGE2_MANIFEST}
+        present_bridge2 = {name for name in bridge2_paths if (root / name).exists()}
+        bridge2 = selected.get("bridge2", {})
+        native_require(isinstance(bridge2, dict) and set(bridge2) == present_bridge2
+                       and (not present_bridge2 or present_bridge2 == bridge2_paths),
+                       "C seed second bridge inventory is incomplete")
+        if bridge2:
+            sources(bridge2)
+        work = Path(seed_receipt.get("work", "")).resolve(strict=True)
+        native_require(work.is_relative_to(root.resolve()), "C seed evidence work directory escapes the repository")
+        seed_report_path = work / "report.json"
+        seed_report = native_json(pin({"path": seed_report_path.relative_to(root).as_posix(), "sha256": seed_receipt.get("report_sha256")}))
+        native_require(type(seed_report.get("pass")) is bool and seed_report["pass"] is True,
+                       "C seed acceptance receipt requires boolean pass=true")
+        pin({"path": (work / "inputs.json").relative_to(root).as_posix(), "sha256": seed_report.get("inputs_sha256")})
+        comparison = seed_report.get("complete_generated_c_comparison")
+        native_require(isinstance(comparison, dict) and set(comparison) == {"driver_u.c", "backend_u.c"},
+                       "C seed comparison evidence is incomplete")
+        for name, row in comparison.items():
+            native_require(isinstance(row, dict), "C seed comparison row is invalid")
+            for stage in ("p1", "p2"):
+                pin({"path": (work / "out" / stage / name).relative_to(root).as_posix(), "sha256": row.get(stage + "_sha256")})
+        native_require(bootstrap.installed_current(seed, seed_receipt_path, selected), "C seed acceptance receipt is stale or incomplete")
+        tool_inputs = receipt.get("inputs")
+        native_require(isinstance(tool_inputs, dict) and set(tool_inputs) == INPUT_FIELDS
+                       and receipt.get("kind") == "ouro.native-tool-build.v1"
+                       and tool_inputs.get("kind") == receipt["kind"] and tool_inputs.get("entry") == NATIVE_ENTRY
+                       and receipt.get("key") == hash_json(tool_inputs)
+                       and receipt.get("binary_sha256") == producer["image"]["sha256"]
+                       and tool_inputs.get("compiler_sha256") == producer["seed"]["sha256"]
+                       and type(tool_inputs.get("fuel")) is int and tool_inputs["fuel"] > 0
+                       and receipt.get("cache") in {"miss", "hit", "installed-hit"}, "P build receipt differs or is incomplete")
+        names = set(BUILD_INPUTS) | set(RUNTIME) | {name for entry in tool_roots(NATIVE_ENTRY) for name in native_units(root, entry)}
+        names.update(child.relative_to(root).as_posix() for child in (root / "runtime").glob("*.h"))
+        native_require(isinstance(tool_inputs.get("sources"), dict) and set(tool_inputs["sources"]) == names,
+                       "P build source inventory is incomplete")
+        sources(tool_inputs["sources"])
+        ordered_sources = list(dict.fromkeys([*(name for entry in tool_roots(NATIVE_ENTRY) for name in native_units(root, entry)),
+                                             *BUILD_INPUTS, *RUNTIME,
+                                             *(child.relative_to(root).as_posix() for child in sorted((root / "runtime").glob("*.h")))]))
+        native_require(pin(producer.get("manifest")).read_text(encoding="utf-8").splitlines() == ordered_sources,
+                       "P source manifest order differs")
+        report["producer"] = producer
+
+        stages = result.get("stages")
+        native_require(isinstance(stages, list) and [row.get("stage") for row in stages if isinstance(row, dict)] == ["N1", "N2", "N3"]
+                       and len(stages) == 3, "native evidence requires ordered N1, N2, N3 stages")
+        images: dict[str, Path] = {}
+        for row in stages:
+            label = row["stage"]
+            output = distinct_image(emission(row, inputs, previous, label), label)
+            report["commands"].append({"label": label, "argv": row["argv"], "status": "pass", "exit_code": 0})
+            report["stages"].append(row)
+            images[label] = previous = output
+
+        with images["N2"].open("rb") as left, images["N3"].open("rb") as right:
+            equal = True
+            while True:
+                a, b = left.read(1024 * 1024), right.read(1024 * 1024)
+                if a != b:
+                    equal = False
+                    break
+                if not a:
+                    break
+        report["summary"]["converged"] = equal
+        report["comparisons"].append({"name": "N2-N3-complete-unsigned-images", "policy": "all-file-bytes", "status": "pass" if equal else "fail",
+                                      "left": stages[1]["image"], "right": stages[2]["image"]})
+        native_require(equal, "native N2/N3 complete images differ")
+
+        behavior = result.get("behavior")
+        required = {(stage, suite) for stage in ("N2", "N3") for suite in ("compiler", "runtime", "tools")}
+        native_require(isinstance(behavior, list) and len(behavior) == len(required)
+                       and {(row.get("stage"), row.get("suite")) for row in behavior if isinstance(row, dict)} == required,
+                       "native N2/N3 compiler/runtime/tools behavior is missing or duplicated")
+        # Pin all raw outputs before accepting any oracle, including later checks.
+        for row in behavior:
+            records = [row]
+            for group in ("programs", "checks"):
+                if isinstance(row.get(group), list):
+                    records.extend(row[group])
+            for record in records:
+                native_require(isinstance(record, dict), "native behavior output record is invalid")
+                for stream in ("stdout", "stderr"):
+                    mark_output(pin(record.get(stream)))
+                if "image" in record:
+                    emitted = record["image"]
+                    native_require(isinstance(emitted, dict) and set(emitted) == {"path", "sha256", "imports"},
+                                   "native image reference requires path, sha256, and imports")
+                    mark_output(pin({key: emitted[key] for key in ("path", "sha256")}))
+        for row in behavior:
+            label = f"{row['stage']}/{row['suite']}"
+            passed(row, label)
+            native_require(pin(row.get("compiler")) == images[row["stage"]]
+                           and row.get("inputs_sha256") == key == row.get("inputs_after_sha256"), f"native {label} compiler or inputs changed")
+            sources(row.get("sources"))
+            roots = row.get("roots")
+            native_require(isinstance(roots, list) and bool(roots) and all(isinstance(entry, str) for entry in roots)
+                           and len(roots) == len(set(roots)), f"native {label} behavior source roots are missing")
+            closure = {name for entry in roots for name in native_units(root, entry)}
+            native_require(closure <= set(row["sources"]), f"native {label} behavior source closure is incomplete")
+            programs = row.get("programs")
+            native_require(isinstance(programs, list) and (row["suite"] == "compiler" or bool(programs)),
+                           f"native {label} has no source-bound native programs")
+            executed = set()
+            for program in programs:
+                native_require(isinstance(program, dict), f"native {label} program record is invalid")
+                binary = distinct_image(emission(program, program.get("inputs"), images[row["stage"]], label + "/program"),
+                                        label + "/program")
+                native_require(set(program["inputs"]["sources"]) <= set(row["sources"]), f"native {label} program sources are missing")
+                executed.add(binary)
+            checks = row.get("checks")
+            native_require(isinstance(checks, list) and bool(checks) and type(row.get("skipped")) is int and row["skipped"] == 0,
+                           f"native {label} has no executed checks or skipped checks")
+            names = set()
+            for check in checks:
+                native_require(isinstance(check, dict) and isinstance(check.get("name"), str) and bool(check["name"])
+                               and check["name"] not in names and check.get("status") == "pass" and check.get("process_status") == "ok"
+                               and type(check.get("exit_code")) is int and type(check.get("expected_exit_code")) is int
+                               and 0 <= check["exit_code"] == check["expected_exit_code"] <= 0xFFFFFFFF,
+                               f"native {label} has a failed, skipped, or duplicate check")
+                names.add(check["name"])
+                argv = check.get("argv")
+                native_require(isinstance(argv, list) and bool(argv) and all(isinstance(word, str) for word in argv)
+                               and (abs_path(root, argv[0]).resolve() in executed
+                                    or (row["suite"] == "compiler" and abs_path(root, argv[0]).resolve() == images[row["stage"]])),
+                               f"native {label} check did not execute a bound native image")
+                for stream in ("stdout", "stderr"):
+                    actual, expected = pin(check.get(stream)), pin(check.get("expected_" + stream))
+                    native_require(check["expected_" + stream]["path"] in row["sources"], f"native {label} expectation is not source-bound")
+                    native_require(not generated(expected),
+                                   f"native {label} expectation is a build/cache output")
+                    native_require(file_identity(expected) not in output_identities,
+                                   f"native {label} expectation aliases an actual output")
+                    native_require(pinned[actual] == pinned[expected], f"native {label}/{check['name']} {stream} differs")
+            report["tests"].append(row)
+
+        native_require(all(sha256_file(path) == digest for path, digest in pinned.items())
+                       and native_units(root, NATIVE_ENTRY) == units and repo_metadata(root)["git_head"] == result["source_revision"],
+                       "native evidence inputs changed during collection")
+        current_headers = {child.relative_to(root).as_posix() for child in (root / "runtime").glob("*.h")}
+        current_tool_names = set(BUILD_INPUTS) | set(RUNTIME) | current_headers
+        current_tool_names.update(name for entry in tool_roots(NATIVE_ENTRY) for name in native_units(root, entry))
+        current_graph = {entry: native_units(root, entry) for entry in [*seed_roots, *bootstrap.ACCEPTANCE_ROOTS]}
+        native_require(current_tool_names == set(tool_inputs["sources"]) and current_graph == graph
+                       and current_headers == {name for name in selected["sources"] if name.startswith("runtime/") and name.endswith(".h")},
+                       "native producer dependency inventory changed during collection")
+        native_require(bootstrap.installed_current(seed, seed_receipt_path, selected), "C seed evidence changed during collection")
+        native_require(all(file_identity(path) == identity for identity, path in image_identities.items()),
+                       "native image file identity changed during collection")
+        report["summary"].update(status="pass", provenance_accepted=True, behavior_accepted=True)
+    except (OSError, ValueError, TypeError, KeyError, struct.error, RecursionError, RuntimeError) as exc:
+        report["summary"]["hard_errors"].append(f"native evidence: {exc}")
+    report["summary"].update(commands_total=len(report["commands"]), stages_total=3,
+                             stages_completed=len(report["stages"]), tests_total=len(report["tests"]),
+                             comparisons_total=len(report["comparisons"]),
+                             mismatch_count=int(report["summary"]["converged"] is False), missing_required_artifacts=[])
+    return report, 0 if report["summary"]["status"] == "pass" else 1
+
+
 def print_summary(report: Mapping[str, Any], out: Path, root: Path) -> None:
     s = report["summary"]
     convergence = "passed" if s["converged"] is True else ("failed" if s["converged"] is False else "unknown")
-    print("Bootstrap evidence summary")
+    print("Native selfhost evidence summary" if report["kind"] == NATIVE_REPORT_KIND else "Bootstrap evidence summary")
     print(f"status: {s['status']}")
     print(f"stages completed: {s['stages_completed']}/{s['stages_total']}")
     print(f"convergence: {convergence}")
@@ -603,7 +1019,8 @@ def print_summary(report: Mapping[str, Any], out: Path, root: Path) -> None:
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--out", default=str(DEFAULT_OUT), help="path to write evidence JSON")
+    parser.add_argument("--out", default=None, help="path to write evidence JSON")
+    parser.add_argument("--native-result", type=Path, help="validate native stage/behavior observations without executing commands")
     parser.add_argument("--work-dir", default=str(DEFAULT_WORK_DIR), help="directory for logs and support files")
     parser.add_argument("--stage-loop-result", default=str(DEFAULT_STAGE_LOOP_RESULT), help="stage-loop result JSON to read")
     parser.add_argument("--stage-loop-command", default=DEFAULT_STAGE_LOOP_COMMAND, help="command used to run the existing stage-loop")
@@ -613,18 +1030,45 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     parser.add_argument("--no-stage-loop", action="store_true", help="do not run stage-loop; report partial evidence only")
     parser.add_argument("--allow-partial", action="store_true", help="return success for partial reports; JSON status remains partial")
     args = parser.parse_args(argv)
-    out = abs_path(ROOT, args.out)
-    report, code = build_report(
-        root=ROOT,
-        out=out,
-        work_dir=Path(args.work_dir),
-        stage_loop_result_path=Path(args.stage_loop_result),
-        run_stage_loop_flag=not args.no_stage_loop,
-        stage_loop_command=shlex.split(args.stage_loop_command),
-        test_commands=[parse_labelled_command(value, f"test-{idx + 1}") for idx, value in enumerate(args.test_command)],
-        timeout_seconds=args.timeout_seconds,
-        log_bytes=max(0, args.log_bytes),
-    )
+    out = abs_path(ROOT, args.out if args.out is not None else (DEFAULT_NATIVE_OUT if args.native_result is not None else DEFAULT_OUT))
+    if args.native_result is not None:
+        if (args.allow_partial or args.no_stage_loop or args.test_command
+                or args.stage_loop_result != str(DEFAULT_STAGE_LOOP_RESULT)
+                or args.stage_loop_command != DEFAULT_STAGE_LOOP_COMMAND):
+            parser.error("--native-result cannot use C stage-loop execution or partial-success options")
+        if not out.resolve().is_relative_to(ROOT.resolve()):
+            parser.error("native evidence output must stay inside the repository")
+        if out.exists():
+            try:
+                previous = native_json(out)
+                native_require(previous.get("kind") == NATIVE_REPORT_KIND, "native output is an input artifact or unrelated file")
+            except (OSError, ValueError, TypeError, RecursionError) as exc:
+                parser.error(f"refusing to overwrite native evidence input: {exc}")
+        try:
+            observation_path = abs_path(ROOT, args.native_result).resolve(strict=True)
+            native_require(observation_path.is_relative_to(ROOT.resolve()), "native result escapes the repository")
+            native_output_guard(ROOT, out, {"path": observation_path.relative_to(ROOT.resolve()).as_posix()})
+            native_require(observation_path.stat().st_size <= 16 * 1024 * 1024, "native evidence JSON exceeds 16 MiB")
+            observation_sha256 = sha256_file(observation_path)
+            native_output_guard(ROOT, out, native_json(observation_path))
+            report, code = build_native_report(root=ROOT, out=out, result_path=args.native_result)
+            native_output_guard(ROOT, out, report["artifacts"])
+            native_require(sha256_file(observation_path) == observation_sha256,
+                           "native observation changed before publication")
+        except (OSError, ValueError, TypeError, RecursionError, RuntimeError) as exc:
+            parser.error(f"refusing unsafe native evidence output: {exc}")
+    else:
+        report, code = build_report(
+            root=ROOT,
+            out=out,
+            work_dir=Path(args.work_dir),
+            stage_loop_result_path=Path(args.stage_loop_result),
+            run_stage_loop_flag=not args.no_stage_loop,
+            stage_loop_command=shlex.split(args.stage_loop_command),
+            test_commands=[parse_labelled_command(value, f"test-{idx + 1}") for idx, value in enumerate(args.test_command)],
+            timeout_seconds=args.timeout_seconds,
+            log_bytes=max(0, args.log_bytes),
+        )
     write_json_atomic(out, report)
     print_summary(report, out, ROOT)
     return 0 if report["summary"]["status"] == "partial" and args.allow_partial else code

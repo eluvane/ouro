@@ -1,0 +1,288 @@
+-- Checked raw-MIR -> concrete SysV calls -> freestanding ELF text and data.
+-- No public source target, foreign imports, managed runtime or Linux seed.
+import "sysv_call.ouro",
+  "codegen_ops.ouro",
+  "codegen_assembly.ouro",
+  "codegen.ouro",
+  "pe_fixups.ouro",
+  "elf_data.ouro";
+
+inductive LinuxCodegenError : Type :=
+  | LinuxMirRejected : MirError -> LinuxCodegenError
+  | LinuxImportsUnsupported : List Nat -> LinuxCodegenError
+  | LinuxDataUnsupported : Nat -> LinuxCodegenError
+  | LinuxManagedTypeUnsupported : Nat -> LinuxCodegenError
+  | LinuxOperationUnsupported : Nat -> LinuxCodegenError
+  | LinuxSignatureUnsupported : Nat -> LinuxCodegenError
+  | LinuxSysvRejected : Nat -> SysvCallError -> LinuxCodegenError
+  | LinuxNativeRejected : NativeCodegenError -> LinuxCodegenError
+  | LinuxFixupRejected : PeError -> LinuxCodegenError
+  | LinuxElfRejected : ElfError -> LinuxCodegenError;
+
+def linux_from_native (A : Type) (result : Either NativeCodegenError A) : Either LinuxCodegenError A :=
+    mapLeft NativeCodegenError A LinuxCodegenError LinuxNativeRejected result;
+def linux_from_sysv (A : Type) (id : Nat) (result : Either SysvCallError A) : Either LinuxCodegenError A :=
+    mapLeft SysvCallError A LinuxCodegenError (LinuxSysvRejected id) result;
+def linux_from_pe (A : Type) (result : Either PeError A) : Either LinuxCodegenError A :=
+    mapLeft PeError A LinuxCodegenError LinuxFixupRejected result;
+
+def linux_scalar_type (ty : MirType) : Bool :=
+    match ty with
+    | MirU8 => True | MirU32 => True | MirU64 => True | MirI32 => True
+    | MirUSize => True | MirRawPtr => True | MirManagedPtr => False end;
+
+def linux_signature_supported (signature : MirSignature) : Bool :=
+    match signature with | MirSignatureOf args result =>
+      andb (all MirType linux_scalar_type args)
+        (match result with | Nothing => True | Just ty => linux_scalar_type ty end) end;
+
+def linux_check_locals : List MirLocal -> Either LinuxCodegenError Unit :=
+  fix check (locals : List MirLocal) : Either LinuxCodegenError Unit :=
+    match locals with | Nil => Right LinuxCodegenError Unit MkUnit
+    | Cons local rest => match linux_scalar_type (mir_local_type local) with
+      | False => Left LinuxCodegenError Unit (LinuxManagedTypeUnsupported (mir_local_id local))
+      | True => check rest end end;
+
+def linux_check_values (function : Nat) : List MirValue -> Either LinuxCodegenError Unit :=
+  fix check (values : List MirValue) : Either LinuxCodegenError Unit :=
+    match values with | Nil => Right LinuxCodegenError Unit MkUnit
+    | Cons value rest => match value with
+      | MirUse _ => check rest
+      | MirBits ty _ => match linux_scalar_type ty with
+        | False => Left LinuxCodegenError Unit (LinuxManagedTypeUnsupported function)
+        | True => check rest end end end;
+
+def linux_check_instruction (function : Nat) (instruction : MirInstruction) : Either LinuxCodegenError Unit :=
+    let? (Left, Right) : Either LinuxCodegenError Unit do
+      let _reads : Unit := linux_check_values function (mir_reads instruction)?;
+      match instruction with
+      | MirManagedAlloc _ _ _ _ _ => Left LinuxCodegenError Unit (LinuxOperationUnsupported function)
+      | MirManagedContext _ => Left LinuxCodegenError Unit (LinuxOperationUnsupported function)
+      | MirCall _ _ target _ => match target with | MirDirect _ => Right LinuxCodegenError Unit MkUnit
+        | MirIndirect signature _ => match linux_signature_supported signature with
+          | False => Left LinuxCodegenError Unit (LinuxSignatureUnsupported function)
+          | True => Right LinuxCodegenError Unit MkUnit end end
+      | MirMove _ _ => Right LinuxCodegenError Unit MkUnit
+      | MirBinaryOp _ _ _ _ => Right LinuxCodegenError Unit MkUnit
+      | MirCompare _ _ _ _ => Right LinuxCodegenError Unit MkUnit
+      | MirConvert _ _ _ => Right LinuxCodegenError Unit MkUnit
+      | MirLoad _ _ _ => Right LinuxCodegenError Unit MkUnit
+      | MirStore _ _ _ => Right LinuxCodegenError Unit MkUnit
+      | MirLoadAt _ _ _ => Right LinuxCodegenError Unit MkUnit
+      | MirStoreAt _ _ _ => Right LinuxCodegenError Unit MkUnit
+      | MirAddress _ _ => Right LinuxCodegenError Unit MkUnit
+      | MirPointerAdd _ _ _ => Right LinuxCodegenError Unit MkUnit end?
+    end;
+
+def linux_check_instructions (function : Nat) : List MirInstruction -> Either LinuxCodegenError Unit :=
+  fix check (instructions : List MirInstruction) : Either LinuxCodegenError Unit :=
+    match instructions with | Nil => Right LinuxCodegenError Unit MkUnit
+    | Cons instruction rest => match linux_check_instruction function instruction with
+      | Left error => Left LinuxCodegenError Unit error | Right _ => check rest end end;
+
+def linux_check_blocks (function : Nat) : List MirBlock -> Either LinuxCodegenError Unit :=
+  fix check (blocks : List MirBlock) : Either LinuxCodegenError Unit :=
+    match blocks with | Nil => Right LinuxCodegenError Unit MkUnit
+    | Cons block rest => match block with | MirBlockDef _ instructions term =>
+      let? (Left, Right) : Either LinuxCodegenError Unit do
+        let _instructions : Unit := linux_check_instructions function instructions?;
+        let _terminator : Unit := linux_check_values function (mir_terminator_reads term)?;
+        check rest?
+      end end end;
+
+def linux_check_functions : List MirFunction -> Either LinuxCodegenError Unit :=
+  fix check (functions : List MirFunction) : Either LinuxCodegenError Unit :=
+    match functions with | Nil => Right LinuxCodegenError Unit MkUnit
+    | Cons function rest => match function with | MirFunctionDef id _ args locals result _ blocks =>
+      let? (Left, Right) : Either LinuxCodegenError Unit do
+        let _locals : Unit := linux_check_locals (append MirLocal args locals)?;
+        let _signature : Unit := match result with
+          | Nothing => Right LinuxCodegenError Unit MkUnit
+          | Just ty => match linux_scalar_type ty with
+            | True => Right LinuxCodegenError Unit MkUnit
+            | False => Left LinuxCodegenError Unit (LinuxSignatureUnsupported id) end end?;
+        let _blocks : Unit := linux_check_blocks id blocks?;
+        check rest?
+      end end end;
+
+def linux_check_slice (program : MirProgram) : Either LinuxCodegenError Unit :=
+    match program with | MirProgramDef functions _ libraries entry =>
+      match libraries with
+      | Cons library _ => match library with | MirLibraryDef name _ =>
+          Left LinuxCodegenError Unit (LinuxImportsUnsupported name) end
+      | Nil => let? (Left, Right) : Either LinuxCodegenError Unit do
+            let _functions : Unit := linux_check_functions functions?;
+            match mir_find_function entry functions with
+            | Nothing => Left LinuxCodegenError Unit (LinuxMirRejected (MirInvalidEntry entry))
+            | Just function => match function with | MirFunctionDef _ _ args _ result _ _ =>
+              match andb (nullb MirLocal args)
+                (match result with | Just ty => mir_type_equal ty MirU32 | Nothing => False end) with
+              | True => Right LinuxCodegenError Unit MkUnit
+              | False => Left LinuxCodegenError Unit (LinuxSignatureUnsupported entry)
+              end end end?
+          end end end;
+
+def linux_select_instruction (program : MirProgram) (function : Nat) (slots : List CodegenSlot)
+    (block : Nat) (site : Nat) (instruction : MirInstruction) : Either LinuxCodegenError (List CodegenAtom) :=
+    match instruction with
+    | MirCall _ dest target args => linux_from_sysv (List CodegenAtom) function
+        (sysv_call program slots block site dest target args)
+    | MirManagedAlloc _ _ _ _ _ => Left LinuxCodegenError (List CodegenAtom) (LinuxOperationUnsupported function)
+    | MirManagedContext _ => Left LinuxCodegenError (List CodegenAtom) (LinuxOperationUnsupported function)
+    | MirMove _ _ => linux_from_native (List CodegenAtom) (codegen_instruction program slots block site instruction)
+    | MirBinaryOp _ _ _ _ => linux_from_native (List CodegenAtom) (codegen_instruction program slots block site instruction)
+    | MirCompare _ _ _ _ => linux_from_native (List CodegenAtom) (codegen_instruction program slots block site instruction)
+    | MirConvert _ _ _ => linux_from_native (List CodegenAtom) (codegen_instruction program slots block site instruction)
+    | MirLoad _ _ _ => linux_from_native (List CodegenAtom) (codegen_instruction program slots block site instruction)
+    | MirStore _ _ _ => linux_from_native (List CodegenAtom) (codegen_instruction program slots block site instruction)
+    | MirLoadAt _ _ _ => linux_from_native (List CodegenAtom) (codegen_instruction program slots block site instruction)
+    | MirStoreAt _ _ _ => linux_from_native (List CodegenAtom) (codegen_instruction program slots block site instruction)
+    | MirAddress _ _ => linux_from_native (List CodegenAtom) (codegen_instruction program slots block site instruction)
+    | MirPointerAdd _ _ _ => linux_from_native (List CodegenAtom) (codegen_instruction program slots block site instruction) end;
+
+def linux_terminator (program : MirProgram) (slots : List CodegenSlot) (allocation : Nat)
+    (block : Nat) (site : Nat) (term : MirTerminator) : Either LinuxCodegenError (List CodegenAtom) :=
+    match term with
+    | MirReturn result => let? (Left, Right) : Either LinuxCodegenError (List CodegenAtom) do
+        let value : List CodegenAtom := match result with
+          | Nothing => Right LinuxCodegenError (List CodegenAtom) []
+          | Just operand => linux_from_native (List CodegenAtom) (codegen_load_value slots X64Rax operand) end?;
+        append CodegenAtom value (codegen_raw
+          [X64ArithmeticImm32 X64Bits64 X64Add X64Rsp (pe_word32 allocation), X64Return])
+      end
+    | MirJump _ => linux_from_native (List CodegenAtom) (codegen_terminator program slots allocation block site term)
+    | MirBranch _ _ _ => linux_from_native (List CodegenAtom) (codegen_terminator program slots allocation block site term)
+    | MirTrap => linux_from_native (List CodegenAtom) (codegen_terminator program slots allocation block site term) end;
+
+def linux_block (program : MirProgram) (function : Nat) (slots : List CodegenSlot)
+    (allocation : Nat) (block : MirBlock) : Either LinuxCodegenError (List CodegenAtom) :=
+    match block with | MirBlockDef id instructions term =>
+      mapRight LinuxCodegenError (List CodegenAtom) (List CodegenAtom)
+        (Cons CodegenAtom (CodegenMark (CodegenBlockLabel id)))
+        ((fix emit (rest : List MirInstruction) (site : Nat) : Either LinuxCodegenError (List CodegenAtom) :=
+          match rest with
+          | Nil => linux_terminator program slots allocation id site term
+          | Cons instruction tail => let? (Left, Right) : Either LinuxCodegenError (List CodegenAtom) do
+              let before : List CodegenAtom := linux_select_instruction program function slots id site instruction?;
+              let after : List CodegenAtom := emit tail (S site)?;
+              append CodegenAtom before after
+            end end) instructions 0) end;
+
+def linux_blocks (program : MirProgram) (function : Nat) (slots : List CodegenSlot)
+    (allocation : Nat) : List MirBlock -> Either LinuxCodegenError (List CodegenAtom) :=
+  fix emit (blocks : List MirBlock) : Either LinuxCodegenError (List CodegenAtom) :=
+    match blocks with | Nil => Right LinuxCodegenError (List CodegenAtom) []
+    | Cons block rest => let? (Left, Right) : Either LinuxCodegenError (List CodegenAtom) do
+        let before : List CodegenAtom := linux_block program function slots allocation block?;
+        let after : List CodegenAtom := emit rest?;
+        append CodegenAtom before after
+      end end;
+
+def linux_encode_function (program : MirProgram) (function : MirFunction) (base : Nat)
+    : Either LinuxCodegenError CodegenEncoded :=
+    match function with | MirFunctionDef id _ args _ _ entry blocks =>
+      match sysv_frame function with
+      | Left error => Left LinuxCodegenError CodegenEncoded (LinuxSysvRejected id error)
+      | Right frame => match frame with | CodegenFrameOf allocation slots =>
+        let? (Left, Right) : Either LinuxCodegenError CodegenEncoded do
+          let prolog : List Nat := linux_from_native (List Nat)
+            (mapLeft X64EncodeError (List Nat) NativeCodegenError NativeEncodingError
+              (x64_encode (X64ArithmeticImm32 X64Bits64 X64Subtract X64Rsp (pe_word32 allocation))))?;
+          let incoming : List CodegenAtom := linux_from_sysv (List CodegenAtom) id
+            (sysv_spill_args slots allocation args 0)?;
+          let body : List CodegenAtom := linux_blocks program id slots allocation blocks?;
+          let encoded : CodegenEncoded := linux_from_native CodegenEncoded
+            (codegen_assemble (append CodegenAtom incoming
+              (Cons CodegenAtom (CodegenJump (CodegenBlockLabel entry)) body)) base (length Nat prolog))?;
+          match encoded with | CodegenEncodedParts bytes fixups calls =>
+            CodegenEncodedParts (append Nat prolog bytes) fixups calls end
+        end end end end;
+
+inductive LinuxText : Type :=
+  | LinuxTextParts : List Nat -> List PeSymbol -> List PeFixup -> LinuxText;
+
+def linux_functions (program : MirProgram) : List MirFunction -> Nat -> Either LinuxCodegenError LinuxText :=
+  fix emit (functions : List MirFunction) (base : Nat) : Either LinuxCodegenError LinuxText :=
+    match functions with
+    | Nil => Right LinuxCodegenError LinuxText (LinuxTextParts [] [] [])
+    | Cons function rest => match linux_encode_function program function base with
+      | Left error => Left LinuxCodegenError LinuxText error
+      | Right encoded => match encoded with | CodegenEncodedParts bytes fixups _ =>
+        let? (Left, Right) : Either LinuxCodegenError LinuxText do
+          let _size : Unit := match leb_nat (length Nat bytes) (sub elf_text_capacity base) with
+            | True => Right LinuxCodegenError Unit MkUnit
+            | False => Left LinuxCodegenError Unit (LinuxNativeRejected NativeCodeTooLarge) end?;
+          let following : LinuxText := emit rest (add base (length Nat bytes))?;
+          match following with | LinuxTextParts more symbols more_fixups =>
+            LinuxTextParts (append Nat bytes more)
+              (Cons PeSymbol (PeNamedSymbol (mir_function_id function) PeText base) symbols)
+              (append PeFixup fixups more_fixups) end
+        end end end end;
+
+def linux_check_fixups : List PeFixup -> Either LinuxCodegenError Unit :=
+  fix check (fixups : List PeFixup) : Either LinuxCodegenError Unit :=
+    match fixups with | Nil => Right LinuxCodegenError Unit MkUnit
+    | Cons fixup rest => match fixup with
+      | PeRel32 section offset _ target => match andb (pe_section_equal section PeText)
+          (match target with | PeSymbolTarget _ => True | PeImportTarget _ => False end) with
+        | True => check rest
+        | False => Left LinuxCodegenError Unit (LinuxFixupRejected (PeInvalidFixup offset)) end
+      | PeRva32 _ offset _ => Left LinuxCodegenError Unit (LinuxFixupRejected (PeInvalidFixup offset))
+      | PeVa64 _ offset _ => Left LinuxCodegenError Unit (LinuxFixupRejected (PeInvalidFixup offset)) end end;
+
+-- This is an internal text-relative container, never a PE header or loader.
+def linux_link_text (bytes : List Nat) (symbols : List PeSymbol) (fixups : List PeFixup)
+    : Either LinuxCodegenError (List Nat) :=
+    let? (Left, Right) : Either LinuxCodegenError (List Nat) do
+      let checked : List Nat := linux_from_pe (List Nat) (pe_check_bytes bytes)?;
+      let sections : List PePlacedSection := [PeSectionAt PeText 0 0 (length Nat checked) checked];
+      let _symbols : Unit := linux_from_pe Unit (pe_validate_symbols sections symbols)?;
+      let _fixups : Unit := linux_check_fixups fixups?;
+      let patches : List PePatch := linux_from_pe (List PePatch) (pe_plan_fixups sections symbols [] fixups)?;
+      pe_apply_section_patches PeText checked patches
+    end;
+
+def linux_start (entry : Nat) : Either LinuxCodegenError CodegenEncoded :=
+    linux_from_native CodegenEncoded (codegen_assemble
+      [CodegenDirectCall entry, CodegenInstruction (X64Mov X64Bits32 X64Rdi X64Rax),
+       CodegenInstruction (X64MovImm32(X64Rax, pe_word32 60)), CodegenInstruction X64Syscall,
+       CodegenInstruction X64Trap] 0 0);
+
+def linux_finish_image (start : CodegenEncoded) (output : LinuxText) : Either LinuxCodegenError (List Nat) :=
+    match start, output with
+    | CodegenEncodedParts prefix initial_fixups _, LinuxTextParts bytes symbols fixups =>
+      let? (Left, Right) : Either LinuxCodegenError (List Nat) do
+        let linked : List Nat := linux_link_text (append Nat prefix bytes) symbols
+          (append PeFixup initial_fixups fixups)?;
+        (mapLeft ElfError (List Nat) LinuxCodegenError LinuxElfRejected (elf_write_image linked 0))?
+      end end;
+
+def linux_finish_data_image (objects : List MirData) (start : CodegenEncoded) (output : LinuxText)
+    : Either LinuxCodegenError (List Nat) :=
+    match start, output with
+    | CodegenEncodedParts prefix initial_fixups _, LinuxTextParts bytes symbols fixups =>
+      match codegen_data objects 0 0 with
+      | CodegenDataOf readonly_data writable_data data_symbols =>
+        mapLeft ElfDataError (List Nat) LinuxCodegenError
+          (fun (error : ElfDataError) => match error with
+            | ElfDataLayoutError problem => LinuxElfRejected problem
+            | ElfDataLinkError problem => LinuxFixupRejected problem end)
+          (elf_write_data_image (append Nat prefix bytes) readonly_data writable_data
+            (append PeSymbol symbols data_symbols) (append PeFixup initial_fixups fixups) 0)
+      end end;
+
+-- All source-independent MIR checks precede every Linux slice/encoding action.
+def linux_codegen_program (limits : MirLimits) (program : MirProgram) : Either LinuxCodegenError (List Nat) :=
+    match mir_validate limits program with
+    | Left error => Left LinuxCodegenError (List Nat) (LinuxMirRejected error)
+    | Right checked => match checked with | MirChecked verified =>
+      match verified with | MirProgramDef functions objects _ entry =>
+        let? (Left, Right) : Either LinuxCodegenError (List Nat) do
+          let _slice : Unit := linux_check_slice verified?;
+          let start : CodegenEncoded := linux_start entry?;
+          let base : Nat := match start with | CodegenEncodedParts prefix _ _ => length Nat prefix end;
+          let output : LinuxText := linux_functions verified functions base?;
+          (match objects with
+           | Nil => linux_finish_image start output
+           | Cons _ _ => linux_finish_data_image objects start output end)?
+        end end end end;

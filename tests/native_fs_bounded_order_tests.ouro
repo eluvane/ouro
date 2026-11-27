@@ -1,0 +1,299 @@
+import "analyze/precision/assertions.ouro", "../runtime/platform/windows_fs_bounded.ouro";
+
+def fs_bounded_poison_allocate (_bytes : USize) (_alignment : USize) : IO (RawPtr U8) :=
+    do exit 99; io_pure(RawPtr U8, raw_null U8);
+
+def fs_bounded_poison_release (_base : RawPtr U8) : IO Bool :=
+    do exit 99; io_pure(Bool, False);
+
+def fs_bounded_poison_read (_handle : RawPtr U8) (_buffer : RawPtr U8) (_bytes : USize)
+    (_count : RawPtr U32) : IO U32 :=
+    do exit 99; io_pure(U32, raw_size_to_u32 _bytes);
+
+def fs_bounded_order_measure (size : USize) (_handle : RawPtr U8) (cell : RawPtr USize) : IO U32 :=
+    do raw_store_usize cell size; io_pure(U32, raw_size_to_u32 (usize_sub size size));
+
+def fs_bounded_order_close (flag : RawPtr U8) (one : USize) (_handle : RawPtr U8) : IO U32 :=
+    match u8_from_nat 1 with
+    | Nothing => do exit 73; io_pure(U32, raw_size_to_u32 one)
+    | Just byte => do let! old := raw_load_u8 flag;
+                     raw_store_u8 flag (u8_sub old (u8_sub(u8_sub byte byte, byte)));
+                     io_pure(U32, raw_size_to_u32 (usize_sub one one))
+    end;
+
+def fs_bounded_order_release (flag : RawPtr U8) (base : RawPtr U8) : IO Bool :=
+    match u8_from_nat 1 with
+    | Nothing => do exit 99; io_pure(Bool, False)
+    | Just once => do let! closed := raw_load_u8 flag;
+                     if u8_equal closed once then raw_pages_release base
+                     else do exit 99; io_pure(Bool, False)
+    end;
+
+def fs_bounded_order_eof (_handle : RawPtr U8) (_buffer : RawPtr U8) (bytes : USize)
+    (count : RawPtr U32) : IO U32 :=
+    raw_windows_store_count count (raw_size_to_u32 (usize_sub bytes bytes));
+
+def fs_bounded_order_growth (_handle : RawPtr U8) (_buffer : RawPtr U8) (bytes : USize)
+    (count : RawPtr U32) : IO U32 :=
+    raw_windows_store_count count (raw_size_to_u32 bytes);
+
+def fs_bounded_order_allocate (expected : USize) (bytes : USize) (alignment : USize) : IO (RawPtr U8) :=
+    (if usize_equal bytes expected then
+      do let! base := raw_pages_allocate bytes alignment;
+                 let! bits := raw_to_bits U8 base;
+                 if usize_equal(bits, usize_sub bits bits) then
+                   do exit 99; io_pure(RawPtr U8, raw_null U8)
+                 else io_pure(RawPtr U8, base)
+    else do exit 99; io_pure(RawPtr U8, raw_null U8));
+
+def fs_bounded_order_note (flag : RawPtr U8) : IO Unit :=
+    match u8_from_nat 1 with
+    | Nothing => exit 99
+    | Just once => do let! old := raw_load_u8 flag;
+                     raw_store_u8 flag (u8_sub old (u8_sub(u8_sub once once, once)))
+    end;
+
+def fs_bounded_order_counted_release (flag : RawPtr U8) (closed : RawPtr U8)
+    (base : RawPtr U8) : IO Bool :=
+    do fs_bounded_order_note flag; fs_bounded_order_release closed base;
+
+-- Four hand-fixed calls request 3,2,1,1 bytes and return 1,1,1,0.
+def fs_bounded_order_partial (flag : RawPtr U8) (one : USize) (_handle : RawPtr U8)
+    (buffer : RawPtr U8) (requested : USize) (count : RawPtr U32) : IO U32 :=
+    do let! seen := raw_load_u8 flag;
+       let index : Nat := bounded_file_u8_to_nat seen in
+       (if leb_nat index 3 then
+         match usize_from_nat (match eq_nat index 3 with | True => 1 | False => sub 3 index end) with
+         | Nothing => do exit 99; io_pure(U32, raw_size_to_u32 one)
+         | Just expected => if usize_equal requested expected then
+             do fs_bounded_order_note flag;
+                        if eq_nat index 3 then
+                          raw_windows_store_count count (raw_size_to_u32 (usize_sub one one))
+                        else
+                          match u8_from_nat (match eq_nat index 0 with
+                            | True => 65 | False => match eq_nat index 1 with | True => 0 | False => 255 end end) with
+                          | Nothing => do exit 99; io_pure(U32, raw_size_to_u32 one)
+                          | Just byte => do raw_store_u8 buffer byte;
+                                            raw_windows_store_count count (raw_size_to_u32 one)
+                          end
+           else do exit 99; io_pure(U32, raw_size_to_u32 one)
+         end
+       else do exit 99; io_pure(U32, raw_size_to_u32 one));
+
+def fs_bounded_order_resized (flag : RawPtr U8) (one : USize) (size : USize)
+    (_handle : RawPtr U8) (cell : RawPtr USize) : IO U32 :=
+    do let! seen := raw_load_u8 flag;
+       let index : Nat := bounded_file_u8_to_nat seen in
+       (if leb_nat index 1 then
+         do fs_bounded_order_note flag;
+                    raw_store_usize cell (match eq_nat index 0 with | True => size | False => usize_add size one end);
+                    io_pure(U32, raw_size_to_u32 (usize_sub one one))
+       else do exit 99; io_pure(U32, raw_size_to_u32 one));
+
+def fs_bounded_order_counts (reads : U8) (closed : U8) (released : U8) : Bool :=
+    andb(eq_nat 4 (bounded_file_u8_to_nat reads),
+      andb(eq_nat 1 (bounded_file_u8_to_nat closed), eq_nat 1 (bounded_file_u8_to_nat released)));
+
+def fs_bounded_order_binary (outcome : WindowsBoundedReadOutcome) : Bool :=
+    match outcome with
+    | WindowsBoundedReadGuard => False
+    | WindowsBoundedReadValue result => match result with
+      | Left _ => False | Right text => str_eq text (str_of_codes ([65,0,255] : List Nat)) end
+    end;
+
+def fs_bounded_order_high_size (scratch : RawPtr U8) (flag : RawPtr U8) (one : USize)
+    : IO WindowsBoundedReadOutcome :=
+    match usize_from_nat 4294967297 with
+    | Nothing => do exit 99; io_pure(WindowsBoundedReadOutcome, WindowsBoundedReadGuard)
+    | Just size => windows_bounded_read_contents_with fs_bounded_poison_allocate fs_bounded_poison_release
+        (fs_bounded_order_measure size) fs_bounded_poison_read
+        (fs_bounded_order_close flag one) (raw_null U8) scratch one 1
+    end;
+
+def fs_bounded_order_high_error (outcome : WindowsBoundedReadOutcome) : Bool :=
+    match outcome with
+    | WindowsBoundedReadGuard => False
+    | WindowsBoundedReadValue result => match result with
+      | Right _ => False
+      | Left error => if let FsBoundedReadTooLarge cap size := error then
+          andb(eq_nat cap 1, eq_nat size 4294967297)
+        else False
+      end
+    end;
+
+def fs_bounded_order_oversize (outcome : WindowsBoundedReadOutcome) : Bool :=
+    match outcome with
+    | WindowsBoundedReadGuard => False
+    | WindowsBoundedReadValue result => match result with
+      | Right _ => False
+      | Left error => andb (str_eq "fs_bounded_read_too_large" (fs_bounded_read_error_code error))
+          (str_eq "bounded file read: size 4 exceeds byte cap 3" (fs_bounded_read_error_message error))
+      end
+    end;
+
+def fs_bounded_order_changed (outcome : WindowsBoundedReadOutcome) : Bool :=
+    match outcome with
+    | WindowsBoundedReadGuard => False
+    | WindowsBoundedReadValue result => match result with
+      | Right _ => False | Left error => str_eq "fs_bounded_read_changed" (fs_bounded_read_error_code error) end
+    end;
+
+def fs_bounded_order_cases : IO Unit :=
+    match usize_from_nat 1, u8_from_nat 0 with
+    | Just one, Just nul =>
+      let two : USize := usize_add one one in
+      let four : USize := usize_add two two in
+      let eight : USize := usize_add four four in
+      let sixteen : USize := usize_add eight eight in
+      let three : USize := usize_add two one in
+      do let! scratch := raw_pages_allocate (usize_add sixteen eight) eight;
+         let! bits := raw_to_bits U8 scratch;
+         if usize_equal(bits, usize_sub one one) then exit 73
+         else
+           do let! flag := raw_add U8 scratch (usize_sub sixteen one);
+                       let! rejected := windows_bounded_read_contents_with fs_bounded_poison_allocate
+                           fs_bounded_poison_release (fs_bounded_order_measure four) fs_bounded_poison_read
+                           (fs_bounded_order_close flag one) (raw_null U8) scratch one 3;
+                       let! rejected_closed := raw_load_u8 flag;
+                       raw_store_u8 flag nul;
+                       let! changed := windows_bounded_read_contents_with (fs_bounded_order_allocate three)
+                           (fs_bounded_order_release flag) (fs_bounded_order_measure three) fs_bounded_order_eof
+                           (fs_bounded_order_close flag one) (raw_null U8) scratch one (S 18446744073709551615);
+                       let! changed_closed := raw_load_u8 flag;
+                       raw_store_u8 flag nul;
+                       let! growth := windows_bounded_read_contents_with fs_bounded_poison_allocate fs_bounded_poison_release
+                           (fs_bounded_order_measure (usize_sub one one)) fs_bounded_order_growth
+                           (fs_bounded_order_close flag one) (raw_null U8) scratch one 0;
+                       let! growth_closed := raw_load_u8 flag;
+                       let! read_flag := raw_add U8 scratch (usize_sub sixteen three);
+                       let! release_flag := raw_add U8 scratch (usize_sub sixteen two);
+                       let! measure_flag := raw_add U8 scratch sixteen;
+                       raw_store_u8 flag nul;
+                       let! partial := windows_bounded_read_contents_with (fs_bounded_order_allocate three)
+                           (fs_bounded_order_counted_release release_flag flag) (fs_bounded_order_measure three)
+                           (fs_bounded_order_partial read_flag one) (fs_bounded_order_close flag one)
+                           (raw_null U8) scratch one 3;
+                       let! partial_reads := raw_load_u8 read_flag;
+                       let! partial_closed := raw_load_u8 flag;
+                       let! partial_released := raw_load_u8 release_flag;
+                       raw_store_u8 read_flag nul;
+                       raw_store_u8 release_flag nul;
+                       raw_store_u8 flag nul;
+                       let! resized := windows_bounded_read_contents_with (fs_bounded_order_allocate three)
+                           (fs_bounded_order_counted_release release_flag flag) (fs_bounded_order_resized measure_flag one three)
+                           (fs_bounded_order_partial read_flag one) (fs_bounded_order_close flag one)
+                           (raw_null U8) scratch one 3;
+                       let! resized_reads := raw_load_u8 read_flag;
+                       let! resized_closed := raw_load_u8 flag;
+                       let! resized_released := raw_load_u8 release_flag;
+                       let! resized_measures := raw_load_u8 measure_flag;
+                       raw_store_u8 flag nul;
+                       let! high_size := fs_bounded_order_high_size scratch flag one;
+                       let! high_size_closed := raw_load_u8 flag;
+                       let! released := raw_pages_release scratch;
+                       if released then
+                         precision_run "fs-bounded-order"
+                           [ MkPair String Bool "fs-bounded/cap-before-allocation-and-read"
+                               (andb(fs_bounded_order_oversize rejected, eq_nat 1 (bounded_file_u8_to_nat rejected_closed)))
+                           , MkPair String Bool "fs-bounded/large-cap-and-close-before-release"
+                               (andb(fs_bounded_order_changed changed, eq_nat 1 (bounded_file_u8_to_nat changed_closed)))
+                           , MkPair String Bool "fs-bounded/empty-growth-never-allocates-payload"
+                               (andb(fs_bounded_order_changed growth, eq_nat 1 (bounded_file_u8_to_nat growth_closed)))
+                           , MkPair String Bool "fs-bounded/positive-partials-preserve-all-binary-bytes"
+                               (andb(fs_bounded_order_binary partial,
+                                 fs_bounded_order_counts partial_reads partial_closed partial_released))
+                           , MkPair String Bool "fs-bounded/eof-zero-final-size-change-refuses-prefix"
+                               (andb(fs_bounded_order_changed resized,
+                                 andb(fs_bounded_order_counts resized_reads resized_closed resized_released,
+                                   eq_nat 2 (bounded_file_u8_to_nat resized_measures))))
+                           , MkPair String Bool "fs-bounded/usize-size-high-limb-before-allocation"
+                               (andb(fs_bounded_order_high_error high_size, eq_nat 1 (bounded_file_u8_to_nat high_size_closed)))
+                           ]
+                       else exit 73
+    | Just _, Nothing => exit 73
+    | Nothing, Just _ => exit 73
+    | Nothing, Nothing => exit 73
+    end;
+
+-- Separate process probes: a cleanup failure dominates a typed size/read error.
+def fs_bounded_order_failed_close (flag : RawPtr U8) (one : USize) (_handle : RawPtr U8) : IO U32 :=
+    do fs_bounded_order_note flag;
+       let two : USize := usize_add one one in
+       io_pure(U32, raw_size_to_u32 (usize_add(usize_add two two, one)));
+
+def fs_bounded_order_failed_release (flag : RawPtr U8) (closed : RawPtr U8) (_base : RawPtr U8) : IO Bool :=
+    do let! attempts := raw_load_u8 closed;
+       (if eq_nat 1 (bounded_file_u8_to_nat attempts) then
+         do fs_bounded_order_note flag; io_pure(Bool, False)
+       else do exit 99; io_pure(Bool, False));
+
+def fs_bounded_order_cleanup_probe (close_fails : Bool) (payload : Bool) : IO Unit :=
+    match usize_from_nat 1 with
+    | Nothing => exit 99
+    | Just one =>
+      let two : USize := usize_add one one in
+      let four : USize := usize_add two two in
+      let eight : USize := usize_add four four in
+      let sixteen : USize := usize_add eight eight in
+      let three : USize := usize_add two one in
+      do let! scratch := raw_pages_allocate sixteen eight;
+         let! bits := raw_to_bits U8 scratch;
+         if usize_equal(bits, usize_sub one one) then exit 99
+         else
+           do let! flag := raw_add U8 scratch (usize_sub sixteen one);
+                       let! release_flag := raw_add U8 scratch (usize_sub sixteen two);
+                       let! outcome := if close_fails then
+                           if payload then
+                             windows_bounded_read_contents_with (fs_bounded_order_allocate three)
+                               (fs_bounded_order_counted_release release_flag flag)
+                               (fs_bounded_order_measure three) fs_bounded_order_eof
+                               (fs_bounded_order_failed_close flag one) (raw_null U8) scratch one 3
+                           else
+                             windows_bounded_read_contents_with fs_bounded_poison_allocate fs_bounded_poison_release
+                               (fs_bounded_order_measure four) fs_bounded_poison_read
+                               (fs_bounded_order_failed_close flag one) (raw_null U8) scratch one 3
+                         else
+                           windows_bounded_read_contents_with (fs_bounded_order_allocate three)
+                             (fs_bounded_order_failed_release release_flag flag)
+                             (fs_bounded_order_measure three) fs_bounded_order_eof (fs_bounded_order_close flag one)
+                             (raw_null U8) scratch one 3;
+                       let! close_attempts := raw_load_u8 flag;
+                       let! release_attempts := raw_load_u8 release_flag;
+                       let expected_release : Nat := match payload with | True => 1 | False => 0 end in
+                       let correct_attempts : Bool := andb(eq_nat 1 (bounded_file_u8_to_nat close_attempts),
+                         eq_nat expected_release (bounded_file_u8_to_nat release_attempts)) in
+                       let! released := raw_pages_release scratch;
+                       if released then
+                         if correct_attempts then
+                           match outcome with
+                           | WindowsBoundedReadValue _ => exit 99
+                           | WindowsBoundedReadGuard => do println (if close_fails then
+                               if payload then "FS_BOUNDED_CLEANUP_REACHED close-payload"
+                               else "FS_BOUNDED_CLEANUP_REACHED close"
+                             else "FS_BOUNDED_CLEANUP_REACHED release");
+                               let! unexpected := windows_fs_bounded_finish outcome;
+                               match unexpected with | Left _ => exit 99 | Right _ => exit 99 end
+                           end
+                         else exit 99
+                       else exit 99
+    end;
+
+def main : IO Unit :=
+    do let! args := argv;
+       match args with
+       | Nil => exit 2
+       | Cons _ rest => match rest with
+         | Nil => fs_bounded_order_cases
+         | Cons mode extra => match extra with
+           | Cons _ _ => exit 2
+           | Nil => if str_eq mode "close-failure" then fs_bounded_order_cleanup_probe True False
+             else
+               if str_eq mode "release-failure" then
+                 fs_bounded_order_cleanup_probe False True
+               else
+                 if str_eq mode "close-payload-failure" then
+                   fs_bounded_order_cleanup_probe True True
+                 else exit 2
+           end
+         end
+       end;

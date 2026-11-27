@@ -13,15 +13,24 @@ import json
 from pathlib import Path, PurePosixPath
 import tarfile
 
-from repo_support import sha256_bytes
+from repo_support import sha256_bytes, sha256_file
 
 ROOT = Path(__file__).resolve().parents[1]
 MANIFEST = "compiler/bootstrap/c-bootstrap-v1.json"
 ARCHIVE = "compiler/bootstrap/c-bootstrap-v1.tar.gz"
+BRIDGE2_MANIFEST = "compiler/bootstrap/bridge2-v1.json"
+BRIDGE2_ARCHIVE = "compiler/bootstrap/bridge2-v1.tar.gz"
 digest = sha256_bytes
 
 KIND = "ouro.c-bootstrap-inputs.v1"
 STAGE0 = ("compiler/stage0/driver_u.c", "compiler/stage0/backend_u.c")
+
+
+def bridge2_inputs(root: Path) -> dict[str, str]:
+    names = (BRIDGE2_ARCHIVE, BRIDGE2_MANIFEST)
+    if not any((root / name).exists() for name in names):
+        return {}
+    return {name: sha256_file(root / name) for name in names}
 
 
 def member_name(name: str) -> str:
@@ -30,20 +39,23 @@ def member_name(name: str) -> str:
             or any(part in {"", ".", ".."} or part.rstrip(" .") != part for part in name.split("/"))
             or any(ord(char) < 32 for char in name)):
         raise ValueError(f"BOOTSTRAP_INPUTS: unsafe member path {name!r}")
-    if len(path.parts) < 3 or path.parts[0] not in {"c0", "bridge"}:
+    if len(path.parts) < 3 or path.parts[0] not in {"c0", "bridge", "bridge2"}:
         raise ValueError(f"BOOTSTRAP_INPUTS: unknown member role {name!r}")
     return name
 
 
-def load_manifest(root: Path = ROOT) -> dict:
-    manifest = json.loads((root / MANIFEST).read_text(encoding="utf-8"))
-    if not isinstance(manifest, dict) or manifest.get("kind") != KIND or manifest.get("archive") != ARCHIVE:
+def load_manifest(root: Path = ROOT, *, bridge2: bool = False) -> dict:
+    manifest_path, archive_path = (BRIDGE2_MANIFEST, BRIDGE2_ARCHIVE) if bridge2 else (MANIFEST, ARCHIVE)
+    manifest = json.loads((root / manifest_path).read_text(encoding="utf-8"))
+    if not isinstance(manifest, dict) or manifest.get("kind") != KIND or manifest.get("archive") != archive_path:
         raise ValueError("BOOTSTRAP_INPUTS: unsupported manifest")
     files = manifest.get("files")
     if not isinstance(files, dict) or not files:
         raise ValueError("BOOTSTRAP_INPUTS: missing member inventory")
     for name, row in files.items():
         member_name(name)
+        if name.startswith("bridge2/") != bridge2:
+            raise ValueError(f"BOOTSTRAP_INPUTS: unexpected member role {name!r}")
         if not isinstance(row, dict) or type(row.get("bytes")) is not int or row["bytes"] < 1:
             raise ValueError(f"BOOTSTRAP_INPUTS: invalid member size {name!r}")
         value = row.get("sha256")
@@ -56,16 +68,17 @@ def load_manifest(root: Path = ROOT) -> dict:
     roots, graph = manifest.get("ordered_roots"), manifest.get("ordered_unit_graph")
     if not isinstance(roots, list) or len(roots) != 15 or len(set(roots)) != 15 or not isinstance(graph, dict) or set(graph) != set(roots):
         raise ValueError("BOOTSTRAP_INPUTS: incomplete bridge root graph")
+    prefix = "bridge2/" if bridge2 else "bridge/"
     for source, units in graph.items():
         if (not isinstance(units, list) or not units or units[-1] != source or len(set(units)) != len(units)
-                or any("bridge/" + unit not in files for unit in units)):
+                or any(prefix + unit not in files for unit in units)):
             raise ValueError(f"BOOTSTRAP_INPUTS: incomplete ordered closure for {source}")
     return manifest
 
 
-def read_bundle(root: Path = ROOT) -> tuple[dict, dict[str, bytes]]:
-    manifest = load_manifest(root)
-    archive = (root / ARCHIVE).read_bytes()
+def read_bundle(root: Path = ROOT, *, bridge2: bool = False) -> tuple[dict, dict[str, bytes]]:
+    manifest = load_manifest(root, bridge2=bridge2)
+    archive = (root / manifest["archive"]).read_bytes()
     if len(archive) != manifest.get("archive_bytes") or sha256_bytes(archive) != manifest.get("archive_sha256"):
         raise ValueError("BOOTSTRAP_INPUTS: archive hash or size mismatch")
     expected = manifest["files"]
@@ -103,8 +116,8 @@ def verify_stage0(root: Path, manifest: dict) -> None:
             raise ValueError(f"BOOTSTRAP_INPUTS: historical stage0 mismatch {name}")
 
 
-def unpack(destination: Path, root: Path = ROOT) -> dict:
-    manifest, contents = read_bundle(root)
+def unpack(destination: Path, root: Path = ROOT, *, bridge2: bool = False) -> dict:
+    manifest, contents = read_bundle(root, bridge2=bridge2)
     # Validate every member before creating or writing the private destination.
     destination = destination.resolve()
     destination.mkdir(parents=False, exist_ok=False)
@@ -131,8 +144,8 @@ def archive_bytes(contents: dict[str, bytes]) -> bytes:
     return result.getvalue()
 
 
-def repack(source: Path, output: Path, root: Path = ROOT) -> None:
-    manifest = load_manifest(root)
+def repack(source: Path, output: Path, root: Path = ROOT, *, bridge2: bool = False) -> None:
+    manifest = load_manifest(root, bridge2=bridge2)
     expected = manifest["files"]
     paths = [path for path in source.rglob("*") if path.is_file() or path.is_symlink()]
     if any(path.is_symlink() for path in paths) or {path.relative_to(source).as_posix() for path in paths} != set(expected):
@@ -149,6 +162,7 @@ def repack(source: Path, output: Path, root: Path = ROOT) -> None:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--bridge2", action="store_true", help="select the second historical bridge bundle")
     sub = parser.add_subparsers(dest="command", required=True)
     sub.add_parser("verify", help="verify the exact archive inventory, hashes and historical stage0 pair")
     sub.add_parser("lineage", help="print reviewed source origins and transformations before unpacking")
@@ -160,14 +174,14 @@ def main() -> int:
     args = parser.parse_args()
     try:
         if args.command == "verify":
-            manifest, _contents = read_bundle()
+            manifest, _contents = read_bundle(bridge2=args.bridge2)
             verify_stage0(ROOT, manifest)
         elif args.command == "lineage":
-            print(json.dumps(load_manifest()["provenance"], indent=2))
+            print(json.dumps(load_manifest(bridge2=args.bridge2)["provenance"], indent=2))
         elif args.command == "unpack":
-            unpack(args.out)
+            unpack(args.out, bridge2=args.bridge2)
         else:
-            repack(args.source, args.out)
+            repack(args.source, args.out, bridge2=args.bridge2)
     except (OSError, ValueError, tarfile.TarError) as error:
         parser.exit(1, f"{error}\n")
     print("BOOTSTRAP_INPUTS: PASS")

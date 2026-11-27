@@ -1,0 +1,55 @@
+-- Checked scalar source to the freestanding SysV/ELF slice.
+-- No managed fallback or Linux host/runtime acceptance is provided here.
+import "lower_source.ouro",
+  "lower.ouro",
+  "codegen_linux.ouro";
+
+inductive LinuxSourceError : Type :=
+  | LinuxSourceFrontend : NativeSourceError -> LinuxSourceError
+  | LinuxSourceBackend : LinuxCodegenError -> LinuxSourceError;
+
+def native_lower_linux_checked (fuel : Nat) (limits : MirLimits) (entry : Nat)
+    (input : CheckedProgram) : Either NativeLowerError NativeLoweredProgram :=
+    lower_bind LowerScalarParts NativeLoweredProgram
+      (lower_scalar_parts_checked fuel entry input)
+      (fun (parts : LowerScalarParts) => match parts with
+        | LowerScalarPartsOf program contracts functions libraries =>
+          let mir : MirProgram := MirProgramDef functions ([] : List MirData) libraries entry in
+          match mir_annotate_calls limits mir with
+          | Left error => Left NativeLowerError NativeLoweredProgram (LowerMirFailure error)
+          | Right annotated =>
+              Right NativeLowerError NativeLoweredProgram (NativeLoweredOf program contracts annotated)
+          end
+        end);
+
+def native_lower_linux_units (fuel : Nat) (limits : MirLimits) (entry_name : List Nat)
+    (root : List Nat) (files : List (Pair (List Nat) (List Nat)))
+    : Either LinuxSourceError NativeLoweredProgram :=
+    match compile_checked_units fuel root files with
+    | CErr error => Left LinuxSourceError NativeLoweredProgram
+        (LinuxSourceFrontend (NativeSourceCheckError error))
+    | COk checked => match checked_program_intern checked with
+      | MkIntern names _ _ _ => match source_lookup_id names entry_name with
+        | Nothing => Left LinuxSourceError NativeLoweredProgram
+            (LinuxSourceFrontend (NativeSourceLowerError (LowerInvalidEntry 0)))
+        | Just entry => match native_lower_linux_checked fuel limits entry checked with
+          | Left error => Left LinuxSourceError NativeLoweredProgram
+              (LinuxSourceFrontend (NativeSourceLowerError error))
+          | Right lowered => Right LinuxSourceError NativeLoweredProgram lowered
+          end
+        end
+      end
+    end;
+
+def native_compile_linux_units (fuel : Nat) (limits : MirLimits) (entry_name : List Nat)
+    (root : List Nat) (files : List (Pair (List Nat) (List Nat)))
+    : Either LinuxSourceError (List Nat) :=
+    match native_lower_linux_units fuel limits entry_name root files with
+    | Left error => Left LinuxSourceError (List Nat) error
+    | Right lowered => match lowered with
+      | NativeLoweredOf _ _ mir => match linux_codegen_program limits mir with
+        | Left error => Left LinuxSourceError (List Nat) (LinuxSourceBackend error)
+        | Right bytes => Right LinuxSourceError (List Nat) bytes
+        end
+      end
+    end;

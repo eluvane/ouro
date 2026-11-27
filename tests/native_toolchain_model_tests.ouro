@@ -1,0 +1,218 @@
+-- Policy and protocol laws do not establish a native seed or stage acceptance.
+import "analyze/precision/assertions.ouro",
+  "native_pe_inspect_fixtures.ouro",
+  "../tools/native_toolchain_model.ouro",
+  "../tools/native_cli_args.ouro",
+  "../std/num.ouro";
+
+def toolchain_test_words : List String :=
+    ["rebuild", "--source", "source dir 雪", "--out", "new dir", "--stages", "3", "--no-cache"];
+
+def toolchain_test_request (words : List String) : Bool :=
+    match native_toolchain_parse words with
+    | Left _ => False
+    | Right request => let (NativeToolchainRequestOf source output) := request in
+      andb (str_eq source "source dir 雪") (str_eq output "new dir")
+    end;
+
+def toolchain_test_argument (words : List String) (expected : String) : Bool :=
+    match native_toolchain_parse words with
+    | Right _ => False
+    | Left error => prim_string_eq (native_toolchain_error_message error) (str_concat "arguments: " expected)
+    end;
+
+def toolchain_test_route (arguments : List String) (expected : Maybe (List String)) : Bool :=
+    match native_cli_toolchain_words arguments with
+    | Nothing => match expected with | Nothing => True | Just _ => False end
+    | Just words => match expected with
+      | Nothing => False | Just other => precision_strings words other end
+    end;
+
+def toolchain_test_sibling (image : String) (arguments : List String)
+    (expected : String) (words : List String) : Bool :=
+    match native_cli_toolchain_words arguments with
+    | Nothing => False
+    | Just actual => match native_sibling_command_checked
+        (Right ExecutablePathError String image) native_cli_toolchain_sibling actual with
+      | Left _ => False
+      | Right command => andb (prim_string_eq (command_program command) expected)
+          (precision_strings (command_args command) words)
+      end
+    end;
+
+def toolchain_test_stage_exit (status : Nat) : Bool :=
+    match native_toolchain_stage_result "N2" "N2.exe" (MkProcResult status "partial" "error") with
+    | Right _ => False
+    | Left error => if let ToolchainStageExit stage code output errors := (error : NativeToolchainError) then
+        andb (str_eq stage "N2")
+          (andb (eq_nat code status) (andb (str_eq output "partial") (str_eq errors "error")))
+      else False
+    end;
+
+def toolchain_test_stage_protocol (output : String) (errors : String) : Bool :=
+    match native_toolchain_stage_result "N3" "N3.exe" (MkProcResult 0 output errors) with
+    | Right _ => False
+    | Left error => if let ToolchainStageProtocol stage actual stderr := (error : NativeToolchainError) then
+        andb (str_eq stage "N3")
+          (andb (prim_string_eq actual output) (prim_string_eq stderr errors))
+      else False
+    end;
+
+def toolchain_test_binary : String := str_of_codes (nat_range_count 0 256);
+
+def toolchain_test_import_image (name : String) : String :=
+    native_pe_probe_patch native_pe_probe_image (add(mul 2 256, 88))
+      (str_concat name (str_of_codes [0]));
+
+def native_toolchain_model_laws : List (Pair String Bool) :=
+    [ MkPair String Bool "native-toolchain/strict-request" (toolchain_test_request toolchain_test_words)
+    , MkPair String Bool "native-toolchain/option-order"
+        (toolchain_test_request ["rebuild", "--no-cache", "--stages", "3", "--out", "new dir", "--source", "source dir 雪"])
+    , MkPair String Bool "native-toolchain/no-command"
+        (toolchain_test_argument [] "missing rebuild")
+    , MkPair String Bool "native-toolchain/no-other-command"
+        (toolchain_test_argument ["build"] "expected rebuild")
+    , MkPair String Bool "native-toolchain/no-cache-required"
+        (toolchain_test_argument ["rebuild", "--source", "s", "--out", "o", "--stages", "3"]
+          "require --stages 3 and --no-cache")
+    , MkPair String Bool "native-toolchain/stages-exact-three"
+        (toolchain_test_argument ["rebuild", "--stages", "2"] "--stages must be 3")
+    , MkPair String Bool "native-toolchain/no-stage-default"
+        (toolchain_test_argument ["rebuild", "--source", "s", "--out", "o", "--no-cache"]
+          "require --stages 3 and --no-cache")
+    , MkPair String Bool "native-toolchain/NUL-directory-refusal"
+        (toolchain_test_argument ["rebuild", "--source", (str_of_codes [97, 0, 98]), "--out", "o", "--stages", "3", "--no-cache"]
+          "invalid --source directory spelling")
+    , MkPair String Bool "native-toolchain/drive-relative-out-refusal"
+        (toolchain_test_argument ["rebuild", "--source", "s", "--out", "C:dir", "--stages", "3", "--no-cache"]
+          "invalid --out directory spelling")
+    , MkPair String Bool "native-toolchain/out-needs-final-new-name"
+        (toolchain_test_argument ["rebuild", "--source", "s", "--out", "new/", "--stages", "3", "--no-cache"]
+          "invalid --out directory spelling")
+    , MkPair String Bool "native-toolchain/extended-directory-spelling"
+        (andb (native_toolchain_directory_spelling "\\\\?\\C:\\source")
+          (native_toolchain_directory_spelling "\\\\?\\UNC\\host\\share\\new"))
+    , MkPair String Bool "native-toolchain/duplicate-source"
+        (toolchain_test_argument ["rebuild", "--source", "s", "--source", "t"] "duplicate --source")
+    , MkPair String Bool "native-toolchain/duplicate-out"
+        (toolchain_test_argument ["rebuild", "--out", "o", "--out", "p"] "duplicate --out")
+    , MkPair String Bool "native-toolchain/duplicate-stages"
+        (toolchain_test_argument ["rebuild", "--stages", "3", "--stages", "3"] "duplicate --stages")
+    , MkPair String Bool "native-toolchain/duplicate-no-cache"
+        (toolchain_test_argument ["rebuild", "--no-cache", "--no-cache"] "duplicate --no-cache")
+    , MkPair String Bool "native-toolchain/missing-option-value"
+        (toolchain_test_argument ["rebuild", "--out"] "missing value for --out")
+    , MkPair String Bool "native-toolchain/dashed-is-not-value"
+        (toolchain_test_argument ["rebuild", "--source", "--out"] "missing value for --source")
+    , MkPair String Bool "native-toolchain/unknown-option"
+        (toolchain_test_argument ["rebuild", "--compiler", "other.exe"] "unknown option: --compiler")
+    , MkPair String Bool "native-toolchain/no-positional-fallback"
+        (toolchain_test_argument ["rebuild", "s"] "unknown option: s")
+    , MkPair String Bool "native-toolchain/root-inclusive-ordered-arguments"
+        (precision_strings (native_toolchain_stage_args "out dir/N2.exe" ["std/base.ouro", native_toolchain_root])
+          [native_toolchain_root, "out dir/N2.exe", "std/base.ouro", native_toolchain_root])
+    , MkPair String Bool "native-toolchain/inventory-requires-root"
+        (notb (native_toolchain_inventory ["std/base.ouro"]))
+    , MkPair String Bool "native-toolchain/inventory-rejects-duplicates"
+        (notb (native_toolchain_inventory [native_toolchain_root, native_toolchain_root]))
+    , MkPair String Bool "native-toolchain/logical-path-escape-refusal"
+        (all String (fun (path : String) => notb (native_toolchain_relative_unit path))
+          ["../other.ouro", "/other.ouro", "C:/other.ouro", "//host/share/a.ouro",
+            "dir/../a.ouro", "dir\\a.ouro", (str_of_codes [97, 0, 98])])
+    , MkPair String Bool "native-toolchain/logical-path-unicode-space"
+        (native_toolchain_inventory ["std/雪 space.ouro", native_toolchain_root])
+    , MkPair String Bool "native-toolchain/policy-full-byte-caps"
+        (andb (eq_nat (native_toolchain_source_cap native_toolchain_policy) (mul 256 native_toolchain_mib))
+          (eq_nat (native_toolchain_image_cap native_toolchain_policy) (mul 512 native_toolchain_mib)))
+    , MkPair String Bool "native-toolchain/per-stage-process-policy"
+        (let (ProcessCaptureLimitsOf timeout memory cpu output errors) :=
+            native_toolchain_child_limits native_toolchain_policy in
+          andb (eq_nat timeout (mul 900 1000))
+            (andb (eq_nat memory (mul 3 1024)) (andb (eq_nat cpu 1)
+              (andb (eq_nat output (mul 16 native_toolchain_mib))
+                (eq_nat errors (mul 16 native_toolchain_mib))))))
+    , MkPair String Bool "native-toolchain/exact-stage-success"
+        (match native_toolchain_stage_result "N2" "out 雪/N2.exe" (MkProcResult 0 "out 雪/N2.exe\n" "") with
+         | Left _ => False | Right _ => True end)
+    , MkPair String Bool "native-toolchain/full-exit-259" (toolchain_test_stage_exit 259)
+    , MkPair String Bool "native-toolchain/ordinary-exit-one" (toolchain_test_stage_exit 1)
+    , MkPair String Bool "native-toolchain/stdout-is-exact" (toolchain_test_stage_protocol "N3.exe\r\n" "")
+    , MkPair String Bool "native-toolchain/stderr-zero-is-failure"
+        (toolchain_test_stage_protocol "N3.exe\n" (str_of_codes [0]))
+    , MkPair String Bool "native-toolchain/all-binary-bytes"
+        (native_toolchain_compare toolchain_test_binary toolchain_test_binary)
+    , MkPair String Bool "native-toolchain/post-NUL-difference"
+        (notb (native_toolchain_compare toolchain_test_binary (native_pe_probe_patch toolchain_test_binary 255 "x")))
+    , MkPair String Bool "native-toolchain/full-image-append-refusal"
+        (notb (native_toolchain_compare toolchain_test_binary (str_concat toolchain_test_binary (str_of_codes [0]))))
+    , MkPair String Bool "native-toolchain/full-image-truncation-refusal"
+        (notb (native_toolchain_compare toolchain_test_binary (str_slice toolchain_test_binary 0 255)))
+    , MkPair String Bool "native-toolchain/empty-equality-is-not-stage-success"
+        (notb (native_toolchain_compare "" ""))
+    , MkPair String Bool "native-toolchain/unsigned-valid-image"
+        (andb (native_toolchain_unsigned_image native_pe_probe_image) (native_toolchain_os_imports native_pe_probe_image))
+    , MkPair String Bool "native-toolchain/certificate-offset-refusal"
+        (notb (native_toolchain_unsigned_image (native_pe_probe_changed 232 [1, 0, 0, 0])))
+    , MkPair String Bool "native-toolchain/certificate-size-refusal"
+        (notb (native_toolchain_unsigned_image (native_pe_probe_changed 236 [1, 0, 0, 0])))
+    , MkPair String Bool "native-toolchain/foreign-DLL-refusal"
+        (notb (native_toolchain_os_imports
+          (native_pe_probe_patch native_pe_probe_image (add(mul 2 256, 88)) "foreignx.dll")))
+    , MkPair String Bool "native-toolchain/padding-is-not-ignored"
+        (notb (native_toolchain_compare native_pe_probe_image (native_pe_probe_changed 400 [1])))
+    , MkPair String Bool "native-toolchain/ordered-path-comparison"
+        (notb (native_toolchain_paths_equal ["a.ouro", native_toolchain_root] [native_toolchain_root, "a.ouro"]))
+    , MkPair String Bool "native-toolchain/route-preserves-words"
+        (toolchain_test_route ["spoof.exe", "toolchain", "rebuild", "", "雪 space", "quote\"here", "trailing\\", "--", "&|<>"]
+          (Just (List String) ["rebuild", "", "雪 space", "quote\"here", "trailing\\", "--", "&|<>"]))
+    , MkPair String Bool "native-toolchain/route-only-first-exact-command"
+        (all (List String) (fun (arguments : List String) => toolchain_test_route arguments (Nothing (List String)))
+          [[], ["toolchain"], ["coil.exe", "Toolchain"], ["coil.exe", "run", "toolchain"]])
+    , MkPair String Bool "native-toolchain/fixed-loaded-sibling"
+        (toolchain_test_sibling "C:\\tools 雪\\renamed.exe" ["D:\\spoof\\coil.exe", "toolchain", "rebuild"]
+          "C:\\tools 雪\\ouro-toolchain.exe" ["rebuild"])
+    , MkPair String Bool "native-toolchain/extended-loaded-sibling"
+        (toolchain_test_sibling "\\\\?\\UNC\\server\\share\\coil.exe" ["other.exe", "toolchain"]
+          "\\\\?\\UNC\\server\\share\\ouro-toolchain.exe" [])
+    , MkPair String Bool "native-toolchain/hosted-empty-refusal"
+        (match native_cli_test_hosted_override (Nothing String) (Just String "") (Nothing String) (Nothing String) with
+         | Nothing => False | Just key => str_eq key "OURO_TEST_BUILD" end)
+    , MkPair String Bool "native-toolchain/hosted-first-key"
+        (match native_cli_test_hosted_override (Just String "a") (Just String "b") (Just String "c") (Just String "d") with
+         | Nothing => False | Just key => str_eq key "OURO_TEST_CHECK" end)
+    , MkPair String Bool "native-toolchain/timeout-partial-streams"
+        (match native_toolchain_process_streams
+          (ProcessDirectoryCapture (ProcessCaptureTimedOut 900 "partial" (str_of_codes [0, 255]))) with
+         | Nothing => False | Just streams => let (MkPair output errors) := streams in
+           andb (prim_string_eq output "partial") (prim_string_eq errors (str_of_codes [0, 255])) end)
+    , MkPair String Bool "native-toolchain/resource-partial-streams"
+        (match native_toolchain_process_streams
+          (ProcessDirectoryCapture (ProcessCaptureResourceLimit 8 64 "out" "err")) with
+         | Nothing => False | Just streams => let (MkPair output errors) := streams in
+           andb (prim_string_eq output "out") (prim_string_eq errors "err") end)
+    , MkPair String Bool "native-toolchain/output-limit-does-not-invent-buffers"
+        (match native_toolchain_process_streams
+          (ProcessDirectoryCapture (ProcessCaptureOutputLimit CaptureStdout 16 17)) with
+         | Nothing => True | Just _ => False end)
+    , MkPair String Bool "native-toolchain/resolved-parent-root-included"
+        (native_toolchain_parent_inside "C:/source" "C:/source")
+    , MkPair String Bool "native-toolchain/resolved-parent-boundary-refusal"
+        (notb (native_toolchain_parent_inside "C:/source" "C:/source-other"))
+    , MkPair String Bool "native-toolchain/resolved-junction-target-refusal"
+        (notb (native_toolchain_parent_inside "C:/source" "D:/outside"))
+    , MkPair String Bool "native-toolchain/resolved-UNC-parent"
+        (native_toolchain_parent_inside "//host/share/source" "//host/share/source/subdir")
+    , MkPair String Bool "native-toolchain/argv-shell32-import"
+        (native_toolchain_os_imports (toolchain_test_import_image "shell32.dll"))
+    , MkPair String Bool "native-toolchain/temp-security-advapi32-import"
+        (native_toolchain_os_imports (toolchain_test_import_image "advapi32.dll"))
+    , MkPair String Bool "native-toolchain/temp-random-bcrypt-import"
+        (native_toolchain_os_imports (toolchain_test_import_image "bcrypt.dll"))
+    , MkPair String Bool "native-toolchain/system-DLL-case-insensitive"
+        (native_toolchain_os_imports (toolchain_test_import_image "SHELL32.DLL"))
+    , MkPair String Bool "native-toolchain/CRT-import-refusal"
+        (notb (native_toolchain_os_imports (toolchain_test_import_image "msvcrt.dll")))
+    ];
+
+-- @entry main
+def main : IO Unit := precision_run "native-toolchain" native_toolchain_model_laws;

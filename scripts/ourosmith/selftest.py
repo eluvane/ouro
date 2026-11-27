@@ -10,7 +10,7 @@ import tempfile
 from types import SimpleNamespace
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from ourosmith import ROOT, generator_hash
 from ourosmith.limits import RunResult, clean_env, run_limited
@@ -118,6 +118,26 @@ class HarnessTests(unittest.TestCase):
             ensure.assert_called_once_with(out / "build", required=("collect", "test"))
             prepare.assert_not_called()
 
+    def test_manifest_tool_build_reuses_shell_for_environment(self):
+        from ourosmith import host
+
+        with tempfile.TemporaryDirectory() as temporary:
+            out = Path(temporary)
+            shells = [out / name / "sh" for name in ("first", "second")]
+            result = SimpleNamespace(ok=True, stdout="", stderr="")
+            with (patch.object(host, "ensure_compiler", return_value=None), patch.object(host, "binary"),
+                  patch.object(host, "shell", side_effect=[*shells, *shells]) as discover,
+                  patch.object(host, "run_limited", return_value=result) as launch):
+                self.assertIsNone(host.ensure_tools(out, required=("collect", "test")))
+
+            self.assertEqual(discover.call_count, 2)
+            self.assertEqual(launch.call_count, 2)
+            for call, sh in zip(launch.call_args_list, shells, strict=True):
+                self.assertEqual(call.args[0][0], str(sh))
+                child = call.kwargs["env"]
+                self.assertEqual(child["OURO_POSIX_SH"], sh.as_posix())
+                self.assertEqual(child["PATH"].split(os.pathsep)[1], str(sh.parent))
+
     def test_native_builds_honor_cache_disable(self):
         from ourosmith.host import environment
 
@@ -125,6 +145,24 @@ class HarnessTests(unittest.TestCase):
             env = environment(jobs=1, build=True)
             self.assertEqual(env["OURO_CACHE"], "0")
             self.assertEqual(env["OURO_CCACHE"], "disabled")
+
+    def test_native_build_passes_process_memory_limit_to_workers(self):
+        from local_scheduler import MEMORY_ENV, Allocation
+        from ourosmith.host import BUILD_MEMORY_MB, build_command
+
+        with tempfile.TemporaryDirectory() as directory, \
+             patch("ourosmith.host.environment", side_effect=lambda **_kwargs: {}), \
+             patch("ourosmith.host.run_limited", return_value=SimpleNamespace(ok=True, stdout="", stderr="")) as run:
+            log = Path(directory) / "build.log"
+            for inherited, allocation, expected in (
+                    ({}, None, BUILD_MEMORY_MB),
+                    ({MEMORY_ENV: "2560"}, None, 2560),
+                    ({MEMORY_ENV: "8192"}, Allocation(4, 4608), 4608)):
+                with self.subTest(inherited=inherited, allocation=allocation), \
+                     patch.dict(os.environ, inherited, clear=True):
+                    self.assertIsNone(build_command(["compiler"], log, allocation=allocation))
+                self.assertEqual(run.call_args.kwargs["memory_mb"], expected)
+                self.assertEqual(run.call_args.kwargs["env"].get(MEMORY_ENV), str(expected))
 
     def test_native_tool_entries_follow_owned_layout(self):
         from ourosmith.host import TOOLS, tool_entry
@@ -163,12 +201,40 @@ class HarnessTests(unittest.TestCase):
                   'inductive Other : Type := | OtherValue : Other;\n')
         with tempfile.TemporaryDirectory(dir=ROOT / "_build") as directory:
             root = Path(directory)
-            (root / "ast.ouro").write_text(source, encoding="utf-8")
+            path = root / "ast.ouro"
+            path.write_text(source, encoding="utf-8")
             with patch.object(inventory, "ROOT", root):
-                self.assertEqual(inventory.constructors("ast.ouro", "Expr"), ["EVar", "ESpan"])
-                self.assertEqual(inventory.constructors("ast.ouro", "Other"), ["OtherValue"])
+                read = inventory.constructor_reader("ast.ouro")
+                self.assertEqual(read("Expr"), ["EVar", "ESpan"])
+                self.assertEqual(read("Other"), ["OtherValue"])
                 with self.assertRaisesRegex(ValueError, "cannot extract Missing"):
-                    inventory.constructors("ast.ouro", "Missing")
+                    read("Missing")
+                saved = path.stat()
+                path.write_text(source.replace("EVar", "EUse"), encoding="utf-8")
+                os.utime(path, ns=(saved.st_atime_ns, saved.st_mtime_ns))
+                self.assertEqual(inventory.constructors("ast.ouro", "Expr"), ["EUse", "ESpan"])
+
+    def test_inventory_check_generates_strategy_contract_once(self):
+        import ouro_smith as smith
+        from ourosmith import inventory
+
+        contracts = inventory.code_strategies()
+        with tempfile.TemporaryDirectory() as directory, contextlib.redirect_stdout(io.StringIO()):
+            for write, registered, exit_code, generations in (
+                (False, contracts, 0, (0, 1)), (False, None, 1, (1, 0)), (True, contracts, 0, (1, 1)),
+            ):
+                args = SimpleNamespace(out=directory, write=write, report=None, verbose=False)
+                with (self.subTest(write=write, registered=registered is not None),
+                      patch.object(smith, "load_strategies", return_value=registered),
+                      patch.object(smith, "write_strategies") as publish,
+                      patch.object(smith, "code_strategies", return_value=contracts) as fallback,
+                      patch.object(inventory, "code_strategies", return_value=contracts) as checked):
+                    self.assertEqual(smith.cmd_inventory(args), exit_code)
+                    self.assertEqual((fallback.call_count, checked.call_count), generations)
+                    if write:
+                        publish.assert_called_once_with(contracts)
+                    else:
+                        publish.assert_not_called()
 
     def test_source_parser_uses_bootstrap_components(self):
         from frontend_regen import collect_units
@@ -273,18 +339,31 @@ class HarnessTests(unittest.TestCase):
     def test_analyzer_core_pool_uses_platform_memory_policy(self):
         import analyze_core_checks as checks
 
-        for platform, jobs, memory in (("nt", 10, 3072), ("posix", 1, 2944)):
+        for platform, ceiling, budget, jobs, memory in (
+            ("nt", 20, 3072, 10, 3072), ("nt", 2, 3072, 2, 3072),
+            ("posix", 2, 6015, 1, 2944), ("posix", 2, 6016, 2, 2944),
+        ):
             with tempfile.TemporaryDirectory() as directory, \
+                 patch.dict(os.environ, {checks.JOBS_ENV: str(ceiling)}), \
                  patch.object(checks, "os", SimpleNamespace(name=platform)), \
-                 patch.object(checks, "command_environment", return_value={}), \
+                 patch.object(checks, "sys", SimpleNamespace(platform="linux")), \
+                 patch.object(checks, "available_memory_mib", return_value=budget), \
+                 patch.object(checks, "command_environment", return_value={"OURO_C_BUILD_DIR": directory}), \
                  patch.object(checks, "shell", return_value=Path("sh")), \
                  patch.object(checks, "run_limited", return_value=RunResult("ok", 0, "CHECK_OK\n", "", 0, 0)) as execute, \
                  contextlib.redirect_stdout(io.StringIO()):
+                for name in ("ouro1", "ouro-collect"):
+                    (Path(directory) / name).touch()
                 report = checks.run_checks([f"file-{n}.ouro" for n in range(12)], Path(directory), 99)
                 self.assertTrue(report["pass"])
                 self.assertEqual(report["jobs"], jobs)
                 self.assertEqual(report["wrapper_launches"], 12)
                 self.assertTrue(all(call.kwargs["memory_mb"] == memory for call in execute.call_args_list))
+                if platform == "posix" and jobs == 2:
+                    self.assertNotIn("OURO_PREPARED_COLLECTOR", execute.call_args_list[0].kwargs["env"])
+                    for call in execute.call_args_list[1:]:
+                        self.assertEqual(call.kwargs["env"]["OURO_PREPARED_COLLECTOR"],
+                                         (Path(directory) / "ouro-collect").as_posix())
 
     def test_analyzer_core_pool_orders_results_and_preserves_failures(self):
         import threading
@@ -422,6 +501,92 @@ class HarnessTests(unittest.TestCase):
             with patch("ourosmith.host.ensure_tools", side_effect=AssertionError("must not build invalid request")), self.assertRaises(ValueError):
                 run_manifest(SimpleNamespace(seed=-1, out=out))
             self.assertEqual(before, sorted(path.relative_to(out).as_posix() for path in out.rglob("*")))
+
+    def test_stable_compiled_fixtures_share_only_matching_native_inputs(self):
+        from concurrent.futures import ThreadPoolExecutor
+        from frontend_regen import collect_units_many
+        from ourosmith.native_inputs import prepare
+        from repo_support import hash_json, sha256_bytes
+
+        scratch = ROOT / "_build/smith/selftest"
+        scratch.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(dir=scratch) as directory:
+            out = Path(directory)
+            for group in ("runtime", "test"):
+                fresh = prepare(group, out, 1)
+                with ThreadPoolExecutor(max_workers=4) as pool:
+                    copies = list(pool.map(lambda _index, group=group: prepare(group, out, 1, stable=True), range(4)))
+                stable = copies[0]
+                self.assertEqual(copies, [stable] * 4)
+                self.assertNotEqual(stable, fresh)
+                expected = {file.name: file.read_bytes() for file in fresh.iterdir()}
+                self.assertEqual({file.name: file.read_bytes() for file in stable.iterdir()}, expected)
+                self.assertEqual(stable.name, group + "-" + hash_json([
+                    1, {name: sha256_bytes(data) for name, data in expected.items()},
+                ])[:16])
+                with patch("ourosmith.native_inputs.tempfile.TemporaryDirectory",
+                           side_effect=AssertionError("warm fixtures must reuse the published tree")):
+                    self.assertEqual(prepare(group, out, 1, stable=True), stable)
+                entries = [file.relative_to(ROOT).as_posix() for file in stable.glob("*.ouro")]
+                self.assertEqual(len(entries), 4)
+                closures = collect_units_many(entries)
+                self.assertTrue(all(units[-1] == entry and "std/io.ouro" in units for entry, units in closures.items()))
+                seed_two = prepare(group, out, 2, stable=True)
+                self.assertNotEqual(stable, seed_two)
+                self.assertEqual(set(out.glob(group + "-*")), {fresh, stable, seed_two})
+                golden = next(fresh.glob("*.golden"))
+                golden.write_bytes(b"deliberately wrong golden")
+                self.assertNotEqual((stable / golden.name).read_bytes(), golden.read_bytes())
+
+    def test_stable_compiled_fixtures_reject_incomplete_or_modified_trees(self):
+        from ourosmith.native_inputs import prepare
+
+        scratch = ROOT / "_build/smith/selftest"
+        scratch.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(dir=scratch) as directory:
+            out = Path(directory)
+            rejected = out / "unsupported"
+            with self.assertRaisesRegex(ValueError, "group runtime or test"):
+                prepare("fix", rejected, 1, stable=True)
+            self.assertFalse(rejected.exists())
+            physical_lstat = Path.lstat
+            for damage in ("changed", "missing", "extra", "linked"):
+                with self.subTest(damage=damage):
+                    destination = out / damage
+                    stable = prepare("test", destination, 6, stable=True)
+                    file = stable / "success.golden"
+                    metadata = contextlib.nullcontext()
+                    if damage == "changed":
+                        file.write_bytes(bytes(file.stat().st_size))
+                    elif damage == "missing":
+                        file.unlink()
+                    elif damage == "extra":
+                        (stable / "unexpected").write_bytes(b"")
+                    else:
+                        linked = SimpleNamespace(st_mode=file.stat().st_mode, st_nlink=2)
+                        metadata = patch.object(Path, "lstat", lambda path, target=file, info=linked:
+                                                info if path == target else physical_lstat(path))
+                    with metadata, self.assertRaisesRegex(ValueError, "invalid stable fixture"):
+                        prepare("test", destination, 6, stable=True)
+
+    def test_stable_compiled_fixture_write_failure_leaves_nothing_to_reuse(self):
+        from ourosmith.native_inputs import prepare
+
+        scratch = ROOT / "_build/smith/selftest"
+        scratch.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(dir=scratch) as directory:
+            out = Path(directory)
+            physical_open = Path.open
+
+            def fail_second(path, mode="r", *args, **kwargs):
+                if path.name == "helpers.golden" and mode.startswith("w"):
+                    raise OSError("fixture write failed")
+                return physical_open(path, mode, *args, **kwargs)
+
+            with patch.object(Path, "open", fail_second), self.assertRaisesRegex(OSError, "fixture write failed"):
+                prepare("test", out, 1, stable=True)
+            self.assertEqual(list(out.iterdir()), [])
+            self.assertTrue((prepare("test", out, 1, stable=True) / "helpers.golden").is_file())
 
     def test_ergonomics_setup_comment_cannot_consume_candidate_or_lint_variant(self):
         from ourosmith.ergonomics_inputs import render
@@ -648,6 +813,7 @@ class HarnessTests(unittest.TestCase):
         with patch("ourosmith.surface.run.binary", return_value=Path("unused")), \
              patch("ourosmith.surface.run.environment", return_value={}), \
              patch("ourosmith.surface.run.job_count", return_value=2), \
+             patch("ourosmith.surface.run.available_memory_mib", return_value=2048), \
              patch("ourosmith.surface.forms.run_forms"), patch.object(SurfaceRunner, "run_recipes"), \
              patch("ourosmith.surface.corpus.load", return_value=[]), \
              patch.object(SurfaceRunner, "run_seed", sample):
@@ -670,11 +836,13 @@ class HarnessTests(unittest.TestCase):
     def test_parallel_recipes_isolate_work_and_preserve_failures(self):
         import threading
         from ourosmith.surface.run import StepFailure, SurfaceRunner
+        from selfhost_module_cache import CachedImportParser
 
         barrier = threading.Barrier(2)
         active = set()
         started = threading.Event()
         paths = []
+        import_parsers = []
         lock = threading.Lock()
         names = ["alpha", "analyzer_lines", "user_test_runner", "beta", "compiler_parity"]
 
@@ -683,9 +851,11 @@ class HarnessTests(unittest.TestCase):
                 self.assertTrue(started.wait(timeout=5))
             with lock:
                 paths.append(worker.work)
+                import_parsers.append(worker.import_parser)
                 if only in {"alpha", "beta"}:
                     active.add(only)
                     started.set()
+                    self.assertEqual(worker.env["OURO_JOBS"], "1")
                 else:
                     self.assertEqual(active, set())
                     self.assertEqual(worker.timeout, 20)
@@ -702,19 +872,27 @@ class HarnessTests(unittest.TestCase):
             if only == "compiler_parity":
                 worker.report.sections["stage_parity"] = {"status": "exercised"}
 
+        def failed_recipe(worker, **_kwargs):
+            self.assertIsNot(worker.import_parser, import_parsers[0])
+            raise RuntimeError("recipe failed")
+
         value = Report(profile="pr", generator_hash="selftest", seeds=[6], command="recipes")
         with patch("ourosmith.surface.run.binary", return_value=Path("unused")), \
              patch("ourosmith.surface.run.environment", return_value={}), \
              patch("ourosmith.surface.run.job_count", return_value=2), \
+             patch("ourosmith.surface.run.available_memory_mib", return_value=2048), \
              patch("ourosmith.surface.tools.PROPERTIES", [SimpleNamespace(__name__=name) for name in names]), \
              patch("ourosmith.surface.tools.run_tools", side_effect=recipe):
             runner = SurfaceRunner(value, ROOT / "_build/smith/selftest/recipes", [6])
             runner.seed = 6
             runner.run_recipes()
-            with patch("ourosmith.surface.tools.run_tools", side_effect=RuntimeError("recipe failed")), \
+            with patch("ourosmith.surface.tools.run_tools", side_effect=failed_recipe), \
                  self.assertRaisesRegex(RuntimeError, "recipe failed"):
                 runner.run_recipes()
         self.assertEqual(len(set(paths)), len(names))
+        self.assertIsNone(runner.import_parser)
+        self.assertIsInstance(import_parsers[0], CachedImportParser)
+        self.assertTrue(all(parser is import_parsers[0] for parser in import_parsers))
         self.assertEqual([finding.prop for finding in value.findings], names)
         self.assertEqual([finding.seed for finding in value.findings], [6] * len(names))
         self.assertEqual([skip["what"] for skip in value.skips], names)
@@ -726,6 +904,84 @@ class HarnessTests(unittest.TestCase):
         conflict.sections["stage_parity"] = {"status": "unavailable"}
         with self.assertRaisesRegex(ValueError, "conflicting surface report section"):
             runner.merge_seed(conflict)
+
+    def test_eval_pair_keeps_child_budgets_and_detects_same_wrong_output(self):
+        from threading import Barrier
+        from ourosmith.surface import parity
+        from ourosmith.surface.run import StepFailure, SurfaceRunner
+
+        expected = {"expected": 2, "successor": "S", "type_name": "Nat"}
+        for jobs in (1, 20):
+            with self.subTest(jobs=jobs), tempfile.TemporaryDirectory() as directory:
+                work = Path(directory)
+                barrier = Barrier(2) if jobs == 20 else None
+
+                def execute(argv, *, cwd, env, timeout_s, memory_mb, barrier=barrier, work=work):
+                    self.assertEqual(env["OURO_JOBS"], "1")
+                    self.assertEqual(env["OURO_SCHEDULER_JOBS"], "1")
+                    self.assertEqual(env["OURO_SCHEDULER_MEMORY_MIB"], "64")
+                    self.assertEqual((cwd, timeout_s, memory_mb), (work, 60, 64))
+                    if barrier is not None:
+                        barrier.wait(timeout=5)
+                    stdout = parity.nat_output(2 if "--print" in argv else 4)
+                    return RunResult("ok", 0, stdout, "", 0, 0)
+
+                with patch("ourosmith.surface.run.environment", return_value={}), \
+                     patch("ourosmith.surface.run.available_memory_mib", return_value=128), \
+                     patch.object(parity, "environment", return_value={}) as environment, \
+                     patch.object(parity, "job_count", return_value=jobs), \
+                     patch.object(parity, "run_limited", side_effect=execute) as commands:
+                    runner = SurfaceRunner(report(), work, [1], memory_mb=64, overrides={"ouro1": work / "compiler"})
+                    with self.assertRaises(StepFailure) as error:
+                        parity.eval_pair(runner, work, [work / "shell", work / "ouro1.sh"], work / "main.ouro", expected)
+                self.assertEqual((error.exception.prop, error.exception.classification), ("eval-parallel", "property-violation"))
+                environment.assert_called_once_with(jobs=1, build=True, shell_path=work / "shell")
+                self.assertEqual(commands.call_count, 2)
+                self.assertEqual(runner.report.timing["surface.eval-pair.scheduler.peak_jobs"], 1 if jobs == 1 else 2)
+                self.assertEqual((work / "parallel-print.stdout").read_text(encoding="utf-8"), parity.nat_output(2))
+                self.assertEqual((work / "parallel-expr.stdout").read_text(encoding="utf-8"), parity.nat_output(4))
+
+    def test_parity_evals_use_the_selected_shell(self):
+        from ourosmith import host
+        from ourosmith.surface import parity
+
+        core = "ouro.checked-program.v1\n1 0 \n"
+        saved = {"cases": [{"name": "fixture", "source": "fixture source\n", "expected": 2,
+                            "type_name": "Nat", "successor": "S", "dependencies": []}]}
+        eval_results = iter([
+            RunResult("ok", 0, parity.nat_output(2), "", 0, 0),
+            RunResult("ok", 0, parity.nat_output(3), "", 0, 0),
+            RunResult("ok", 2, "", "EVAL_FAIL: require exactly one of --eval / --print", 0, 0),
+            RunResult("ok", 2, "", "EVAL_FAIL: require exactly one of --eval / --print", 0, 0),
+            RunResult("ok", 2, "", "EVAL_FAIL: missing", 0, 0),
+            RunResult("ok", 1, "", "CErr code=2", 0, 0),
+        ])
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            sh = directory / "wrapper" / "sh"
+            steps = []
+
+            def command(argv, _cwd, step, **options):
+                if step == "parity-host":
+                    argv[-1].write_text(core, encoding="utf-8")
+                    return RunResult("ok", 0, "CHECK_OK\n", "", 0, 0)
+                steps.append(step)
+                self.assertEqual(argv[0], sh)
+                self.assertEqual(options["env"]["OURO_POSIX_SH"], sh.as_posix())
+                self.assertEqual(options["timeout"], 60)
+                return next(eval_results)
+
+            run = SimpleNamespace(overrides={}, input=None, command=command, count=Mock(),
+                                  accepts=Mock(return_value=core), native=Mock(return_value=RunResult("ok", 0, parity.nat_output(2), "", 0, 0)),
+                                  output=lambda result: result.stdout + result.stderr,
+                                  require=lambda ok, step, *_details: self.assertTrue(ok, step))
+            with (patch.object(parity, "stage", return_value=None), patch.object(parity, "shell", return_value=sh) as locate,
+                  patch.object(host, "shell", return_value=directory / "rediscovered" / "sh") as redundant,
+                  patch.object(parity, "eval_pair")):
+                parity.run_checks(run, directory, saved=saved)
+            locate.assert_called_once_with()
+            redundant.assert_not_called()
+            self.assertEqual(steps, ["eval-reference"] * 2 + ["eval-negative"] * 4)
 
     def test_recursive_surface_shrinking_keeps_scope_and_cleanliness(self):
         from ourosmith.surface import gen
@@ -767,6 +1023,60 @@ class HarnessTests(unittest.TestCase):
         self.assertEqual(observed, ["frozen source\n"])
         self.assertEqual(runner.report.findings[0].minimal_input, value)
 
+    def test_parity_reads_each_checked_snapshot_once(self):
+        from ourosmith.surface import parity
+        from ourosmith.surface.run import StepFailure, SurfaceRunner
+        from repo_support import sha256_bytes
+
+        core = "ouro.checked-program.v1\n1 0 \n"
+        changed = "ouro.checked-program.v1\n1 1 \n"
+        saved = {"cases": [{"name": "frozen", "source": "frozen source\n", "expected": 9,
+                            "type_name": "Nat", "successor": "S", "dependencies": []}]}
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            staged = root / "_build/stage_loop/ouro1_stage2"
+            staged.parent.mkdir(parents=True)
+            image = b"s" * (1024 * 1024) + b"1"
+            staged.write_bytes(image)
+            staged.with_name("result.json").write_text(json.dumps({
+                "stages": 2, "pass": True, "frontend_eq": True, "backend_eq": True,
+                "artifacts": {"binary_sha256": sha256_bytes(image)},
+            }), encoding="utf-8")
+
+            def command(argv, _work, prop):
+                path = Path(argv[-1])
+                path.write_text(changed if prop == failure else core, encoding="ascii")
+                return RunResult("ok", 0, "CHECK_OK", "", 0, 0)
+
+            with (patch.object(parity, "ROOT", root), patch.object(parity, "shell", return_value=root / "shell"),
+                  patch("ourosmith.surface.run.environment", return_value={}),
+                  patch("ourosmith.surface.run.available_memory_mib", return_value=128),
+                  patch.object(Path, "read_bytes", side_effect=AssertionError("whole binary read")),
+                  patch.object(parity, "checked_program_snapshot", wraps=parity.checked_program_snapshot) as reads):
+                runner = SurfaceRunner(report(), root, [1], memory_mb=64, overrides={"ouro1": root / "compiler"})
+                with (patch.object(runner, "accepts", return_value=core), patch.object(runner, "command", command),
+                      patch.object(runner, "native", side_effect=StepFailure("fixture-stop", None, None))):
+                    for failure, expected, paths in (
+                        (None, "fixture-stop", ["host.checked", "stage.checked"]),
+                        ("parity-host", "parity-host-core", ["host.checked"]),
+                        ("parity-stage", "parity-stage-core", ["host.checked", "stage.checked"]),
+                    ):
+                        with self.subTest(failure=failure):
+                            reads.reset_mock()
+                            with self.assertRaises(StepFailure) as error:
+                                parity.run_checks(runner, root, saved=saved)
+                            self.assertEqual(error.exception.prop, expected)
+                            if failure is not None:
+                                self.assertEqual((error.exception.expected, error.exception.actual), (core, changed))
+                            self.assertEqual([call.args[0].name for call in reads.call_args_list], paths)
+
+                timestamp = staged.stat()
+                staged.write_bytes(image[:-1] + b"2")
+                os.utime(staged, ns=(timestamp.st_atime_ns, timestamp.st_mtime_ns))
+                with self.assertRaises(StepFailure) as error:
+                    parity.stage(runner)
+                self.assertEqual(error.exception.prop, "stage-fixpoint-proof")
+
     def test_saved_io_freezes_source_helper_and_process_inputs(self):
         from ourosmith.surface.run import SurfaceRunner
 
@@ -793,6 +1103,54 @@ class HarnessTests(unittest.TestCase):
         self.assertEqual(native.call_args.kwargs["env"]["OURO_SMITH_VALUE"], saved["env_value"])
         self.assertEqual(checked.call_args.kwargs["timeout"], 900)
         self.assertEqual(native.call_args.kwargs["compile_timeout"], 900)
+
+    def test_c_static_commands_apply_only_required_module_scope_flags(self):
+        import c_static_analysis_suite as gate
+
+        flag = "-DOURO_MODULE_PURE_SCOPES=1"
+        target = ["--target=x86_64-w64-windows-gnu"]
+        exclusions = ["unix.Stream", "unix.Errno"]
+        sources = (
+            (gate.ROOT / "runtime/module_pure_scope_selftest.c", 1),
+            (gate.ROOT / "runtime/../runtime/module_pure_scope_selftest.c", 1),
+            (gate.ROOT / "runtime/ouro_rt.c", 0),
+            (gate.ROOT / "runtime/frontend_link.c", 0),
+            (gate.FIXTURES / "good.c", 0),
+            (gate.FIXTURES / "bad_use_after_free.c", 0),
+            (gate.FIXTURES / "module_pure_scope_selftest.c", 0),
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            obj = Path(directory) / "objects" / "fixture.o"
+            for source, count in sources:
+                with self.subTest(source=source):
+                    gcc = gate.gcc_command("gcc", source, obj)
+                    clang = gate.clang_command("clang", target, exclusions, source)
+                    for command in (gcc, clang):
+                        self.assertEqual(command.count(flag), count)
+                        self.assertIn(gate.rel(source), command)
+                        self.assertIn("-Werror", command)
+                        for common in gate.COMMON_FLAGS:
+                            self.assertIn(common, command)
+                    self.assertIn("-fanalyzer", gcc)
+                    self.assertIn("-c", gcc)
+                    self.assertIn("--analyze", clang)
+                    self.assertIn("-analyzer-werror", clang)
+                    self.assertIn(target[0], clang)
+                    self.assertIn("-analyzer-disable-checker=unix.Stream,unix.Errno", clang)
+
+    def test_c_static_gcc_codegen_timeout_is_scoped_and_overridable(self):
+        import c_static_analysis_suite as gate
+
+        for extra, codegen_timeout, other_timeout in (([], 300.0, 180.0), (["--timeout-seconds", "12"], 12.0, 12.0)):
+            with self.subTest(extra=extra), tempfile.TemporaryDirectory() as directory, \
+                 patch.object(gate, "find_tool", side_effect=("gcc", None)), \
+                 patch.object(gate, "tool_version", return_value="test"), \
+                 patch.object(gate.subprocess, "run", return_value=SimpleNamespace(returncode=0, stdout="")) as run:
+                gate.run_suite(gate.parser().parse_args(["--out", directory, *extra]))
+                timeouts = {call.args[0][-3]: call.kwargs["timeout"] for call in run.call_args_list
+                            if "-fanalyzer" in call.args[0]}
+                self.assertEqual(timeouts.pop("runtime/frontend_codegen_selftest.c"), codegen_timeout)
+                self.assertEqual(set(timeouts.values()), {other_timeout})
 
     def test_msvc_environment_is_local_and_fail_closed(self):
         import c_static_analysis_suite as gate
@@ -940,6 +1298,50 @@ class HarnessTests(unittest.TestCase):
                 produced.unlink()
                 self.assertIsNone(ci_pr_receipt(out, current)[0])
 
+                from ourosmith.validation import ci_pr_repeat
+
+                workspace = out / "_build/ci-fixture/smith"
+                expected.cmd[-1] = "_build/ci/smith-pr"
+                isolated_report = workspace / expected.cmd[-1] / "report.json"
+                isolated_report.parent.mkdir(parents=True)
+                isolated_report.write_text('{"fingerprint":"isolated"}\n', encoding="utf-8")
+                gate.update(workspace=workspace.relative_to(out).as_posix(), jobs=4, memory_mib=4608)
+                write_summary()
+                with patch("ourosmith.evidence.ROOT", out), patch("ourosmith.validation.ROOT", out):
+                    isolated, errors = ci_pr_receipt(out, current)
+                    self.assertEqual(errors, [])
+                    self.assertEqual(Path(isolated["report"]), isolated_report)
+                    checked.assert_called_with({"fingerprint": "isolated"}, "pr", current, root=workspace)
+                    repeated_root, _, repeated_argv, lease = ci_pr_repeat(isolated)
+                    self.assertEqual(repeated_root, workspace)
+                    self.assertEqual(repeated_argv[-1], "_build/ci/smith-pr-repeat")
+                    self.assertEqual((lease.jobs, lease.memory_mib), (4, 4608))
+                    gate["workspace"] = "../smith"
+                    write_summary()
+                    self.assertIsNone(ci_pr_receipt(out, current)[0])
+
+    def test_validation_passes_the_same_aggregate_budget_to_child_and_supervisor(self):
+        from ourosmith import validation
+        from local_scheduler import JOBS_ENV, MEMORY_ENV
+
+        source = {"source_sha256": "current"}
+        success = SimpleNamespace(ok=True, returncode=0, stdout="", stderr="", elapsed_s=0,
+                                  classify=lambda: "ok")
+        with (tempfile.TemporaryDirectory() as directory,
+              patch.object(validation, "commands", return_value=[("ci", ["unused-command"])]),
+              patch.object(validation, "begin", return_value={"source": source}),
+              patch.object(validation, "source_state", return_value=source),
+              patch.object(validation, "environment", return_value={}),
+              patch.object(validation, "job_count", return_value=8),
+              patch.object(validation, "available_memory_mib", return_value=6144),
+              patch.object(validation, "run_limited", return_value=success) as launch,
+              patch("ourosmith.evidence.validation_problems", return_value=[]),
+              contextlib.redirect_stdout(io.StringIO())):
+            self.assertEqual(validation.run(SimpleNamespace(out=directory)), 0)
+        self.assertEqual(launch.call_args.kwargs["memory_mb"], 6144)
+        self.assertEqual(launch.call_args.kwargs["env"][MEMORY_ENV], "6144")
+        self.assertEqual(launch.call_args.kwargs["env"][JOBS_ENV], "8")
+
     def test_legacy_consumer_path_boundaries(self):
         from ourosmith.migration import LEGACY_REFERENCE
 
@@ -957,6 +1359,129 @@ class HarnessTests(unittest.TestCase):
              patch("ourosmith.evidence.binary_state", return_value=partial):
             problems = provenance_problems({"source": current, "binaries": partial}, current, surface=True)
         self.assertIn("required tested binary set is incomplete", problems)
+
+    def test_crypto_stream_fixture_runs_preserve_binary_boundaries(self):
+        from ourosmith.surface.library import _crypto_stream_bytes
+
+        for value, expected in (
+            (bytes(range(256)), "str_of_codes (nat_range_count 0 256)"),
+            (bytes(range(63, 129)), "str_of_codes (nat_range_count 63 66)"),
+            (bytes(range(250, 256)), "str_of_codes (nat_range_count 250 6)"),
+            (b"a" * 62, "str_of_codes (replicate Nat 97 62)"),
+            (b"\xff" * 64, "str_of_codes (replicate Nat 255 64)"),
+        ):
+            with self.subTest(value=value):
+                self.assertEqual(_crypto_stream_bytes(value), expected)
+        for value in (b"", b"\0", b"\xff", bytes((0, 2, 3)), bytes((3, 2, 1)),
+                      bytes((254, 255, 0)), bytes((65, 0, 255, 13, 10, 128)),
+                      b"abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq"):
+            with self.subTest(value=value):
+                expected = f'str_of_codes ([{", ".join(map(str, value))}] : List Nat)'
+                self.assertEqual(_crypto_stream_bytes(value), expected)
+
+    def test_crypto_stream_fixture_preserves_all_159_oracle_rows(self):
+        import hashlib
+        from ourosmith.surface.library import FAMILIES, crypto
+
+        rows = list(crypto(1))
+        expected = "".join(value + "\n" for _expression, value in rows).encode("utf-8")
+        self.assertEqual(len(rows), 159)
+        self.assertEqual(len(expected), 7215)
+        self.assertEqual(hashlib.sha256(expected).hexdigest(),
+                         "be964b6b7c71183821c3522c3d9ab61f6ff789b0a07030a99dd34b236bc03aba")
+        self.assertEqual(FAMILIES["crypto"][1], ("std/crypto.ouro", "std/num.ouro"))
+
+    def test_native_crypto_fixture_checks_all_rows_in_one_ordered_main(self):
+        from ourosmith.native_inputs import prepare_library
+        from ourosmith.surface.library import FAMILIES, _crypto_stream_bytes
+
+        rows = list(FAMILIES["crypto"][0](1))
+        self.assertEqual(len(rows), 159)
+        comparisons = [index for index, (expression, _value) in enumerate(rows)
+                       if expression.startswith("show_bool (str_eq observed")]
+        self.assertEqual(comparisons, list(range(16, 60, 3)))
+        lengths = (0, 1, 55, 56, 57, 63, 64, 65, 119, 120, 121, 127, 128, 129, 256)
+        for comparison, size in zip(comparisons, lengths, strict=True):
+            digest_index = comparison - 1
+            message = _crypto_stream_bytes(bytes(range(size)))
+            self.assertIn("sha256_stream_final", rows[digest_index][0])
+            self.assertEqual(rows[comparison],
+                             (f"show_bool (str_eq observed{digest_index} (sha256 ({message})))", "true"))
+        scratch = ROOT / "_build/smith/selftest"
+        scratch.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(dir=scratch) as directory:
+            root = Path(directory)
+            prepare_library(root, "crypto", 1)
+            source = (root / "crypto.ouro").read_text(encoding="utf-8")
+            definitions, main = source.split("\n-- @entry main\ndef main : IO Unit :=\n  do\n")
+            imports = "".join(f'import "{os.path.relpath(ROOT / name, root).replace(chr(92), "/")}";\n'
+                              for name in ("std/io.ouro", "std/format.ouro", *FAMILIES["crypto"][1]))
+            self.assertEqual(definitions, imports + "".join(
+                f"def observed{i} : String := {expression};\n"
+                for i, (expression, _value) in enumerate(rows)))
+            self.assertEqual(main, "".join(f"     println observed{i};\n" for i in range(159))
+                             + "     exit 0\n")
+            expected = "".join(value + "\n" for _expression, value in rows).encode("utf-8")
+            self.assertEqual((root / "crypto.golden").read_bytes(), expected)
+            self.assertEqual(len(expected), 7215)
+
+    def test_hosted_crypto_checks_and_replays_all_rows_in_batches(self):
+        from ourosmith.surface.library import crypto, run_family
+        from ourosmith.surface.run import SurfaceRunner
+
+        scratch = ROOT / "_build/smith/selftest"
+        scratch.mkdir(parents=True, exist_ok=True)
+        rows = list(crypto(1))
+        batches = ["".join(value + "\n" for _, value in rows[start:start + 53]) for start in (0, 53, 106)]
+        with tempfile.TemporaryDirectory(dir=scratch) as directory, \
+             patch("ourosmith.surface.run.binary", return_value=Path("unused")), \
+             patch("ourosmith.surface.run.environment", return_value={}), \
+             patch("frontend_regen.collect_units", return_value=["main.ouro"]):
+            root = Path(directory)
+            runner = SurfaceRunner(report(), root, [1], shrink_budget=0)
+            runner.seed = 1
+            saved = None
+            for _ in range(2):
+                with patch.object(runner, "accepts") as check, \
+                     patch.object(runner, "compile_native", return_value=root / "main.exe") as compile_native, \
+                     patch.object(runner, "command", side_effect=[
+                         RunResult("ok", 0, output, "", 0, 0) for output in batches
+                     ]) as command:
+                    run_family(runner, root, "crypto", saved=saved)
+                check.assert_called_once()
+                compile_native.assert_called_once()
+                self.assertEqual([request.args for request in command.call_args_list], [
+                    ([root / "main.exe", str(number)], root, "native-run") for number in range(3)
+                ])
+                self.assertEqual(runner.input["expected_batches"], batches)
+                self.assertEqual(runner.input["expected_stdout"], "".join(batches))
+                source = runner.input["source"]
+                self.assertEqual([line.strip() for line in source.splitlines() if line.lstrip().startswith("println ")],
+                                 [f"println observed{index};" for index in range(159)])
+                if saved is not None:
+                    self.assertEqual(runner.input, saved)
+                saved = runner.input
+
+    def test_native_other_library_fixture_source_shape_is_unchanged(self):
+        from ourosmith.native_inputs import prepare_library
+        from ourosmith.surface.library import FAMILIES
+
+        scratch = ROOT / "_build/smith/selftest"
+        scratch.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(dir=scratch) as directory:
+            root = Path(directory)
+            for family in ("strings", "data", "helpers"):
+                with self.subTest(family=family):
+                    rows = list(FAMILIES[family][0](1))
+                    prepare_library(root, family, 1)
+                    imports = "".join(f'import "{os.path.relpath(ROOT / name, root).replace(chr(92), "/")}";\n'
+                                      for name in ("std/io.ouro", "std/format.ouro", *FAMILIES[family][1]))
+                    source = imports + "\n-- @entry main\ndef main : IO Unit :=\n  do\n"
+                    source += "".join(f"     println ({expression});\n" for expression, _value in rows)
+                    source += "     exit 0\n"
+                    self.assertEqual((root / (family + ".ouro")).read_text(encoding="utf-8"), source)
+                    self.assertEqual((root / (family + ".golden")).read_bytes(),
+                                     "".join(value + "\n" for _expression, value in rows).encode("utf-8"))
 
     def test_saved_stdlib_replays_exact_oracle(self):
         from ourosmith.surface.run import SurfaceRunner
@@ -1194,16 +1719,62 @@ class HarnessTests(unittest.TestCase):
                 self.assertNotIn(key, env)
 
     def test_build_environment_preserves_visual_studio_discovery(self):
-        from ourosmith.host import environment
+        from ourosmith import host
 
-        with patch.dict(os.environ, {"PROGRAMDATA": "smith-program-data", "SMITH_FAKE_SECRET": "sentinel"}), \
-             patch("ourosmith.host.shell", return_value=Path(sys.executable)):
-            build = environment(build=True)
-            runtime = environment()
+        with (patch.dict(os.environ, {"PROGRAMDATA": "smith-program-data", "SMITH_FAKE_SECRET": "sentinel",
+                                      "OURO_C_BUILD_DIR": "smith-first"}),
+              patch.object(host, "shell", return_value=Path(sys.executable)),
+              patch.object(host, "build_config", wraps=host.build_config) as load):
+            build = host.environment(build=True)
+            with patch.dict(os.environ, {"OURO_C_BUILD_DIR": "smith-second"}):
+                next_build = host.environment(build=True)
+                runtime = host.environment()
+        self.assertEqual(load.call_count, 3)
+        for child, name in ((build, "smith-first"), (next_build, "smith-second")):
+            target = ROOT / name
+            self.assertEqual(child["OURO_C_BUILD_DIR"], target.as_posix())
+            self.assertEqual(child["OURO_HOSTED_FMT"], (target / "ouro-fmt").as_posix())
         self.assertEqual(build["PROGRAMDATA"], "smith-program-data")
         self.assertNotIn("PROGRAMDATA", runtime)
         self.assertNotIn("SMITH_FAKE_SECRET", build)
         self.assertNotIn("SMITH_FAKE_SECRET", runtime)
+
+    def test_user_test_runner_resolves_one_shell_per_launch(self):
+        from ourosmith import host
+        from ourosmith.surface import tools
+
+        def result(code=0, stdout="", stderr=""):
+            return SimpleNamespace(ok=code == 0, returncode=code, stdout=stdout, stderr=stderr)
+
+        clean = "seed4\nok case0\nok case1\n"
+        command = Mock(side_effect=[
+            result(),
+            result(stdout=clean),
+            result(),
+            result(1, clean + "FAIL broken intentional\n"),
+            result(stdout="test: ok\n"),
+            result(1, stderr="test: failed\n"),
+            result(1, "ok run ./success_test.ouro\n", "FAIL run ./failure_test.ouro\ntest: failed\n"),
+            result(1, stderr="FAIL golden\n"),
+        ])
+        run = SimpleNamespace(seed=4, command=command, require=lambda ok, step, *_details: self.assertTrue(ok, step),
+                              tool=lambda name: name, output=lambda child: child.stdout + child.stderr)
+        work = (ROOT / "_build").resolve()
+        self.assertEqual(work.parent, ROOT)
+        work.mkdir(exist_ok=True)
+        with tempfile.TemporaryDirectory(dir=work, prefix="smith-launch-") as temporary:
+            directory = Path(temporary)
+            discover = Mock(side_effect=[directory / f"shell-{i}" / "sh" for i in range(7)])
+            with patch.object(host, "shell", discover), patch.object(tools, "shell", discover):
+                tools.user_test_runner(run, directory)
+        self.assertEqual(discover.call_count, 4)
+        shell_calls = [call for call in command.call_args_list if call.args[2] in ("test-program-build", "test-runner-discovery")]
+        self.assertEqual([call.kwargs["timeout"] for call in shell_calls], [120, 120, 180])
+        for call in shell_calls:
+            sh = call.args[0][0]
+            child = call.kwargs["env"]
+            self.assertEqual(child["OURO_POSIX_SH"], sh.as_posix())
+            self.assertEqual(child["PATH"].split(os.pathsep)[1], str(sh.parent))
 
     def test_surface_evaluator_and_shrink(self):
         from ourosmith.surface import gen
@@ -1235,12 +1806,16 @@ class HarnessTests(unittest.TestCase):
 
     def test_ci_shell_environment_uses_portable_paths(self):
         from ci_gate import Gate, env_for
+        from local_scheduler import Allocation
 
         with patch.dict(os.environ, {}, clear=True):
-            env = env_for(Gate("probe", [], ("pr",), env=(("PROBE_OUT", "_build/probe"),)), ROOT / "_build/ci")
+            env = env_for(Gate("probe", [], ("pr",), env=(("PROBE_OUT", "_build/probe"),)),
+                          ROOT / "_build/ci", ROOT, Allocation(1, 3072))
         for key in ("OURO_ROOT", "OURO_CACHE_DIR", "OURO_BUILD_DIR", "OURO_C_BUILD_DIR", "OURO_CI_GATE_OUT", "PROBE_OUT", "PYTHON"):
             self.assertNotIn("\\", env[key])
         self.assertEqual(env["PYTHON"], Path(sys.executable).as_posix())
+        self.assertEqual(env["OURO_JOBS"], "1")
+        self.assertEqual(env["OURO_SCHEDULER_MEMORY_MIB"], "3072")
 
 
     def test_surface_promotion_and_cli_alias_preserve_input(self):
@@ -1279,16 +1854,19 @@ class LimitTests(unittest.TestCase):
             state = Path(f"/proc/{pid}/status").read_text()
         except (FileNotFoundError, ProcessLookupError):
             return
-        self.assertIn("State:\tZ", state)
+        self.assertRegex(state, r"(?m)^State:[ \t]+[XZ](?:[ \t]|$)")
 
     def test_posix_process_observation_handles_reaping(self):
         for error in (FileNotFoundError(), ProcessLookupError()):
             with self.subTest(error=type(error).__name__), patch.object(Path, "read_text", autospec=True, side_effect=error) as read:
                 self.assert_posix_process_exited(123)
                 read.assert_called_once_with(Path("/proc/123/status"))
-        with patch.object(Path, "read_text", autospec=True, return_value="State:\tZ (zombie)\n") as read:
-            self.assert_posix_process_exited(123)
-            read.assert_called_once_with(Path("/proc/123/status"))
+        for state in ("Z (zombie)", "X (dead)"):
+            with self.subTest(state=state), patch.object(
+                Path, "read_text", autospec=True, return_value=f"State:\t{state}\n"
+            ) as read:
+                self.assert_posix_process_exited(123)
+                read.assert_called_once_with(Path("/proc/123/status"))
         with patch.object(Path, "read_text", autospec=True, return_value="State:\tS (sleeping)\n"), self.assertRaises(AssertionError):
             self.assert_posix_process_exited(123)
         with patch.object(Path, "read_text", autospec=True, side_effect=PermissionError()), self.assertRaises(PermissionError):
@@ -1304,6 +1882,82 @@ class LimitTests(unittest.TestCase):
     def test_missing_executable(self):
         result = run_limited([str(ROOT / "_build/smith/absent-executable")], timeout_s=1, memory_mb=64)
         self.assertEqual(result.classify(), "spawn-error")
+
+    @unittest.skipUnless(os.name == "nt", "Windows shared job limits")
+    def test_shared_job_keeps_command_limit_and_aggregate_limit(self):
+        from ourosmith.windows_job import Job
+
+        for shared_memory, child_memory in ((256, 64), (64, 256)):
+            with self.subTest(shared_memory=shared_memory, child_memory=child_memory):
+                group = Job(shared_memory)
+                try:
+                    small = run_limited([sys.executable, "-c", "print('joined')"], timeout_s=10,
+                        memory_mb=child_memory, shared_job=group.name)
+                    self.assertTrue(small.ok, small)
+                    self.assertEqual(small.stdout, "joined\n")
+                    large = run_limited([sys.executable, "-c", "data = bytearray(96 * 1024 * 1024)"],
+                        timeout_s=10, memory_mb=child_memory, shared_job=group.name)
+                    self.assertEqual(large.classify(), "memory", large)
+                finally:
+                    group.close()
+
+    @unittest.skipUnless(os.name == "nt", "Windows shared job limits")
+    def test_shared_job_bounds_combined_memory_of_peer_commands(self):
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+        from ourosmith.windows_job import Job
+
+        with tempfile.TemporaryDirectory(prefix="ouro-shared-memory-") as folder:
+            group = Job(160)
+            try:
+                with ThreadPoolExecutor(max_workers=2) as pool:
+                    futures = []
+                    for index in range(2):
+                        code = ("import pathlib,time\n"
+                                f"root=pathlib.Path({folder!r})\n"
+                                f"(root / '{index}').write_text('ready')\n"
+                                "deadline=time.monotonic()+5\n"
+                                "while not all((root / str(i)).exists() for i in range(2)):\n"
+                                " if time.monotonic()>deadline: raise RuntimeError('peer did not start')\n"
+                                " time.sleep(0.01)\n"
+                                "data=bytearray(64*1024*1024)\n"
+                                "time.sleep(30)\n")
+                        futures.append(pool.submit(run_limited, [sys.executable, "-c", code],
+                            timeout_s=10, memory_mb=128, shared_job=group.name))
+                    first = next(as_completed(futures, timeout=8)).result()
+                    self.assertEqual(first.classify(), "memory", first)
+                    group.terminate()
+                    results = [future.result(timeout=5) for future in futures]
+                    self.assertTrue(all(not result.ok for result in results), results)
+            finally:
+                group.close()
+
+    @unittest.skipUnless(os.name == "nt", "Windows shared job limits")
+    def test_shared_job_termination_stops_all_running_commands(self):
+        from concurrent.futures import ThreadPoolExecutor
+        import time
+        from ourosmith.windows_job import Job
+
+        with tempfile.TemporaryDirectory(prefix="ouro-shared-job-") as folder:
+            group = Job(256)
+            try:
+                with ThreadPoolExecutor(max_workers=2) as pool:
+                    futures = []
+                    for index in range(2):
+                        marker = Path(folder) / str(index)
+                        code = f"import pathlib,time; pathlib.Path({str(marker)!r}).write_text('ready'); time.sleep(30)"
+                        futures.append(pool.submit(run_limited, [sys.executable, "-c", code],
+                            timeout_s=10, memory_mb=128, shared_job=group.name))
+                    deadline = time.monotonic() + 5
+                    while not all((Path(folder) / str(index)).exists() for index in range(2)):
+                        if time.monotonic() >= deadline:
+                            self.fail("shared commands did not start")
+                        time.sleep(0.01)
+                    group.terminate()
+                    results = [future.result(timeout=5) for future in futures]
+                    self.assertTrue(all(not result.ok for result in results), results)
+                    self.assertTrue(all(result.status == "ok" and result.returncode != 0 for result in results), results)
+            finally:
+                group.close()
 
     def test_stdin_preserves_protocol_bytes(self):
         body = "Content-Length: 2\r\n\r\n{}"
@@ -1395,12 +2049,14 @@ class LimitTests(unittest.TestCase):
 def run() -> int:
     from ourosmith.native_selftest import NativeHarnessTests
     from ourosmith.checker_fault_selftest import CheckerFaultTests
+    from ourosmith.native_inputs_test import ManifestBatchesTests
     from ourosmith.producer_selftest import ProducerTests
     from ourosmith import compiler_evidence_test
 
     suite = unittest.defaultTestLoader.loadTestsFromModule(sys.modules[__name__])
     suite.addTests(unittest.defaultTestLoader.loadTestsFromTestCase(NativeHarnessTests))
     suite.addTests(unittest.defaultTestLoader.loadTestsFromTestCase(CheckerFaultTests))
+    suite.addTests(unittest.defaultTestLoader.loadTestsFromTestCase(ManifestBatchesTests))
     suite.addTests(unittest.defaultTestLoader.loadTestsFromTestCase(ProducerTests))
     suite.addTests(unittest.defaultTestLoader.loadTestsFromModule(compiler_evidence_test))
     result = unittest.TextTestRunner(verbosity=2).run(suite)

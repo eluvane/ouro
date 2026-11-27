@@ -1,0 +1,234 @@
+-- Real OS unwinding of constructed contexts at instruction boundaries.
+-- AMD64 CONTEXT layout: Windows SDK 10.0.26100.0, winnt.h.
+-- These cases do not claim to capture asynchronous exceptions at those PCs.
+import "../compiler/native/pe.ouro",
+  "../std/string.ouro";
+
+inductive PeRecoveryAtom : Type :=
+  | PeRecoveryInstruction : X64Instruction -> PeRecoveryAtom
+  | PeRecoveryReference : X64Instruction -> PeTarget -> PeRecoveryAtom
+  | PeRecoveryMark : Nat -> PeRecoveryAtom;
+
+inductive PeRecoveryPart : Type :=
+  | PeRecoveryParts : List Nat -> List PeSymbol -> List PeFixup -> PeRecoveryPart;
+
+def pe_recovery_zero : X64Displacement := X64Forward (X64Bytes32 0 0 0 0);
+def pe_recovery_stack (offset : Nat) : X64Address := X64Base X64Rsp (X64Forward (pe_word32 offset));
+
+def pe_recovery_encode_instruction (instruction : X64Instruction) : Either PeError (List Nat) :=
+    mapLeft X64EncodeError (List Nat) PeError PeInstructionError (x64_encode instruction);
+
+def pe_recovery_encode_atom (offset : Nat) (atom : PeRecoveryAtom) : Either PeError PeRecoveryPart :=
+    match atom with
+    | PeRecoveryMark id => Right PeError PeRecoveryPart
+        (PeRecoveryParts [] ([PeNamedSymbol id PeText offset] : List PeSymbol) [])
+    | PeRecoveryInstruction instruction => mapRight PeError (List Nat) PeRecoveryPart
+        (fun (bytes : List Nat) => PeRecoveryParts bytes [] []) (pe_recovery_encode_instruction instruction)
+    | PeRecoveryReference instruction target =>
+      match pe_recovery_encode_instruction instruction with
+      | Left err => Left PeError PeRecoveryPart err
+      | Right bytes => match leb_nat 4 (length Nat bytes) with
+        | False => Left PeError PeRecoveryPart (PeInvalidFixup offset)
+        | True => Right PeError PeRecoveryPart (PeRecoveryParts bytes []
+            ([PeRel32 PeText (sub(add offset (length Nat bytes), 4)) (add offset (length Nat bytes)) target] : List PeFixup))
+        end
+      end
+    end;
+
+def pe_recovery_emit : List PeRecoveryAtom -> Nat -> Either PeError PeRecoveryPart :=
+  fix emit (atoms : List PeRecoveryAtom) (offset : Nat) : Either PeError PeRecoveryPart :=
+    match atoms with
+    | Nil => match leb_nat offset pe_max_rva with
+      | True => Right PeError PeRecoveryPart (PeRecoveryParts [] [] [])
+      | False => Left PeError PeRecoveryPart PeImageTooLarge end
+    | Cons atom rest => match pe_recovery_encode_atom offset atom with
+      | Left err => Left PeError PeRecoveryPart err
+      | Right part => match part with | PeRecoveryParts bytes symbols fixups =>
+        match andb (leb_nat offset pe_max_rva) (leb_nat (length Nat bytes) (sub pe_max_rva offset)) with
+        | False => Left PeError PeRecoveryPart PeImageTooLarge
+        | True => mapRight PeError PeRecoveryPart PeRecoveryPart
+            (fun (tail : PeRecoveryPart) => match tail with | PeRecoveryParts tail_bytes tail_symbols tail_fixups =>
+              PeRecoveryParts (append Nat bytes tail_bytes) (append PeSymbol symbols tail_symbols)
+                (append PeFixup fixups tail_fixups) end)
+            (emit rest (add offset (length Nat bytes)))
+        end end
+      end
+    end;
+
+def pe_recovery_raw (instructions : List X64Instruction) : List PeRecoveryAtom :=
+    map X64Instruction PeRecoveryAtom PeRecoveryInstruction instructions;
+def pe_recovery_join (parts : List (List PeRecoveryAtom)) : List PeRecoveryAtom :=
+    concat_map (List PeRecoveryAtom) PeRecoveryAtom (fun (part : List PeRecoveryAtom) => part) parts;
+def pe_recovery_address (reg : X64Register) (id : Nat) : List PeRecoveryAtom :=
+    [PeRecoveryReference (X64Lea reg (X64Rip pe_recovery_zero)) (PeSymbolTarget id)];
+def pe_recovery_call (id : Nat) : List PeRecoveryAtom :=
+    [PeRecoveryReference (X64CallIndirect (X64MemoryOperand (X64Rip pe_recovery_zero))) (PeImportTarget id)];
+def pe_recovery_reject (condition : X64Condition) : List PeRecoveryAtom :=
+    [PeRecoveryReference (X64JumpIf condition pe_recovery_zero) (PeSymbolTarget 3)];
+
+def pe_recovery_rbx : X64Word64 := X64Words64 (X64Bytes32 136 119 102 85) (X64Bytes32 68 51 34 17);
+def pe_recovery_r12 : X64Word64 := X64Words64 (X64Bytes32 204 187 170 153) (X64Bytes32 136 119 102 85);
+def pe_recovery_bad_rbx : X64Word64 := X64Words64 (X64Bytes32 17 17 165 165) (pe_word32 0);
+def pe_recovery_bad_r12 : X64Word64 := X64Words64 (X64Bytes32 34 34 90 90) (pe_word32 0);
+def pe_recovery_guard : X64Word64 := X64Words64 (X64Bytes32 8 25 42 59) (X64Bytes32 76 93 110 127);
+
+-- CONTEXT offsets, not encoder register IDs. All eight nonvolatile GPRs
+-- receive distinct full-width values; only RBX/R12 are changed by the target.
+def pe_recovery_canaries : List (Pair Nat X64Word64) :=
+    [ MkPair Nat X64Word64 144 pe_recovery_rbx
+    , MkPair Nat X64Word64 160 (X64Words64 (X64Bytes32 153 136 119 102) (X64Bytes32 85 68 51 34))
+    , MkPair Nat X64Word64 168 (X64Words64 (X64Bytes32 170 153 136 119) (X64Bytes32 102 85 68 51))
+    , MkPair Nat X64Word64 176 (X64Words64 (X64Bytes32 187 170 153 136) (X64Bytes32 119 102 85 68))
+    , MkPair Nat X64Word64 216 pe_recovery_r12
+    , MkPair Nat X64Word64 224 (X64Words64 (X64Bytes32 221 204 187 170) (X64Bytes32 153 136 119 102))
+    , MkPair Nat X64Word64 232 (X64Words64 (X64Bytes32 238 221 204 187) (X64Bytes32 170 153 136 119))
+    , MkPair Nat X64Word64 240 (X64Words64 (X64Bytes32 255 238 221 204) (X64Bytes32 187 170 153 136))
+    ];
+
+inductive PeRecoveryState : Type :=
+  | PeRecoveryAt : Nat -> Nat -> X64Word64 -> X64Word64 -> Bool -> PeRecoveryState;
+
+def pe_recovery_prolog_states : List PeRecoveryState :=
+    [PeRecoveryAt 0 0 pe_recovery_rbx pe_recovery_r12 False,
+     PeRecoveryAt 1 8 pe_recovery_rbx pe_recovery_r12 False,
+     PeRecoveryAt 3 16 pe_recovery_rbx pe_recovery_r12 False,
+     PeRecoveryAt 10 56 pe_recovery_rbx pe_recovery_r12 False];
+def pe_recovery_body_states : List PeRecoveryState :=
+    [PeRecoveryAt 21 56 pe_recovery_bad_rbx pe_recovery_bad_r12 True];
+def pe_recovery_epilog_states : List PeRecoveryState :=
+    [PeRecoveryAt 26 56 pe_recovery_bad_rbx pe_recovery_bad_r12 False,
+     PeRecoveryAt 33 16 pe_recovery_bad_rbx pe_recovery_bad_r12 False,
+     PeRecoveryAt 35 8 pe_recovery_bad_rbx pe_recovery_r12 False,
+     PeRecoveryAt 36 0 pe_recovery_rbx pe_recovery_r12 False];
+
+-- Entry RSP is 16-byte aligned after allocation1528. [0,64) is the
+-- eight-argument outgoing area; outputs [64,96), CONTEXT [112,1344),
+-- mock stack [1360,1488). S=[entry RSP+1432] holds the return address.
+def pe_recovery_guard_offsets : List Nat :=
+    [96, 104, 1344, 1352, 1360, 1368, 1376, 1384, 1392, 1400, 1408,
+     1440, 1448, 1456, 1464, 1472, 1480];
+
+def pe_recovery_store (offset : Nat) (word : X64Word64) : List PeRecoveryAtom :=
+    pe_recovery_raw [X64MovImm64 X64Rax word, X64Store X64Bits64 (pe_recovery_stack offset) X64Rax];
+def pe_recovery_expect (offset : Nat) (word : X64Word64) : List PeRecoveryAtom :=
+    append PeRecoveryAtom (pe_recovery_raw
+      [X64Load X64Bits64 X64Rax (pe_recovery_stack offset), X64MovImm64 X64R10 word,
+       X64ArithmeticReg X64Bits64 X64Compare X64Rax X64R10]) (pe_recovery_reject X64NotEqual);
+def pe_recovery_expect_pointer (offset : Nat) (stack : Nat) : List PeRecoveryAtom :=
+    append PeRecoveryAtom (pe_recovery_raw
+      [X64Load X64Bits64 X64Rax (pe_recovery_stack offset), X64Lea X64R10 (pe_recovery_stack stack),
+       X64ArithmeticReg X64Bits64 X64Compare X64Rax X64R10]) (pe_recovery_reject X64NotEqual);
+def pe_recovery_expect_return (offset : Nat) : List PeRecoveryAtom :=
+    pe_recovery_join [pe_recovery_address X64R10 4,
+      pe_recovery_raw [X64Load X64Bits64 X64Rax (pe_recovery_stack offset),
+        X64ArithmeticReg X64Bits64 X64Compare X64Rax X64R10], pe_recovery_reject X64NotEqual];
+
+def pe_recovery_prepare (state : PeRecoveryState) : List PeRecoveryAtom :=
+    match state with | PeRecoveryAt pc distance rbx r12 _ => pe_recovery_join
+      [ concat_map Nat PeRecoveryAtom (fun (offset : Nat) => pe_recovery_store offset pe_recovery_guard)
+          (append Nat ([64, 72, 80, 88] : List Nat) pe_recovery_guard_offsets)
+      , pe_recovery_raw [X64Lea X64Rcx (pe_recovery_stack 112)]
+      , pe_recovery_call 2
+      , pe_recovery_raw [X64MovImm32 X64Rax (X64Bytes32 3 0 16 0),
+          X64Store X64Bits32 (pe_recovery_stack 160) X64Rax]
+      , concat_map (Pair Nat X64Word64) PeRecoveryAtom (fun (canary : Pair Nat X64Word64) =>
+          match canary with | MkPair offset word => pe_recovery_store (add 112 offset) word end) pe_recovery_canaries
+      , pe_recovery_store 256 rbx, pe_recovery_store 328 r12
+      , pe_recovery_store 1416 pe_recovery_r12, pe_recovery_store 1424 pe_recovery_rbx
+      , pe_recovery_address X64Rax 4
+      , pe_recovery_raw [X64Store X64Bits64 (pe_recovery_stack 1432) X64Rax,
+          X64Lea X64Rax (pe_recovery_stack (sub 1432 distance)),
+          X64Store X64Bits64 (pe_recovery_stack 264) X64Rax]
+      , pe_recovery_address X64Rax 2
+      , pe_recovery_raw [X64ArithmeticImm32 X64Bits64 X64Add X64Rax (pe_word32 pc),
+          X64Store X64Bits64 (pe_recovery_stack 360) X64Rax]
+      ] end;
+
+def pe_recovery_lookup : List PeRecoveryAtom :=
+    pe_recovery_join
+      [ pe_recovery_raw [X64Load X64Bits64 X64Rcx (pe_recovery_stack 360),
+          X64Lea X64Rdx (pe_recovery_stack 72), X64ArithmeticReg X64Bits32 X64Xor X64R8 X64R8]
+      , pe_recovery_call 3
+      , pe_recovery_raw [X64Store X64Bits64 (pe_recovery_stack 64) X64Rax,
+          X64ArithmeticImm32 X64Bits64 X64Compare X64Rax (pe_word32 0)]
+      , pe_recovery_reject X64Equal
+      , pe_recovery_raw [X64Load X64Bits32 X64Rdx (X64Base X64Rax pe_recovery_zero)]
+      , pe_recovery_address X64R10 2
+      , pe_recovery_raw [X64Load X64Bits64 X64Rax (pe_recovery_stack 72),
+          X64ArithmeticReg X64Bits64 X64Subtract X64R10 X64Rax,
+          X64ArithmeticReg X64Bits64 X64Compare X64Rdx X64R10]
+      , pe_recovery_reject X64NotEqual
+      , pe_recovery_raw [X64Load X64Bits64 X64Rax (pe_recovery_stack 64),
+          X64Load X64Bits32 X64Rdx (X64Base X64Rax (X64Forward (pe_word32 4))),
+          X64ArithmeticImm32 X64Bits64 X64Add X64R10 (pe_word32 37),
+          X64ArithmeticReg X64Bits64 X64Compare X64Rdx X64R10]
+      , pe_recovery_reject X64NotEqual
+      ];
+
+def pe_recovery_virtual_unwind : List PeRecoveryAtom :=
+    pe_recovery_join
+      [ pe_recovery_raw
+          [X64MovImm32 X64Rcx (pe_word32 0), X64Load X64Bits64 X64Rdx (pe_recovery_stack 72),
+           X64Load X64Bits64 X64R8 (pe_recovery_stack 360), X64Load X64Bits64 X64R9 (pe_recovery_stack 64),
+           X64Lea X64Rax (pe_recovery_stack 112), X64Store X64Bits64 (pe_recovery_stack 32) X64Rax,
+           X64Lea X64Rax (pe_recovery_stack 80), X64Store X64Bits64 (pe_recovery_stack 40) X64Rax,
+           X64Lea X64Rax (pe_recovery_stack 88), X64Store X64Bits64 (pe_recovery_stack 48) X64Rax,
+           X64ArithmeticReg X64Bits32 X64Xor X64Rax X64Rax, X64Store X64Bits64 (pe_recovery_stack 56) X64Rax]
+      , pe_recovery_call 4
+      , pe_recovery_raw [X64ArithmeticImm32 X64Bits64 X64Compare X64Rax (pe_word32 0)]
+      , pe_recovery_reject X64NotEqual
+      ];
+
+def pe_recovery_check (state : PeRecoveryState) : List PeRecoveryAtom :=
+    pe_recovery_join
+      [ concat_map (Pair Nat X64Word64) PeRecoveryAtom (fun (canary : Pair Nat X64Word64) =>
+          match canary with | MkPair offset word => pe_recovery_expect (add 112 offset) word end) pe_recovery_canaries
+      , pe_recovery_expect_pointer 264 1440, pe_recovery_expect_return 360
+      , concat_map Nat PeRecoveryAtom (fun (offset : Nat) => pe_recovery_expect offset pe_recovery_guard)
+          pe_recovery_guard_offsets
+      , pe_recovery_expect 1416 pe_recovery_r12, pe_recovery_expect 1424 pe_recovery_rbx
+      , pe_recovery_expect_return 1432
+      , match state with | PeRecoveryAt _ _ _ _ body => match body with
+          | True => pe_recovery_expect_pointer 88 1376 | False => [] end end
+      ];
+
+def pe_recovery_exit (status : Nat) : List PeRecoveryAtom :=
+    pe_recovery_join [pe_recovery_raw [X64MovImm32 X64Rcx (pe_word32 status)], pe_recovery_call 1,
+      pe_recovery_raw [X64Trap]];
+
+def pe_recovery_entry (states : List PeRecoveryState) : List PeRecoveryAtom :=
+    pe_recovery_join
+      [ [PeRecoveryMark 1]
+      , pe_recovery_raw [X64ArithmeticImm32 X64Bits64 X64Subtract X64Rsp (pe_word32 1528)]
+      , concat_map PeRecoveryState PeRecoveryAtom (fun (state : PeRecoveryState) =>
+          pe_recovery_join [pe_recovery_prepare state, pe_recovery_lookup, pe_recovery_virtual_unwind,
+            pe_recovery_check state]) states
+      , [PeRecoveryMark 4], pe_recovery_exit 42
+      , [PeRecoveryMark 3], pe_recovery_exit 99
+      ];
+
+def pe_recovery_target : List X64Instruction :=
+    [X64Push X64Rbx, X64Push X64R12,
+     X64ArithmeticImm32 X64Bits64 X64Subtract X64Rsp (pe_word32 40),
+     X64MovImm32 X64Rbx (X64Bytes32 17 17 165 165), X64MovImm32 X64R12 (X64Bytes32 34 34 90 90),
+     X64MovImm32 X64Rax (pe_word32 42),
+     X64ArithmeticImm32 X64Bits64 X64Add X64Rsp (pe_word32 40),
+     X64Pop X64R12, X64Pop X64Rbx, X64Return];
+
+def pe_recovery_program (states : List PeRecoveryState) : Either PeError PeProgram :=
+    match pe_recovery_emit (pe_recovery_entry states) 0 with
+    | Left err => Left PeError PeProgram err
+    | Right entry => match entry with | PeRecoveryParts bytes symbols fixups =>
+      match mapLeft X64EncodeError (List Nat) PeError PeInstructionError (x64_encode_block pe_recovery_target) with
+      | Left err => Left PeError PeProgram err
+      | Right target => let size : Nat := length Nat bytes in
+        Right PeError PeProgram (PeProgramParts (append Nat bytes target) [] []
+          (append PeSymbol symbols ([PeNamedSymbol 2 PeText size] : List PeSymbol))
+          [PeImportLibrary (str_codes "kernel32.dll") [PeNamedImport 1 (str_codes "ExitProcess")],
+           PeImportLibrary (str_codes "ntdll.dll") [PeNamedImport 2 (str_codes "RtlCaptureContext"),
+             PeNamedImport 3 (str_codes "RtlLookupFunctionEntry"), PeNamedImport 4 (str_codes "RtlVirtualUnwind")]]
+          fixups
+          [PeCodeFunction 1 size (str_codes "unwind_entry") (PeCallFrame [] 1528),
+           PeCodeFunction 2 (length Nat target) (str_codes "saved_target") (PeCallFrame [X64Rbx, X64R12] 40)] 1)
+      end end
+    end;

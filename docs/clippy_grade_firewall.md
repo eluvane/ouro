@@ -1,17 +1,16 @@
 # Clippy-grade deny firewall
 
-Semantic proofs in this page are the `semantic` family of `ouro1 lint`.
-They use the compiler lexer/parser, canonical import resolver and a
-read-only declaration index. Language and proven style stay in the other
-lint families. `analyze` retains repository-graph and heavy structured
-cores. The Python command is an adapter for that family plus fixture and
-query flags. The separation is not yet complete: expensive clone analysis
-still lives in this family.
+The `semantic` family of `ouro1 lint` uses the compiler lexer and parser,
+import resolver, and a read-only declaration index. It includes clone
+analysis. The other lint families cover language and proven style rules.
+`analyze` also provides repository graph and structured analysis.
 
 ## Run it
 
-The user-facing command is `ouro1 lint`. The Python adapter adds rule,
-fixture, and file-inventory queries and JSON/SARIF reports:
+Run these commands from the repository root in a POSIX-compatible shell with
+the bootstrap toolchain available. Use `ouro1 lint` to lint code. The Python
+adapter also provides rule, fixture, and inventory queries and JSON and SARIF
+reports. [Build the bootstrap toolchain](getting_started.md#build-the-bootstrap-toolchain)
 
 ```sh
 sh scripts/ouro1.sh lint --deny --family semantic --profile project std
@@ -29,8 +28,8 @@ and does not decide whether a program is well typed.
 
 `strict` and `release` reject `--warn-only` and fail on deny/fatal findings.
 `project --warn-only` can report ordinary debt but cannot hide a fatal error,
-malformed registry, missing rule, or incomplete inventory. See
-[CI](ci.md#local-profiles) for focused validation commands.
+malformed registry, missing rule, or incomplete inventory. Use the
+[CI validation matrix](ci.md#validation-matrix) to select focused checks.
 
 ## Semantic boundary
 
@@ -61,7 +60,7 @@ emits `ouro.clippy-semantic.v3`. Hits never skip proofs. `semantic_registry.ouro
 contracts with canonical module/declaration or intrinsic ABI identity. A local
 same-spelled function does not inherit a standard-library contract. Unknown
 calls are effect barriers, not assumed pure. This is not a full compiler type
-check of the analyzed program and does not replace `ouro check`.
+check of the analyzed program. Use `ouro1 check` for compiler acceptance.
 
 The worker produces `ouro.clippy-semantic.v3`: exact byte-framed root source,
 complete proof count, then rule, owner, node ordinal, optional byte range, and
@@ -114,12 +113,12 @@ constructors. Explicit registered default policies and successful checked retry
 branches invalidate the unrecovered-failure proof. This is conservative local
 reasoning, not path-complete validation or interprocedural error tracking.
 
-Clone detection uses bounded compiler hashing, sorted buckets, then full
-structural token comparison. Hash equality alone never proves a clone. Only
-local binders may be alpha-renamed; global identities, literals and constructors
-remain significant. Small, unknown-purity, effectful and registered-boundary
-implementations are excluded. There is no general near-clone or wrapper-removal
-proof, and no automatic public API deletion.
+Clone detection sorts token streams by the numeric order of their normalized
+base-131 keys, then compares complete structural token streams. A key match
+alone never proves a clone. Only local binders may be alpha-renamed. Global
+identities, literals and constructors remain significant. Small, unknown-purity,
+effectful and registered-boundary implementations are excluded. There is no
+general near-clone or wrapper-removal proof, and no automatic public API deletion.
 
 ## Active rules
 
@@ -190,9 +189,8 @@ normalization and reversal join producer identities with calls in the
 same branch and effect epoch, without another expression traversal.
 Those same-operation laws require the same resolved callee; composition
 laws instead require their explicitly registered compatible operation roles.
-These are review-required suggestions; evaluation and source spans are not
-edit proofs. All twenty scalar/composition additions use `warn` in baseline
-and project and `deny` in strict and release.
+These suggestions require review. The twenty scalar and composition rules use
+`warn` in baseline and project and `deny` in strict and release.
 
 Composition proofs use the existing sorted producer/consumer join, not source
 spelling or ordinal ordering. Result/Maybe tests and defaults require known
@@ -201,6 +199,13 @@ that constructor proof remain unreported. An unused fallback is not permission
 to remove its eager evaluation. Count dominance and interval containment use
 ordered literal facts; unknown counts, inverted bounds and partial interval
 overlap do not establish those proofs.
+
+`OURO-CLIPPY-REDUNDANT-121` reports `maybe_bind` when `Nothing` rules out the
+continuation. `OURO-CLIPPY-REDUNDANT-122` reports `maybe_unwrap_or_else` on
+`Just` and `result_unwrap_or_else` on `Right`. The fallback is not invoked,
+but the expression that produces it is still evaluated. On `Nothing`, `mapMaybe`
+and `maybe` also skip their handler without requiring it to be pure. The default
+argument to `maybe` is eager on both constructors.
 
 Length-of-reversal/append findings require an unbound temporary producer.
 Existing binder facts conservatively exclude any locally bound producer,
@@ -243,7 +248,7 @@ companion is never used after a failed freshness check.
 ## Session lifetime boundary
 
 The structural worker accepts `--session SOURCE_ROOT PATH...`; the production
-lint and Clippy-grade reporter supervise these sessions. Build the worker
+lint and Clippy-grade reporter supervise these sessions. Build a C-host worker
 through `native_tool_build.py`: plain C emission without its required
 lifetime hooks is not a session-enabled tool build. The legacy single-root
 and at-most-two-root batch paths keep their existing dispatch and errors.
@@ -278,6 +283,37 @@ an oversized table ends the session with a completed prefix rather than starting
 another root with accumulated identities. The existing root-count, cache-size,
 large-source and heap limits remain additional recycling conditions. These
 limits do not reject a source or skip any requested root.
+
+The native managed worker samples `ouro.managed.allocated_requested_bytes`, a
+readonly `Runtime (Maybe Nat)` action. `Just bytes` is the current native
+allocator's requested managed-object bytes, including object headers and
+objects awaiting sweep. The counter is captured when the action executes,
+before allocating its Nat and Maybe result. Observation does not collect,
+reset accounting, walk objects or invoke user callbacks. Null or misaligned
+context storage, inconsistent empty/nonempty accounting and a missing private
+heap owner terminate with the existing runtime invariant code 73.
+
+This metric excludes private-heap overhead, raw reservations, shadow frames,
+context/descriptor storage and static data. It is neither exact reachable
+bytes nor process commit, peak memory or cumulative allocation. The C worker
+retains its required `ouro_quality_scope.h` arena-byte hook and the same
+two-Unit sample ABI. The C primitive adapter returns `Nothing`; an unhooked
+C worker reports observer unavailability and exits 1. Native requested bytes
+and C arena bytes are distinct measurements. The existing 256 MiB watermark
+and all other recycling limits remain unchanged; their numeric equality does
+not establish metric or session-memory parity.
+
+`compiler_managed_heap_observer_tests.ouro` is registered in the compiler
+suite. `frontend_host_suite.py` requires eight Windows native rows: real
+allocation/free and root retention, deferred action reuse across allocations,
+and six accounting/pointer invariant failures. Five checked helper refusals
+cover missing, axiom, extern, pointee and result contracts. Its reports pin the
+complete source closures, producer, generated source, images and raw streams;
+timeouts, memory failures and missing rows cannot satisfy the native section.
+The C IO selftest separately requires typed `Nothing` on repeated executions.
+These component checks do not replace complete structural-worker session,
+protocol, analyzer-result and resource acceptance against the actual native
+tool. Keep the C lifetime owner until those consumers have working replacements.
 
 The source root, compiled frontend and semantic options are fixed for the
 entire invocation. Mutable state is not serialized across processes or reused
@@ -398,17 +434,16 @@ that proof owns the smaller-prefix diagnostic. `COLLECTION-015` remains
 available for proven transparent wrappers outside the direct canonical API
 contract required by `PERF-016`; one pair emits only one of these findings.
 
-`tests/clippy_semantic/quality_expansion/` contains paired bad/good fixtures
-for every rule and alias, shadowing, same-spelled global, changed-wrapper,
-branch/effect, unknown and constant-input counterexamples. They are appended
-to the existing `cases.json` precision inventory and retain exact expected
-code lists. `quality_laws.ouro` calls the production producer join, checks
-one expected rule (not merely membership), and mutates types, purity, arities,
-lineage, costs, branch, epoch and producer binding independently. Its finite
-value checks call the actual stdlib on empty, singleton and longer lists;
-they are regression tests, not a universal equivalence theorem or benchmark.
-`proofs.ouro` also applies its missing/unknown/false/duplicate-evidence matrix
-to all twenty new proof kinds. None of these additions authorizes an autofix.
+`tests/clippy_semantic/quality_expansion/` contains paired bad and good fixtures
+for every rule. It also covers alias, shadowing, same-spelled global, changed
+wrapper, branch, effect, unknown and constant-input cases. The `cases.json`
+inventory records the exact expected codes. `quality_laws.ouro` checks the
+exact diagnostic from the production producer join. It independently mutates
+types, purity, arities, lineage, costs, branch, epoch, and producer binding.
+Its finite value checks call the standard library on empty, singleton, and
+longer lists.
+`proofs.ouro` checks missing, unknown, false, and duplicate evidence for all
+twenty proof kinds. These laws support review suggestions.
 
 [CI](ci.md#local-profiles) owns the required Clippy suite. Authored fixtures
 and laws do not imply a completed production run.

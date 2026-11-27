@@ -70,13 +70,15 @@ def plan_sort_view (t : CoreTerm) : PlanSortView :=
     | CStrLit _ _ => PlanNotSort
     end;
 
+private def plan_elaborate_surface (elaborate : Nat -> Surface -> List Nat -> CoreTerm)
+    (fuel : Nat) (annotation : Surface) : CoreTerm :=
+  elaborate fuel (rewrite_dummy_anns annotation) (Nil Nat);
+
 def plan_elaborate
   (lower_expr_env2 : LowerEnv -> Maybe Surface -> Expr -> Surface)
   (elaborate : Nat -> Surface -> List Nat -> CoreTerm)
   (fuel : Nat) (env : LowerEnv) (expr : Expr) : CoreTerm :=
-    elaborate fuel
-      (rewrite_dummy_anns (lower_expr_env2 env (Nothing Surface) expr))
-      (Nil Nat);
+    plan_elaborate_surface elaborate fuel (lower_expr_env2 env (Nothing Surface) expr);
 
 def build_params : List (Pair Nat Expr) -> CoreTerm -> ParamBuild :=
   fix build_params (params : List (Pair Nat Expr)) (family : CoreTerm)
@@ -425,45 +427,70 @@ def plan_extern_request (st : InternState) (metadata : List Nat) : Maybe ExternR
         end
     end;
 
-def build_definitions
+private def build_definitions_with_annotations
   (lower_expr_env2 : LowerEnv -> Maybe Surface -> Expr -> Surface)
   (elaborate : Nat -> Surface -> List Nat -> CoreTerm)
   (fuel : Nat) (env : LowerEnv) (st : InternState)
-  : List Decl -> List (Pair Nat CoreTerm) -> DefinitionBuild :=
-  fix build_definitions (decls : List Decl)
-      (cores : List (Pair Nat CoreTerm)) : DefinitionBuild :=
+  : List Decl -> List (Pair Nat CoreTerm) -> Maybe (List (Pair Nat Surface)) -> DefinitionBuild :=
+  fix build (decls : List Decl) (cores : List (Pair Nat CoreTerm))
+      (annotations : Maybe (List (Pair Nat Surface))) : DefinitionBuild :=
     match decls with
-    | Nil => DefinitionBuildOk(Nil FileItem, cores)
+    | Nil =>
+        match annotations with
+        | Just prepared =>
+            match prepared with
+            | Cons extra _ => let (MkPair name _) := extra in DefinitionBuildErr name
+            | Nil => DefinitionBuildOk(Nil FileItem, cores)
+            end
+        | Nothing => DefinitionBuildOk(Nil FileItem, cores)
+        end
     | Cons decl rest =>
         match decl with
         | DDef name ty source_body marked params =>
-            let signature : CoreTerm :=
-              plan_elaborate lower_expr_env2 elaborate fuel env ty in
-            match andb (checked_def_metadata params ty source_body)
-                (checked_def_prefix marked (length DefParam params) signature) with
-            | False => DefinitionBuildErr name
-            | True =>
-                match cores with
+            let add_definition (annotation : Surface) (next : Maybe (List (Pair Nat Surface)))
+                : DefinitionBuild :=
+              let signature : CoreTerm := plan_elaborate_surface elaborate fuel annotation in
+              match andb (checked_def_metadata params ty source_body)
+                  (checked_def_prefix marked (length DefParam params) signature) with
+              | False => DefinitionBuildErr name
+              | True =>
+                  match cores with
+                  | Nil => DefinitionBuildErr name
+                  | Cons pair core_rest =>
+                      match pair with
+                      | MkPair core_name body =>
+                          match eqNat name core_name with
+                          | False => DefinitionBuildErr name
+                          | True =>
+                              match build rest core_rest next with
+                              | DefinitionBuildErr detail => DefinitionBuildErr detail
+                              | DefinitionBuildOk built remaining =>
+                                  DefinitionBuildOk
+                                    (Cons FileItem (FDef name signature body) built)
+                                    remaining
+                              end
+                          end
+                      end
+                  end
+              end in
+            match annotations with
+            | Nothing =>
+                add_definition (lower_expr_env2 env (Nothing Surface) ty) annotations
+            | Just prepared =>
+                match prepared with
                 | Nil => DefinitionBuildErr name
-                | Cons pair core_rest =>
-                    match pair with
-                    | MkPair core_name body =>
-                        match eqNat name core_name with
+                | Cons annotated following =>
+                    match annotated with
+                    | MkPair annotation_name annotation =>
+                        match eqNat annotation_name name with
                         | False => DefinitionBuildErr name
-                        | True =>
-                            match build_definitions rest core_rest with
-                            | DefinitionBuildErr detail => DefinitionBuildErr detail
-                            | DefinitionBuildOk built remaining =>
-                                DefinitionBuildOk
-                                  (Cons FileItem (FDef name signature body) built)
-                                  remaining
-                            end
+                        | True => add_definition annotation (Just (List (Pair Nat Surface)) following)
                         end
                     end
                 end
             end
         | DAxiom name ty =>
-            match build_definitions rest cores with
+            match build rest cores annotations with
             | DefinitionBuildErr detail => DefinitionBuildErr detail
             | DefinitionBuildOk built remaining =>
                 DefinitionBuildOk
@@ -478,14 +505,14 @@ def build_definitions
               params family ctors marked with
             | IndBuildErr detail => DefinitionBuildErr detail
             | IndBuildOk ind =>
-                match build_definitions rest cores with
+                match build rest cores annotations with
                 | DefinitionBuildErr detail => DefinitionBuildErr detail
                 | DefinitionBuildOk built remaining =>
                     DefinitionBuildOk(Cons FileItem (FInd ind) built, remaining)
                 end
             end
         | DEffect _ params ops =>
-            match build_definitions(rest, drop_effect_cores ops cores) with
+            match build rest (drop_effect_cores ops cores) annotations with
             | DefinitionBuildErr detail => DefinitionBuildErr detail
             | DefinitionBuildOk built remaining =>
                 DefinitionBuildOk
@@ -494,12 +521,12 @@ def build_definitions
                     built)
                   remaining
             end
-        | DImport _ => build_definitions rest cores
+        | DImport _ => build rest cores annotations
         | DIntrinsic name ty key specialization =>
             match plan_string st key with
             | Nothing => DefinitionBuildErr name
             | Just bytes =>
-                match build_definitions rest cores with
+                match build rest cores annotations with
                 | DefinitionBuildErr detail => DefinitionBuildErr detail
                 | DefinitionBuildOk built remaining =>
                     DefinitionBuildOk
@@ -515,7 +542,7 @@ def build_definitions
             match plan_extern_request st metadata with
             | Nothing => DefinitionBuildErr name
             | Just request =>
-                match build_definitions rest cores with
+                match build rest cores annotations with
                 | DefinitionBuildErr detail => DefinitionBuildErr detail
                 | DefinitionBuildOk built remaining =>
                     DefinitionBuildOk
@@ -528,7 +555,7 @@ def build_definitions
             match plan_string st key with
             | Nothing => DefinitionBuildErr name
             | Just bytes =>
-                match build_definitions rest cores with
+                match build rest cores annotations with
                 | DefinitionBuildErr detail => DefinitionBuildErr detail
                 | DefinitionBuildOk built remaining =>
                     DefinitionBuildOk
@@ -537,6 +564,15 @@ def build_definitions
             end
         end
     end;
+
+def build_definitions
+  (lower_expr_env2 : LowerEnv -> Maybe Surface -> Expr -> Surface)
+  (elaborate : Nat -> Surface -> List Nat -> CoreTerm)
+  (fuel : Nat) (env : LowerEnv) (st : InternState)
+  : List Decl -> List (Pair Nat CoreTerm) -> DefinitionBuild :=
+    fun (decls : List Decl) (cores : List (Pair Nat CoreTerm)) =>
+      build_definitions_with_annotations lower_expr_env2 elaborate fuel env st decls cores
+        (Nothing (List (Pair Nat Surface)));
 
 def definition_names : List Decl -> List Nat :=
   fix definition_names (decls : List Decl) : List Nat :=
@@ -557,8 +593,7 @@ def definition_names : List Decl -> List Nat :=
 
 def filter_definition_cores (names : List Nat)
     : List (Pair Nat CoreTerm) -> List (Pair Nat CoreTerm) :=
-    -- Derive membership from this name list; the ordered cores remain intact.
-    -- Repeated linear membership scans retained quadratic temporary graphs.
+    -- Index membership to avoid repeated scans while preserving Core order.
     let index : EntryIndex :=
       (fix collect (remaining : List Nat) (tree : EntryIndex) : EntryIndex :=
         match remaining with
@@ -580,13 +615,13 @@ def filter_definition_cores (names : List Nat)
         end
     end;
 
-def build_check_plan
+def build_check_plan_with_annotations
   (lower_expr_env2 : LowerEnv -> Maybe Surface -> Expr -> Surface)
   (elaborate : Nat -> Surface -> List Nat -> CoreTerm)
   (fuel : Nat) (env : LowerEnv) (st : InternState) (decls : List Decl)
-  (cores : List (Pair Nat CoreTerm)) : CheckPlan :=
-    match build_definitions lower_expr_env2 elaborate fuel env st decls
-      (filter_definition_cores(definition_names decls, cores)) with
+  (cores : List (Pair Nat CoreTerm)) (annotations : Maybe (List (Pair Nat Surface))) : CheckPlan :=
+    match build_definitions_with_annotations lower_expr_env2 elaborate fuel env st decls
+      (filter_definition_cores(definition_names decls, cores)) annotations with
     | DefinitionBuildErr detail => CheckPlanErr detail
     | DefinitionBuildOk items remaining =>
         match remaining with
@@ -597,3 +632,11 @@ def build_check_plan
             end
         end
     end;
+
+def build_check_plan
+  (lower_expr_env2 : LowerEnv -> Maybe Surface -> Expr -> Surface)
+  (elaborate : Nat -> Surface -> List Nat -> CoreTerm)
+  (fuel : Nat) (env : LowerEnv) (st : InternState) (decls : List Decl)
+  (cores : List (Pair Nat CoreTerm)) : CheckPlan :=
+    build_check_plan_with_annotations lower_expr_env2 elaborate fuel env st decls cores
+      (Nothing (List (Pair Nat Surface)));

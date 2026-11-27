@@ -1,11 +1,9 @@
 # Typed bioinformatics examples
 
-These examples use the generic external-tool layer in
-[`samples/scientific/`](../scientific/README.md) to represent bioinformatics
-workflow states in ordinary Ouro types.
-
-Fixture executables keep CI self-contained. A real adapter can replace the
-executable and argument list while retaining the same typed stage boundary.
+These fixtures represent bioinformatics workflow states as Ouro types. They
+use the [external-tool layer](../scientific/README.md) to check process
+outcomes and the compatibility of declared stage inputs. The sample suite
+runs fixture executables locally.
 
 ## RNA-seq slice
 

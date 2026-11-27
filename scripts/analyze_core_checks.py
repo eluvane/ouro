@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Run analyzer core checks in order-preserving, bounded parallel processes.
 
-Windows bounds up to ten workers with one 3 GiB Job Object. POSIX remains
-serial with a 2944 MiB per-process rlimit, leaving controller slack.
+Windows bounds up to ten workers with one 3 GiB Job Object. Linux reserves
+2944 MiB per worker and parallelizes only after the shared tools are warm.
 """
 from __future__ import annotations
 
@@ -14,10 +14,26 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
+from local_scheduler import JOBS_ENV, available_memory_mib, bounded_jobs
 from ourosmith import ROOT
 from ourosmith.host import environment, job_count, shell
 from ourosmith.limits import run_limited
 from repo_support import write_json_atomic
+
+
+POSIX_WORKER_MEMORY_MIB = 2944
+POOL_CONTROLLER_MEMORY_MIB = 128
+
+
+def pool_jobs(requested: int, remaining: int) -> int:
+    jobs = min(bounded_jobs(max(1, requested)), max(1, remaining))
+    if os.name == "nt":
+        return min(10, jobs)
+    if sys.platform == "linux" and jobs > 1:
+        budget = available_memory_mib()
+        if budget is not None and budget >= POOL_CONTROLLER_MEMORY_MIB + 2 * POSIX_WORKER_MEMORY_MIB:
+            return 2
+    return 1
 
 
 def command_environment():
@@ -31,14 +47,15 @@ def command_environment():
 def run_checks(files: list[str], out: Path, jobs: int) -> dict:
     started = time.perf_counter()
     out.mkdir(parents=True, exist_ok=True)
-    jobs = min(10, max(1, jobs), max(1, len(files) - 1)) if os.name == "nt" else 1
+    jobs = pool_jobs(jobs, len(files) - 1)
     env, sh = command_environment(), shell().as_posix()
-    memory = 3072 if os.name == "nt" else 2944
+    worker_env = {**env, JOBS_ENV: "1", "OURO_JOBS": "1", "OURO_FRONTEND_JOBS": "1"}
+    memory = 3072 if os.name == "nt" else POSIX_WORKER_MEMORY_MIB
 
-    def check(item):
+    def check(item, *, child_env=env):
         index, path = item
         argv = [sh, "scripts/ouro1.sh", "check", path, "200000"]
-        result = run_limited(argv, cwd=ROOT, env=env, timeout_s=300, memory_mb=memory)
+        result = run_limited(argv, cwd=ROOT, env=child_env, timeout_s=300, memory_mb=memory)
         status = "PASS" if result.ok else "TIMEOUT" if result.status == "timeout" else "FAIL"
         log = out / f"{index:02}-{Path(path).stem}.log"
         row = {"file": path, "command": argv, "status": status,
@@ -52,17 +69,24 @@ def run_checks(files: list[str], out: Path, jobs: int) -> dict:
     # subsequent check invocations only read them and own their output logs.
     rows = [check((0, files[0]))]
     if rows[0]["status"] == "PASS":
+        if os.name != "nt" and jobs > 1:
+            c_build = ROOT / env.get("OURO_C_BUILD_DIR", "_build/c")
+            compiler = ROOT / env.get("OURO1_COMPILER", c_build / "ouro1")
+            collector = c_build / "ouro-collect"
+            if compiler.is_file() and collector.is_file():
+                worker_env.update(OURO1_COMPILER=compiler.as_posix(), OURO_PREPARED_COLLECTOR=collector.as_posix())
+            else:
+                jobs = 1
         items = list(enumerate(files[1:], 1))
         exclusive = (ROOT / "tools/analyze/drive_main.ouro").resolve()
-        # This entry checks the complete analyzer/frontend closure. On Windows,
-        # give its existing deadline CPU time without competing core checks.
-        solo = [item for item in items if os.name == "nt" and Path(item[1]).resolve() == exclusive]
+        # The complete analyzer/frontend closure needs dedicated CPU time.
+        solo = [item for item in items if (os.name == "nt" or jobs > 1) and Path(item[1]).resolve() == exclusive]
         pooled = [item for item in items if item not in solo]
         completed = {0: rows[0]}
         for item in solo:
             completed[item[0]] = check(item)
         with ThreadPoolExecutor(max_workers=jobs) as pool:
-            for item, row in zip(pooled, pool.map(check, pooled), strict=True):
+            for item, row in zip(pooled, pool.map(lambda item: check(item, child_env=worker_env), pooled), strict=True):
                 completed[item[0]] = row
         rows = [completed[index] for index in range(len(files))]
     passed = len(rows) == len(files) and all(row["status"] == "PASS" for row in rows)
@@ -82,14 +106,15 @@ def main(argv=None):
     parser.add_argument("files", nargs="+")
     args = parser.parse_args(argv)
     out = args.out.resolve()
-    jobs = min(job_count(), 10) if os.name == "nt" else 1
+    jobs = pool_jobs(job_count(), len(args.files) - 1)
     if args.worker:
         return int(not run_checks(args.files, out, jobs)["pass"])
     out.mkdir(parents=True, exist_ok=True)
     report_path = out / "report.json"
     report_path.unlink(missing_ok=True)
     command = [sys.executable, str(Path(__file__).resolve()), "--worker", "--out", out.as_posix(), *args.files]
-    result = run_limited(command, cwd=ROOT, env=command_environment(), timeout_s=1800, memory_mb=3072)
+    memory = 3072 if os.name == "nt" else POOL_CONTROLLER_MEMORY_MIB + jobs * POSIX_WORKER_MEMORY_MIB
+    result = run_limited(command, cwd=ROOT, env=command_environment(), timeout_s=1800, memory_mb=memory)
     (out / "pool.log").write_text(result.stdout + result.stderr, encoding="utf-8")
     print(result.stdout + result.stderr, end="")
     report = json.loads(report_path.read_text(encoding="utf-8")) if report_path.is_file() else {"pass": False}

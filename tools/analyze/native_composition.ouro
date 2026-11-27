@@ -1,0 +1,292 @@
+import "native_family_query.ouro",
+  "cli_flags.ouro",
+  "../native_sibling_model.ouro",
+  "../../std/listx.ouro",
+  "../../std/executable.ouro",
+  "../../std/process.ouro",
+  "../../std/processx.ouro",
+  "bounded_report.ouro";
+
+inductive NativeAnalyzeCompositionError : Type :=
+  | NativeAnalyzeBaseStatus : Nat -> NativeAnalyzeCompositionError
+  | NativeAnalyzeBaseStderr : NativeAnalyzeCompositionError
+  | NativeAnalyzeBaseReport : NativeAnalyzeCompositionError
+  | NativeAnalyzeBaseBytes : BoundedNativeReportError -> NativeAnalyzeCompositionError
+  | NativeAnalyzeFamilySelection : NativeFamilyQueryError -> NativeAnalyzeCompositionError
+  | NativeAnalyzeMissingDrive : NativeAnalyzeCompositionError
+  | NativeAnalyzeUnexpectedDrive : NativeAnalyzeCompositionError
+  | NativeAnalyzeDriveStatus : Nat -> NativeAnalyzeCompositionError
+  | NativeAnalyzeDriveReport : BoundedNativeReportError -> NativeAnalyzeCompositionError;
+
+def native_analyze_style_words : List String :=
+    ["--enable-dataflow", "--enable-metrics", "--enable-simplify", "--enable-perf", "--enable-naming"];
+
+def native_analyze_drive_words : List String :=
+    analyze_drive_option_words;
+
+def native_analyze_option_takes_value (word : String) : Bool :=
+    orb(str_eq word "--scope", str_eq word "--api-baseline");
+
+-- Option values remain literal, including a value named --enable-style.
+def native_analyze_expand_style : List String -> List String :=
+  fix expand (words : List String) : List String :=
+    match words with
+    | Nil => Nil String
+    | Cons word rest =>
+        match native_analyze_option_takes_value word with
+        | True => match rest with
+          | Nil => [word]
+          | Cons value tail => [word, value, ..expand tail]
+          end
+        | False => match str_eq word "--enable-style" with
+          | True => append String native_analyze_style_words (expand rest)
+          | False => Cons String word (expand rest)
+          end
+        end
+    end;
+
+def native_analyze_flag_present (wanted : String) : List String -> Bool :=
+  fix present (words : List String) : Bool :=
+    match words with
+    | Nil => False
+    | Cons word rest =>
+        if native_analyze_option_takes_value word then
+          match rest with | Nil => False | Cons _ more => present more end
+        else if str_eq wanted word then True else present rest
+    end;
+
+def native_analyze_needs_drive (expanded : List String) : Bool :=
+    any String (fun (word : String) => native_analyze_flag_present word expanded) native_analyze_drive_words;
+
+def native_analyze_drive_after_base (expanded : List String) (result : ProcResult) : Bool :=
+    andb(native_analyze_needs_drive expanded, notb(eq_nat (proc_code result) 2));
+
+-- These facts must come from completed source discovery, not child reports.
+inductive NativeAnalyzeSourceFacts : Type :=
+  | NativeAnalyzeSourceFactsOf : String -> Nat -> Bool -> NativeAnalyzeSourceFacts;
+
+def native_analyze_global_words : List String :=
+    analyze_global_option_words;
+
+def native_analyze_global_requested (flags : List String) : Bool :=
+    any String (fun (word : String) => native_analyze_flag_present word flags) native_analyze_global_words;
+
+def native_analyze_source_bytes (files : List NativeAnalyzeSourceFacts) : Nat :=
+    foldl NativeAnalyzeSourceFacts Nat (fun (total : Nat) (file : NativeAnalyzeSourceFacts) =>
+      match file with | NativeAnalyzeSourceFactsOf _ bytes _ => add total bytes end) Z files;
+
+def native_analyze_global_source_limit : Nat := pow_nat 2 16;
+
+def native_analyze_global_file_limit : Nat := 8;
+
+def native_analyze_global_size_valid (files : Nat) (bytes : Nat) : Bool :=
+    andb(leb_nat files native_analyze_global_file_limit,
+      leb_nat bytes native_analyze_global_source_limit);
+
+private def native_analyze_scope_small (files : List NativeAnalyzeSourceFacts) : Bool :=
+    native_analyze_global_size_valid (length NativeAnalyzeSourceFacts files)
+      (native_analyze_source_bytes files);
+
+def native_analyze_global_scope_valid (flags : List String) (files : List NativeAnalyzeSourceFacts) : Bool :=
+    orb(notb(native_analyze_global_requested flags), native_analyze_scope_small files);
+
+def native_analyze_drive_scope_valid (flags : List String) (files : List NativeAnalyzeSourceFacts) : Bool :=
+    orb(notb(native_analyze_needs_drive flags),
+      all NativeAnalyzeSourceFacts (fun (file : NativeAnalyzeSourceFacts) =>
+        match file with | NativeAnalyzeSourceFactsOf _ bytes _ => leb_nat bytes (mul 40 (mul 32 32)) end) files);
+
+def native_analyze_should_batch_by (A : Type) (flags : List String)
+    (path : A -> String) (bytes : A -> Nat) (suppressed : A -> Bool) (files : List A) : Bool :=
+    if orb(native_analyze_global_requested flags, native_analyze_flag_present "--local-only" flags) then False
+    else
+      let eligible : Bool :=
+        if any A (fun (file : A) => str_starts (path file) "std/") files then True
+        else
+          let count : Nat := length A files in
+          if ltb_nat count 2 then False
+          else if ltb_nat native_analyze_global_file_limit count then True
+          else
+            let total : Nat := foldl A Nat (fun (acc : Nat) (file : A) => add acc (bytes file)) Z files in
+            notb(native_analyze_global_size_valid count total) in
+      if eligible then notb(any A suppressed files) else False;
+
+def native_analyze_should_batch (flags : List String) (files : List NativeAnalyzeSourceFacts) : Bool :=
+    native_analyze_should_batch_by NativeAnalyzeSourceFacts flags
+      (fun (file : NativeAnalyzeSourceFacts) =>
+        match file with | NativeAnalyzeSourceFactsOf path _ _ => path end)
+      (fun (file : NativeAnalyzeSourceFacts) =>
+        match file with | NativeAnalyzeSourceFactsOf _ bytes _ => bytes end)
+      (fun (file : NativeAnalyzeSourceFacts) =>
+        match file with | NativeAnalyzeSourceFactsOf _ _ found => found end)
+      files;
+
+def native_analyze_count_keys : List String :=
+    ["files", "imports", "decls", "refs", "exports", "constructors", "modules",
+     "branches", "suppressions", "strict-diagnostics"];
+
+def native_analyze_base_counts : List String -> List String -> Maybe (List String) :=
+  fix counts (keys : List String) (words : List String) : Maybe (List String) :=
+    match keys with
+    | Nil => match words with
+      | Nil => Just (List String) (Nil String)
+      | Cons _ _ => Nothing (List String)
+      end
+    | Cons key rest => match words with
+      | Nil => Nothing (List String)
+      | Cons word tail =>
+          let? (Nothing, Just) : Maybe (List String) do
+            let value : String := (str_strip_prefix word (str_concat key "="))?;
+            (bounded_report_guard (andb(bounded_native_report_count value,
+              if str_eq key "strict-diagnostics" then str_eq value "0" else True)))?;
+            let remaining : List String := (counts rest tail)?;
+            Cons String value remaining
+          end
+      end
+    end;
+
+def native_analyze_base_line (profile : String) (files : String) (line : String) : Bool :=
+    match str_strip_prefix line (str_cat3 "ANALYZE_OK profile=" profile " ") with
+    | Nothing => False
+    | Just fields => match native_analyze_base_counts native_analyze_count_keys (str_split fields 32) with
+      | Nothing => False
+      | Just counts => match counts with
+        | Nil => False
+        | Cons count _ => andb(notb(str_eq count "0"), str_eq count files)
+        end
+      end
+    end;
+
+def native_analyze_facts_values : List (List String) -> List String -> Bool :=
+  fix fields (choices : List (List String)) (words : List String) : Bool :=
+    match choices with
+    | Nil => nullb String words
+    | Cons allowed rest => match words with
+      | Nil => False
+      | Cons word more => andb(elem String str_eq word allowed, fields rest more)
+      end
+    end;
+
+def native_analyze_base_facts (profile : String) (line : String) : Bool :=
+    match str_strip_prefix line "ANALYZE_FACTS " with
+    | Nothing => False
+    | Just fields => native_analyze_facts_values
+        [["architecture=graph"], ["suppressions=parsed"], ["deadcode=typed", "deadcode=typed-facts"],
+         ["api_surface=baseline", "api_surface=baseline-required"],
+         (if str_eq profile "strict" then ["format=strict-subset"] else ["format=facts-only", "format=opt-in"]),
+         ["trust=effects-taint-import", "trust=effects-taint-required"], ["structured=ouro-analyze-drive"]]
+        (str_split fields 32)
+    end;
+
+def native_analyze_base_tail (profile : String) (files : String) (lines : List String) : Bool :=
+    match lines with
+    | Nil => False
+    | Cons banner rest => match rest with
+      | Nil => False
+      | Cons facts more => andb(nullb String more,
+          andb(native_analyze_base_line profile files banner, native_analyze_base_facts profile facts))
+      end
+    end;
+
+def native_analyze_base_frame (profile : String) (files : String) (lines : List String) : Bool :=
+    (fix preamble (remaining : List String) (dumped : Bool) : Bool :=
+      match remaining with
+      | Nil => False
+      | Cons line rest => if str_starts line "FACT " then preamble rest True
+        else if str_starts line "FACT_SUMMARY " then native_analyze_base_tail profile files rest
+        else andb(notb dumped, native_analyze_base_tail profile files remaining)
+      end) lines False;
+
+def native_analyze_base_lines (fuel : Nat) (text : String) (offset : Nat)
+    (rev : List String) : Either BoundedNativeReportError (List String) :=
+    bounded_native_report_fold_lines (List String) (List String)
+      CaptureStdout BoundedNativeReportByteLimit (Cons String) (reverse_lin String)
+      text fuel offset rev;
+
+def native_analyze_base_verify (profile : String) (files : String) (result : ProcResult)
+    : Either NativeAnalyzeCompositionError Unit :=
+    let (MkProcResult code output errors) := result in
+    if notb(eq_nat code Z) then Left NativeAnalyzeCompositionError Unit (NativeAnalyzeBaseStatus code)
+    else if notb(str_null errors) then Left NativeAnalyzeCompositionError Unit NativeAnalyzeBaseStderr
+    else if notb(bounded_native_report_size_valid (str_len output) Z) then
+      Left NativeAnalyzeCompositionError Unit (NativeAnalyzeBaseBytes BoundedNativeReportByteLimit)
+    else match native_analyze_base_lines (str_len output) output Z (Nil String) with
+      | Left error => Left NativeAnalyzeCompositionError Unit (NativeAnalyzeBaseBytes error)
+      | Right lines =>
+          let clean : Bool := notb(any String (fun (line : String) => str_contains line "OURO-") lines) in
+          if andb(clean, native_analyze_base_frame profile files lines)
+          then Right NativeAnalyzeCompositionError Unit MkUnit
+          else Left NativeAnalyzeCompositionError Unit NativeAnalyzeBaseReport
+      end;
+
+def native_analyze_composition_verify (profile : String) (base_files : String)
+    (expected : Maybe BoundedDriveExpected) (base : ProcResult)
+    (family_query : Maybe ProcResult) (drive : Maybe ProcResult)
+    : Either NativeAnalyzeCompositionError Unit :=
+    match native_analyze_base_verify profile base_files base with
+    | Left error => Left NativeAnalyzeCompositionError Unit error
+    | Right _ => match expected with
+      | Nothing => match family_query with
+        | Just _ => Left NativeAnalyzeCompositionError Unit NativeAnalyzeUnexpectedDrive
+        | Nothing => match drive with
+          | Just _ => Left NativeAnalyzeCompositionError Unit NativeAnalyzeUnexpectedDrive
+          | Nothing => Right NativeAnalyzeCompositionError Unit MkUnit
+          end
+        end
+      | Just request => match family_query with
+        | Nothing => Left NativeAnalyzeCompositionError Unit NativeAnalyzeMissingDrive
+        | Just query => match native_family_query_observe query with
+          | Left error => Left NativeAnalyzeCompositionError Unit (NativeAnalyzeFamilySelection error)
+          | Right families =>
+              let (MkBoundedDriveExpected files wanted path) := request in
+              match wanted with
+              | Nothing => Left NativeAnalyzeCompositionError Unit NativeAnalyzeMissingDrive
+              | Just names => match str_eq names families with
+                | False => Left NativeAnalyzeCompositionError Unit
+                    (NativeAnalyzeFamilySelection NativeFamilyQueryInconsistent)
+                | True => match drive with
+                  | Nothing => Left NativeAnalyzeCompositionError Unit NativeAnalyzeMissingDrive
+                  | Just result => match bounded_native_report_verify
+                      (MkBoundedDriveExpected files (Just String families) path) result with
+                    | Left error => Left NativeAnalyzeCompositionError Unit (NativeAnalyzeDriveReport error)
+                    -- A valid report can describe findings. It is not a passing verdict.
+                    | Right _ => match eq_nat (proc_code result) Z with
+                      | False => Left NativeAnalyzeCompositionError Unit (NativeAnalyzeDriveStatus (proc_code result))
+                      | True => Right NativeAnalyzeCompositionError Unit MkUnit
+                      end
+                    end
+                  end
+                end
+              end
+          end
+        end
+      end
+    end;
+
+inductive NativeAnalyzeWorker : Type :=
+  | NativeAnalyzeBaseWorker : NativeAnalyzeWorker
+  | NativeAnalyzeDriveWorker : NativeAnalyzeWorker;
+
+def native_analyze_worker_name (worker : NativeAnalyzeWorker) : String :=
+    match worker with
+    | NativeAnalyzeBaseWorker => "ouro-analyze-base.exe"
+    | NativeAnalyzeDriveWorker => "ouro-analyze-drive.exe"
+    end;
+
+inductive NativeAnalyzeProcessError : Type :=
+  | NativeAnalyzeSiblingFailure : NativeSiblingError -> NativeAnalyzeProcessError
+  | NativeAnalyzeDirectoryFailure : ProcessDirectoryError -> NativeAnalyzeProcessError;
+
+def native_analyze_capture_at (located : Either ExecutablePathError String)
+    (limits : ProcessCaptureLimits) (directory : String) (worker : NativeAnalyzeWorker)
+    (words : List String) : IO (Either NativeAnalyzeProcessError ProcResult) :=
+    match native_sibling_command_checked located (native_analyze_worker_name worker) words with
+    | Left error => io_pure (Either NativeAnalyzeProcessError ProcResult)
+        (Left NativeAnalyzeProcessError ProcResult (NativeAnalyzeSiblingFailure error))
+    | Right command =>
+        do let! captured := process_run_spec_captured_bounded_at limits directory command;
+           io_pure (Either NativeAnalyzeProcessError ProcResult)
+             (match captured with
+             | Left error => Left NativeAnalyzeProcessError ProcResult (NativeAnalyzeDirectoryFailure error)
+             | Right result => Right NativeAnalyzeProcessError ProcResult (process_capture_proc_result result)
+             end)
+    end;

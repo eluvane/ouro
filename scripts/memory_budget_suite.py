@@ -13,7 +13,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Optional, Sequence
 
-from ourosmith.host import BUILD_MEMORY_MB
+from local_scheduler import MEMORY_ENV
+from ourosmith.host import build_memory_mib
 from ourosmith.limits import run_limited
 from repo_support import bind_relative_path, read_json_value, write_json_atomic
 
@@ -48,7 +49,6 @@ class Case:
     description: str
     blocking: bool = True
     env: dict[str, str] = field(default_factory=dict)
-    # One accepted exit code, or several when the verdict is not the point.
     expected_returncode: int | tuple[int, ...] = 0
     required_output: str | None = None
 
@@ -209,8 +209,8 @@ CASES: tuple[Case, ...] = (
             largest_production_source(),
         ],
         "every structured family over the largest production source in one native drive process",
-        # Opt-in families report on production code until the triage pass;
-        # the budget measures the process, not the verdict.
+        env={"OURO_ANALYZE_ALLOW_UNBOUNDED": "1"},
+        # Measure resource use even when the selected families report findings.
         expected_returncode=(0, 1),
         required_output="ANALYZE_DRIVE ",
     ),
@@ -278,10 +278,6 @@ def prepare_tools(cases: Sequence[Case], out: Path) -> list[dict[str, Any]]:
     if labels & {"native-check-fmt", "native-check-analyze", "native-check-analyze-drive",
                  "import-heavy-batch", "small-source", "medium-selfhost-module"}:
         tools.append(("tools/collect.ouro", "ouro-collect"))
-    if labels & {"formatter-suite", "tool-emission-fmt"}:
-        tools.append(("tools/fmt.ouro", "ouro-fmt"))
-    if "formatter-suite" in labels:
-        tools.append(("tests/quality_source_write_driver.ouro", "quality-source-write"))
     if "tool-emission-analyze" in labels or any(label.startswith("analyzer-") for label in labels):
         tools.append(("tools/analyze/main.ouro", "ouro-analyze"))
     if "analyzer-drive-largest-file" in labels:
@@ -304,23 +300,23 @@ def prepare_tools(cases: Sequence[Case], out: Path) -> list[dict[str, Any]]:
             if not target.is_absolute():
                 target = ROOT / target
             # Imported installed tools need not have a shared content-cache entry.
-            # The formatter launcher removes its image before installing it again.
             requests.extend((entry, "formatter-suite-" + name, target / name) for entry, name in (
                 ("tools/fmt.ouro", "ouro-fmt"),
                 ("tests/quality_source_write_driver.ouro", "quality-source-write"),
             ))
     reports: list[dict[str, Any]] = []
+    memory_mib = build_memory_mib()
+    env = {**os.environ, MEMORY_ENV: str(memory_mib)}
     for entry, name, target in requests:
         command = [sys.executable, "scripts/native_tool_build.py", entry,
                    str(target), "--compiler", str(compiler)]
         print(f"MEMORY_PREPARE_START {name}", flush=True)
-        result = run_limited(command, cwd=ROOT, env=os.environ,
-                             timeout_s=900, memory_mb=BUILD_MEMORY_MB)
+        result = run_limited(command, cwd=ROOT, env=env, timeout_s=900, memory_mb=memory_mib)
         log = out / f"prepare-{name}.log"
         log.write_text(result.stdout + result.stderr, encoding="utf-8")
         reports.append({"tool": name, "command": command, "status": result.classify(),
                         "returncode": result.returncode, "elapsed_s": result.elapsed_s,
-                        "memory_mb": BUILD_MEMORY_MB, "log": rel(log)})
+                        "memory_mb": memory_mib, "log": rel(log)})
         write_json_atomic(out / "preparation.json", {"pass": result.ok, "tools": reports})
         print(f"MEMORY_PREPARE_DONE {name} status={result.classify()} log={rel(log)}", flush=True)
         if not result.ok:

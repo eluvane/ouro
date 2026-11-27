@@ -240,8 +240,9 @@ def user_test_runner(run, directory):
         path = write(directory / f"{name}_test.ouro", source)
         write(path.with_suffix(".golden"), expected)
         exe = directory / (name + ".exe")
-        built = run.command([shell(), ROOT / "scripts/build_tool.sh", path, exe], ROOT, "test-program-build",
-                            env=environment(build=True), timeout=120)
+        sh = shell()
+        built = run.command([sh, ROOT / "scripts/build_tool.sh", path, exe], ROOT, "test-program-build",
+                            env=environment(build=True, shell_path=sh), timeout=120)
         run.require(built.ok, "test-program-build", "exit 0", run.output(built))
         actual = run.command([exe], directory, "test-program-run")
         run.require(actual.returncode == int(failing) and actual.stdout == expected,
@@ -253,8 +254,9 @@ def user_test_runner(run, directory):
         result = run.command([run.tool("ouro-test"), *inputs], directory, "test-runner-" + name, env=env, timeout=180)
         run.require(result.returncode == rc and fragment in result.stdout + result.stderr,
                     "test-runner-" + name, {"exit_code": rc, "message": fragment}, run.output(result))
-    discovered = run.command([shell(), ROOT / "scripts/ouro1.sh", "test"], directory,
-                             "test-runner-discovery", env=environment(build=True), timeout=180)
+    sh = shell()
+    discovered = run.command([sh, ROOT / "scripts/ouro1.sh", "test"], directory,
+                             "test-runner-discovery", env=environment(build=True, shell_path=sh), timeout=180)
     expected_failure = "FAIL run ./failure_test.ouro\ntest: failed\n"
     run.require(discovered.returncode == 1 and discovered.stdout == "ok run ./success_test.ouro\n"
                 and discovered.stderr == expected_failure,

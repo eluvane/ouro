@@ -1,41 +1,44 @@
 # Surface syntax
 
-This page describes the source forms accepted by the current toolchain.
-[Stability](stability.md) owns the pre-1.0 compatibility policy.
+Look up source forms accepted by the toolchain. See the
+[pre-1.0 compatibility policy](stability.md) when upgrading existing code.
 
 ## Modules and imports
 
-Source files are modules. Imports use paths relative to the importing file:
+Each source file is a module. Resolve import paths from the directory
+containing the importing file. In these examples, `std/` paths assume a source
+file at the repository root. Each import block is a separate example.
 
 ```ouro
-import "../std/listx.ouro";
-import "nat_lib.ouro" as N;
+import "std/listx.ouro";
+import "std/types.ouro" as N;
 ```
 
 Multiple plain paths can share a declaration, with an optional final comma
 before `;`:
 
 ```ouro
-import "../std/string.ouro", "../std/listx.ouro",;
+import "std/string.ouro", "std/listx.ouro",;
 ```
 
 The parser expands the group into ordered imports. Aliases remain on separate
-single-path declarations. [Ergonomic syntax](language/ergonomic-syntax.md#grouped-imports)
+single-path declarations. [Ergonomic syntax](language/ergonomic_syntax.md#grouped-imports)
 explains the desugaring and rejected forms.
 
 ### Import aliases
 
-An import alias qualifies declarations owned by that imported file:
+An alias qualifies declarations defined in its imported file. This excerpt
+uses the `N` alias declared above.
 
 ```ouro
-def two : N.Nat := N.S N.one;
+def two : N.Nat := N.S (N.S N.Z);
 ```
 
 A single-path import can expose chosen direct declarations, with optional
 local names and a final comma:
 
 ```ouro
-import "../std/listx.ouro" as Lists exposing (nth as at, foldl,);
+import "std/listx.ouro" as Lists exposing (nth as at, foldl,);
 ```
 
 `at` is available as a bare name and inside `open Lists in ...`;
@@ -83,10 +86,11 @@ operation metadata. Unambiguous `do` programs keep their current behavior.
 
 ### Local opens
 
-An expression can open an alias for its own subtree:
+An expression can open an alias for its own subtree. This excerpt uses the
+`N` alias declared above.
 
 ```ouro
-def three : Nat := open N in add two one;
+def one : N.Nat := open N in S Z;
 ```
 
 `open N in` selects directly owned declarations permitted by that import,
@@ -126,7 +130,7 @@ let x : A := value in body
 Short lambdas such as `fun x => body` and `fun x y => body` use an expected
 function type when available. Its parameter types can also guide nested
 callbacks and matches in the lambda body; ambiguous or missing context still
-requires an annotation. [Ergonomic syntax](language/ergonomic-syntax.md#expected-types-in-short-lambdas)
+requires an annotation. [Ergonomic syntax](language/ergonomic_syntax.md#expected-types-in-short-lambdas)
 describes the bounded rule.
 
 A local helper can put its typed parameters next to its name:
@@ -137,7 +141,7 @@ let twice (x : Nat) := add x x in twice 2
 
 This is a non-recursive lambda-binding. Parameterized local helpers require
 typed parameters; the result annotation may be omitted when the body type can
-be inferred. [Ergonomic syntax](language/ergonomic-syntax.md#typed-local-helper-declarations)
+be inferred. [Ergonomic syntax](language/ergonomic_syntax.md#typed-local-helper-declarations)
 explains their scope and desugaring.
 
 Helpers can also follow their expression:
@@ -153,13 +157,13 @@ def doubled : Nat :=
 Helpers are sequential and non-recursive. Their initializers see earlier
 helpers, while the main expression sees them all. A lambda's body extends to
 the right; use `(fun ... => ...) where ... end` to wrap the whole lambda.
-[Ergonomic syntax](language/ergonomic-syntax.md#helpers-after-an-expression)
+[Ergonomic syntax](language/ergonomic_syntax.md#helpers-after-an-expression)
 explains grouping, delimiters, and scope.
 
 Top-level definitions may use `(public => internal : Type)` to expose a call
 label distinct from the binder used in the body. A direct call can then write
 `f(public := value)` or `f(public :=)` to use an identically named local value.
-See [Named calls and public labels](language/ergonomic-syntax.md#named-calls-and-public-labels)
+See [Named calls and public labels](language/ergonomic_syntax.md#named-calls-and-public-labels)
 for the bounded call rule and compatibility with positional arguments.
 
 An expression block groups sequential pure bindings with a final expression:
@@ -174,7 +178,7 @@ let {
 
 Each binding ends with `;`; the final expression has no trailing semicolon.
 The block lowers to nested local `let ... in` expressions. See
-[Pure expression blocks](language/ergonomic-syntax.md#pure-expression-blocks)
+[Pure expression blocks](language/ergonomic_syntax.md#pure-expression-blocks)
 for scope and rejection rules.
 
 For a checked `Either E A` or `Maybe A` family, a typed fallible block can
@@ -188,12 +192,12 @@ end
 ```
 
 The header identifies the actual failure and success constructors. See
-[Typed fallible blocks](language/ergonomic-syntax.md#typed-fallible-blocks)
+[Typed fallible blocks](language/ergonomic_syntax.md#typed-fallible-blocks)
 for payload inference, boundaries, and rejection rules.
 
 For a registered `Maybe A`, `value ?? fallback` selects the payload of
 `Just` or evaluates `fallback` on `Nothing`. It binds less tightly than `|>`
-and associates to the right. See [Maybe fallback operator](language/ergonomic-syntax.md#maybe-fallback-operator)
+and associates to the right. See [Maybe fallback operator](language/ergonomic_syntax.md#maybe-fallback-operator)
 for typing and precedence.
 
 ## Inductive data and pattern matching
@@ -219,9 +223,10 @@ let { let (MkPair left _) := pair; left }
 ```
 
 This uses the same checked match as `match pair with | MkPair left right => ... end`.
-The constructor must cover the family, and the result needs an expected type
-when it cannot be inferred from the subject. See
-[checked destructuring lets](language/ergonomic-syntax.md#checked-destructuring-lets)
+The subject identifies the constructor family, which the pattern must cover.
+The compiler can infer a result type from the branch when that type does not
+depend on the bound fields. Supply an expected type if inference fails. See
+[checked destructuring lets](language/ergonomic_syntax.md#checked-destructuring-lets)
 for the exact limits.
 
 An ordinary conditional is a total expression:
@@ -276,7 +281,7 @@ A saturated call without that context can also use direct constructor field
 value types when every family parameter is marked and reliably witnessed.
 Explicit arguments remain valid; unmarked constructors and generic functions
 keep their existing explicit-argument rules. See
-[Marked constructor parameters](language/ergonomic-syntax.md#marked-constructor-parameters)
+[Marked constructor parameters](language/ergonomic_syntax.md#marked-constructor-parameters)
 for the bounded inference rule.
 
 Definitions can also opt in with leading `{A : Type}` parameters:
@@ -288,7 +293,7 @@ def explicit : Nat := identity Nat Z;
 ```
 
 Only exact saturated source calls use bounded value and expected type hints;
-explicit calls remain valid. See [Marked definition parameters](language/ergonomic-syntax.md#marked-definition-parameters).
+explicit calls remain valid. See [Marked definition parameters](language/ergonomic_syntax.md#marked-definition-parameters).
 
 Matches are constructor-based. The current implementation does not provide the
 full pattern language of a mature functional language; advanced patterns,
@@ -585,7 +590,7 @@ constructing the `Cons` spine. It allocates a new cell for each prefix value
 and reuses the tail list. A spread must be the sole final tail; it is not an
 expression outside `[...]`. One comma before `]` is optional. Nonfinal,
 multiple, or doubled-comma spreads are syntax errors. See
-[Ergonomic syntax](language/ergonomic-syntax.md#list-spreads) for the
+[Ergonomic syntax](language/ergonomic_syntax.md#list-spreads) for the
 lowering boundary.
 
 ## Records
@@ -630,9 +635,9 @@ from the subject, bind renamed fields, or support imported records.
 With an import alias, a literal annotated `A.Point` uses the record declared
 by `A`, and `A.point.x` retains `A.point` as its base. Qualified projection
 requires the value and record declaration to belong directly to that aliased
-file. A value re-exported with a record type from another file needs an
-explicit accessor call from the record's owner. An unqualified local value or
-bare record type backed by an imported record also uses that record's alias
+file. If `A` declares a value whose record type comes from another file, call
+the accessor from the file that declares the record. An unqualified local value
+or bare record type backed by an imported record also uses that record's alias
 when available. Without an alias, record sugar retains the existing short
 name when unambiguous. If a local binder or explicit use has the same short
 name, the compiler attaches an internal record-owner reference to the generated
@@ -686,13 +691,13 @@ f(x, y,)
 
 This is left-associated application; a trailing comma is optional.
 `f (x y)` still passes one argument, while `f()` is rejected. See
-[Ergonomic syntax](language/ergonomic-syntax.md#positional-parenthesized-calls)
+[Ergonomic syntax](language/ergonomic_syntax.md#positional-parenthesized-calls)
 for desugaring and compatibility details.
 
 A nonempty positional call may put its last callback in a trailing block:
 `with_value(2) { value -> add value 1 }`. This is an ordinary final lambda
 argument with one inferred binder. See
-[Trailing lambda calls](language/ergonomic-syntax.md#trailing-lambda-calls).
+[Trailing lambda calls](language/ergonomic_syntax.md#trailing-lambda-calls).
 
 The forward pipe appends its left-hand value as the final argument of the
 application on the right:
@@ -708,13 +713,19 @@ argument convention is obvious.
 
 ## IO and `do`
 
-Runnable programs export `main : IO Unit`. A `do` expression sequences actions,
-uses `let!` for an action's result, and uses ordinary `let` for a pure value:
+A standard-library IO program can declare `main : IO Unit` as its entry point.
+The backend reference lists the supported
+[managed native entry types](architecture.md#backends-and-runtime).
+
+A `do` expression sequences actions. Use `let!` for an action's result and
+ordinary `let` for a pure value.
 
 ```ouro
+import "std/io.ouro";
+
 def echo : IO Unit :=
   do let! line := readLine;
-     println line
+     println line;
 ```
 
 The pure binding requires a semicolon and a following statement. It scopes
@@ -724,6 +735,23 @@ The final statement supplies the `do` expression's result. For `IO A`, make it
 an action of type `IO A`, such as `io_pure A value` for a pure result.
 `let!` is valid only inside a `do` expression. The older `<-` binding spelling
 is not accepted by the strict project profile.
+
+Use `match!` to run one `IO` action and match its result directly:
+
+```ouro
+import "std/io.ouro";
+
+def report_env (key : String) : IO Unit :=
+  match! env_get key with
+  | Nothing => println "unset"
+  | Just value => println value
+  end;
+```
+
+This expands to `do let!` followed by an ordinary `match` on the bound
+result. The action runs once, and only the selected arm runs. Every arm must
+return an action of the same `IO` type. The ordinary pattern and coverage
+rules apply. For `Either`, write the error handling in the `Left` arm.
 
 ## Effects and handlers
 
@@ -746,8 +774,10 @@ Line comments begin with `--`:
 `-- @entry` marks a root for repository analyzers; it does not change the term's
 type.
 
-Top-level declarations end with `;`. Constructor arms inside an inductive
-declaration do not require a trailing semicolon per arm.
+Use `;` at the end of top-level declarations. It is optional after a
+definition, axiom, inductive, effect, or import without a trailing comma. A
+grouped import with a trailing comma requires `;`. Separate inductive
+constructor arms with `|`.
 
 ## Current limits
 

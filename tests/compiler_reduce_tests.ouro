@@ -3,6 +3,7 @@
 import "../compiler/file_elab_core.ouro",
   "../compiler/file_elab_lookup.ouro",
   "../std/io.ouro",
+  "compiler_startup_test_support.ouro",
   "compiler_core_test_decls.ouro";
 
 inductive ReduceTest : Type :=
@@ -12,27 +13,10 @@ def reduce_test_assert (name : String) (passed : Bool) : ReduceTest :=
     ReduceLaw name passed "expected true";
 
 def reduce_tests_run (tests : List ReduceTest) : IO Unit :=
-    (fix report (remaining : List ReduceTest) (failed : Bool) : IO Unit :=
-      match remaining with
-      | Nil =>
-          match failed with
-          | True => exit 1
-          | False => exit 0
-          end
-      | Cons law rest =>
-          match law with
-          | ReduceLaw name passed observed =>
-              do println
-                   (prim_string_concat
-                     (match passed with | True => "ok " | False => "FAIL " end)
-                     (prim_string_concat name
-                       (match passed with
-                        | True => ""
-                        | False => prim_string_concat " " observed
-                        end)));
-                 report(rest, orb(failed, notb passed))
-          end
-      end) tests False;
+    startup_test_run (map ReduceTest StartupTest
+      (fun (law : ReduceTest) =>
+        match law with | ReduceLaw name passed observed => StartupTestOf name passed observed end)
+      tests);
 
 def reduce_test_fuel : Nat := mul 50 40;
 
@@ -78,39 +62,26 @@ def reduce_normal_status (A : Type) (result : NormalizeResult A) : String :=
 def reduce_normal_expect (name : String) (result : NormalizeResult CoreTerm)
     (expected : CoreTerm) : ReduceTest :=
     ReduceLaw name
-      (match result with
-       | Normalized value => eqTerm reduce_test_fuel value expected
-       | NormalizeExhausted => False
-       | NormalizeMalformed _ => False
-       end) (reduce_normal_status CoreTerm result);
+      (if let Normalized value := result then eqTerm reduce_test_fuel value expected else False) (reduce_normal_status CoreTerm result);
 
 def reduce_normal_exhaust (A : Type) (name : String) (result : NormalizeResult A)
     : ReduceTest :=
     ReduceLaw name
-      (match result with
-       | NormalizeExhausted => True
-       | Normalized _ => False
-       | NormalizeMalformed _ => False
-       end) (reduce_normal_status A result);
+      (if let NormalizeExhausted := result then True else False) (reduce_normal_status A result);
 
 def reduce_normal_fault (A : Type) (name : String) (expected : NormalizeFault)
     (result : NormalizeResult A) : ReduceTest :=
     ReduceLaw name
-      (match result with
-       | NormalizeMalformed actual =>
-           eqNat(reduce_normal_fault_id actual, reduce_normal_fault_id expected)
-       | Normalized _ => False
-       | NormalizeExhausted => False
-       end) (reduce_normal_status A result);
+      (if let NormalizeMalformed actual := result then
+          eqNat(reduce_normal_fault_id actual, reduce_normal_fault_id expected)
+        else False) (reduce_normal_status A result);
 
 def reduce_normal_boolean (name : String) (result : NormalizeResult Bool)
     (expected : Bool) : ReduceTest :=
     ReduceLaw name
-      (match result with
-       | Normalized actual => match expected with | True => actual | False => notb actual end
-       | NormalizeExhausted => False
-       | NormalizeMalformed _ => False
-       end) (reduce_normal_status Bool result);
+      (if let Normalized actual := result then
+          match expected with | True => actual | False => notb actual end
+        else False) (reduce_normal_status Bool result);
 
 def reduce_normal_aliases (result_type : CoreTerm) (value : CoreTerm)
     : Nat -> Nat -> List Entry :=
@@ -171,16 +142,13 @@ def reduce_normal_apps : Nat -> CoreTerm -> CoreTerm :=
 
 def reduce_normal_spine_round_trip : Bool :=
     let term : CoreTerm := reduce_normal_apps(205, CConst 90) in
-    match app_spine_checked reduce_test_fuel term with
-    | NormalizeExhausted => False
-    | NormalizeMalformed _ => False
-    | Normalized spine =>
-        match spine with
-        | MkSpine head arguments =>
-            andb (eqNat(205, length CoreTerm arguments))
-              (eqTerm reduce_test_fuel (mk_app head arguments) term)
-        end
-    end;
+    if let Normalized spine := (app_spine_checked reduce_test_fuel term : NormalizeResult Spine) then
+      match spine with
+      | MkSpine head arguments =>
+          andb (eqNat(205, length CoreTerm arguments))
+            (eqTerm reduce_test_fuel (mk_app head arguments) term)
+      end
+    else False;
 
 def reduce_normal_case (scrutinee : CoreTerm) (zero_branch : CoreTerm)
     (successor_branch : CoreTerm) : CoreTerm :=
@@ -207,6 +175,11 @@ def reduce_normal_second_fix : CoreTerm :=
       (CLam(reduce_test_nat, CLam(reduce_test_nat, CRel 0)));
 
 def reduce_normal_tests : List ReduceTest :=
+    let fix_body : CoreTerm := CLam reduce_test_nat (CLam reduce_test_nat (CRel 0)) in
+    let fix_application (index : Nat) (prefix : CoreTerm) (argument : CoreTerm) : NormalizeResult CoreTerm :=
+      normalize_fix_application (fun (term : CoreTerm) => Normalized CoreTerm term)
+        1 50 index 2 (CPi reduce_test_nat (CPi reduce_test_nat reduce_test_nat)) fix_body
+        ([prefix] : List CoreTerm) argument (CRel 7) in
     [ reduce_normal_exhaust CoreTerm "normalize zero fuel has no term"
         (reduce_normal_reduce 0 reduce_test_zero)
     , reduce_normal_exhaust CoreTerm "WHNF zero fuel has no term"
@@ -315,6 +288,14 @@ def reduce_normal_tests : List ReduceTest :=
     , reduce_normal_expect "fix unfolds when its second structural argument arrives"
         (reduce_normal_reduce reduce_test_fuel
           (CApp(CApp reduce_normal_second_fix reduce_test_zero, reduce_test_zero))) reduce_test_zero
+    , reduce_normal_expect "fix selects a structural constructor from the prefix"
+        (fix_application 0 reduce_test_zero (CRel 1))
+        (CApp(CApp(fix_body, reduce_test_zero), CRel 1))
+    , reduce_normal_expect "fix selects a structural constructor from the last argument"
+        (fix_application 1 (CRel 1) reduce_test_zero)
+        (CApp(CApp(fix_body, CRel 1), reduce_test_zero))
+    , reduce_normal_expect "fix stays stuck when the selected prefix argument is neutral"
+        (fix_application 0 (CRel 1) reduce_test_zero) (CRel 7)
     , reduce_normal_fault CoreTerm "nonfunction application has a precise fault" NormalizeNonFunction
         (reduce_normal_reduce(100, CApp(CSort 0, reduce_test_zero)))
     , reduce_normal_fault CoreTerm "excess case arities have a precise fault" NormalizeCaseBranchCount
@@ -336,6 +317,14 @@ def reduce_normal_tests : List ReduceTest :=
     , reduce_normal_fault CoreTerm "out of range constructor has a precise fault" NormalizeCaseConstructor
         (reduce_normal_reduce 100
           (reduce_normal_case(CConstruct 10 9 0, reduce_test_zero, CLam(reduce_test_nat, CRel 0))))
+    , reduce_normal_fault CoreTerm "branch selection rejects a missing arity at the requested index"
+        NormalizeCaseConstructor
+        (normalize_case_branch (fun (body : CoreTerm) => Normalized CoreTerm body) 0
+          ([0] : List Nat) ([reduce_test_zero, reduce_test_true] : List CoreTerm) 1 (Nil CoreTerm))
+    , reduce_normal_fault CoreTerm "branch selection rejects a missing body at the requested index"
+        NormalizeCaseConstructor
+        (normalize_case_branch (fun (body : CoreTerm) => Normalized CoreTerm body) 0
+          ([0, 0] : List Nat) ([reduce_test_zero] : List CoreTerm) 1 (Nil CoreTerm))
     , reduce_normal_fault CoreTerm "missing constructor fields have a precise fault" NormalizeCaseArguments
         (reduce_normal_reduce 100
           (reduce_normal_case(CConstruct 10 1 0, reduce_test_zero, CLam(reduce_test_nat, CRel 0))))

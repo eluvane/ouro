@@ -1,0 +1,164 @@
+-- @entry main
+
+import "../tools/fmt_pipeline.ouro",
+  "../std/collections.ouro",
+  "../std/stringx.ouro",
+  "../std/test.ouro", "quality_fmt_test_support.ouro";
+
+def quality_fmt_expected (source : String) (expected : String) : Bool :=
+    match fmt_checked source with
+    | Left _ => False
+    | Right actual =>
+        match fmt_checked actual with
+        | Left _ => False
+        | Right again => andb(str_eq actual expected, str_eq again actual)
+        end
+    end;
+
+def quality_fmt_token_refused : String -> Bool := fmt_test_rejects_token_change;
+
+def quality_fmt_indented_literal : String :=
+    "          \"def first : Nat := add(\\n        Z,\\n     S Z,\\n   );\\n-- keep gap\\ndef second : Nat :=\\n    choose(\\n           back := Z,\\n         front := S Z\\n      );\\n\"\n";
+
+def quality_fmt_indent_bytes : Bool :=
+    let line : String := str_of_codes [32, 32, 0, 255, 13] in
+    andb (str_eq (fmt_call_indent_line [MkPair Nat Nat 1 2] 1 line) line)
+      (str_eq (fmt_call_indent_line [MkPair Nat Nat 1 4] 1 line)
+        (str_of_codes [32, 32, 32, 32, 0, 255, 13]));
+
+private def quality_fmt_snapshot_z (result : Either FmtError FmtCheckedChange) : Bool :=
+    match result with
+    | Left _ => False
+    | Right checked => match checked with
+      | FmtUnchanged => False
+      | FmtChanged snapshot =>
+          let expected : String := "def value : Nat := add(\n  Z,\n  S Z,\n);\n" in
+          let start : Nat := str_len "def value : Nat := add(\n  " in
+          if str_eq (fx_lexed_text snapshot) expected then
+            match find FxTok (fun (token : FxTok) => fx_is_word token "Z") (fx_lexed_tokens snapshot) with
+            | Nothing => False
+            | Just token => andb (fx_tok_bol token)
+                (andb (eq_nat (fx_tok_line token) 2)
+                  (andb (eq_nat (fx_tok_col token) 2)
+                    (andb (eq_nat (fx_tok_start token) start) (eq_nat (fx_tok_end token) (S start)))))
+            end
+          else False
+      end
+    end;
+
+def quality_fmt_regressions : List Test :=
+    [ assert_true "public indentation helper accepts unsorted edits"
+        (list_eq String str_eq
+          ["    first", "second", "  third", "  tail"]
+          (fmt_call_indent_lines
+            [MkPair Nat Nat 3 2, MkPair Nat Nat 1 4, MkPair Nat Nat 2 0]
+            [" first", "  second", "      third", "  tail"] 1))
+    , assert_true "public indentation helper keeps the first duplicate edit"
+        (list_eq String str_eq
+          ["    first", "second", "  third"]
+          (fmt_call_indent_lines
+            [MkPair Nat Nat 3 2, MkPair Nat Nat 1 4, MkPair Nat Nat 3 8,
+             MkPair Nat Nat 2 0, MkPair Nat Nat 1 6]
+            [" first", "  second", "      third"] 1))
+    , assert_true "unchanged or expanded indentation preserves the remaining bytes" quality_fmt_indent_bytes
+    , assert_true "a call row needs a complete prefix of spaces"
+        (let token : FxTok := MkFxTok fx_k_ident 2 3 1 2 True "x" fx_c_plain in
+          andb (fmt_call_line_start ["  x"] token)
+            (andb (notb (fmt_call_line_start [" "] token))
+              (notb (fmt_call_line_start [" \tx"] token))))
+    , assert_true "a call row needs its first token to fit on one line"
+        (andb (notb (fmt_call_line_start ["  x"]
+          (MkFxTok fx_k_ident 2 3 1 2 False "x" fx_c_plain)))
+          (notb (fmt_call_line_start ["  x"]
+            (MkFxTok fx_k_str 2 5 1 2 True "x\ny" fx_c_plain))))
+    , assert_true "operator spacing keeps the same bytes inside literals and comments"
+        (quality_fmt_expected
+          "def chosen : Nat:=Z|>S; --keep := => |>\ndef arm : Nat :=\n  match color with\n  |Red=>0\n  end;\ndef text : String := \"x:=y=>z|>w\";\n"
+          "def chosen : Nat := Z |> S; -- keep := => |>\ndef arm : Nat :=\n  match color with\n  | Red => 0\n  end;\ndef text : String := \"x:=y=>z|>w\";\n")
+    , assert_true "indented literal keeps its opening quote and escaped source bytes"
+        (quality_fmt_expected quality_fmt_indented_literal quality_fmt_indented_literal)
+    , assert_true "call-like bytes inside a raw literal keep the original layout"
+        (let source : String := "def text : String := r#\"inner(\nkeep verbatim\"#;\n" in
+          quality_fmt_expected source source)
+    , assert_eq "binary input keeps the host split result when there are no call edits"
+        (let source : String := str_cat3 "def text : String := r#\"inner(\n"
+            (str_of_codes [0]) "keep verbatim\"#;\n" in fmt_string source)
+        (let source : String := str_cat3 "def text : String := r#\"inner(\n"
+            (str_of_codes [0]) "keep verbatim\"#;\n" in str_join "\n" (str_lines source))
+    , assert_true "successive flat calls keep their own indentation"
+        (quality_fmt_expected
+          "def first : Nat := add(\n        Z,\n     S Z,\n   );\n-- keep gap\ndef second : Nat :=\n    choose(\n           back := Z,\n         front := S Z\n      );\n"
+          "def first : Nat := add(\n  Z,\n  S Z,\n);\n-- keep gap\ndef second : Nat :=\n    choose(\n      back := Z,\n      front := S Z\n    );\n")
+    , assert_true "comments and quoted token bytes survive ordered edits"
+        (quality_fmt_expected
+          "def text : String := join(\n       r#\"a,b := |> --\"#, -- keep after\n   -- before second\n       \"tab\tvalue\"\n  -- before close\n      );\n"
+          "def text : String := join(\n  r#\"a,b := |> --\"#, -- keep after\n   -- before second\n  \"tab\tvalue\"\n  -- before close\n);\n")
+    , assert_true "nested calls retain layout before a later flat call"
+        (quality_fmt_expected
+          "def nested : Nat := outer(\n      inner(\n      Z,\n      S Z,\n    ),\n  Z,\n);\n\ndef flat : Nat := add(\n      Z,\n       S Z,\n    );\n"
+          "def nested : Nat := outer(\n      inner(\n      Z,\n      S Z,\n    ),\n  Z,\n);\n\ndef flat : Nat := add(\n  Z,\n  S Z,\n);\n")
+    , assert_true "a refused closing line preserves the next call across comment lines"
+        (quality_fmt_expected
+          (str_cat3 "def first : Nat := add(\n      Z,\n    S Z,\n  ); -- keep layout\n"
+            (str_repeat "-- café\n" 64) "def later : Nat := add(\n     Z,\n      S Z,\n   );\n")
+          (str_cat3 "def first : Nat := add(\n      Z,\n    S Z,\n  ); -- keep layout\n"
+            (str_repeat "-- café\n" 64) "def later : Nat := add(\n  Z,\n  S Z,\n);\n"))
+    , assert_true "declaration parameters retain their existing layout"
+        (quality_fmt_expected
+          "def incomplete(\n    first,\n      second,\n  ) : Nat := first;\n"
+          "def incomplete(\n    first,\n      second,\n  ) : Nat := first;\n")
+    , assert_true "calls without commas retain their existing layout"
+        (quality_fmt_expected
+          "def unary : Nat := one(\n    Z\n   -- before close\n  );\n"
+          "def unary : Nat := one(\n    Z\n   -- before close\n  );\n")
+    , assert_true "unedited suffix survives the final call edit"
+        (quality_fmt_expected
+          "def value : Nat := add(\n      Z,\n    S Z,\n  );\ndef after : Nat := 0;\n-- final comment\n"
+          "def value : Nat := add(\n  Z,\n  S Z,\n);\ndef after : Nat := 0;\n-- final comment\n")
+    , assert_true "checked call normalization keeps LF output stable after CRLF and tab input"
+        (quality_fmt_expected
+          "def value : Nat := add(\r\n\tZ,\r\n    S Z\r\n   );\r\n"
+          "def value : Nat := add(\n  Z,\n  S Z\n);\n")
+    , assert_true "the snapshot after CRLF normalization has output byte offsets"
+        (quality_fmt_snapshot_z
+          (fmt_checked_change "def value : Nat := add(\r\n  Z,\r\n  S Z,\r\n);\r\n"))
+    , assert_true "the snapshot after an indentation edit has the new token column"
+        (quality_fmt_snapshot_z (fmt_checked_lexed (fx_lex_source
+          "def value : Nat := add(\n       Z,\n  S Z,\n);\n")))
+    , assert_true "mixed CR and CRLF keep their individual line boundaries"
+        (quality_fmt_expected
+          "def value : Nat :=\r  0;\r\r\n-- keep comment\r"
+          "def value : Nat :=\n  0;\n\n-- keep comment\n")
+    , assert_true "normalization keeps interior blanks and drops whitespace at EOF"
+        (quality_fmt_expected "\n\nZ\n \t\n\nx  \r\n\n\t\n" "\n\nZ\n\n\nx\n")
+    , assert_true "whitespace-only input normalizes to one LF"
+        (quality_fmt_expected " \r\n\t \n\n\r" "\n")
+    , assert_true "LF-only normalization retains bytes after NUL"
+        (let binary : String := str_of_codes [0, 255] in
+          quality_fmt_expected (str_cat3 "Z \n" binary "  \nX\t   \n\n")
+            (str_cat3 "Z\n" binary "\nX\n"))
+    , assert_true "an unmatched closer stops later call edits"
+        (quality_fmt_expected
+          "def value : Nat := add(\n      Z,\n    S Z,\n  );\n]\ndef after : Nat := add(\n      Z,\n    S Z,\n  );\n"
+          "def value : Nat := add(\n  Z,\n  S Z,\n);\n]\ndef after : Nat := add(\n      Z,\n    S Z,\n  );\n")
+    , assert_true "many flat call edits preserve every output byte"
+        (quality_fmt_expected
+          (str_repeat "def value : Nat := add(\n      Z,\n    S Z,\n   );\n" 64)
+          (str_repeat "def value : Nat := add(\n  Z,\n  S Z,\n);\n" 64))
+    , assert_true "raw CR inside a quoted token is refused"
+        (quality_fmt_token_refused "def text : String := \"a\rb\";\n")
+    , assert_true "multiline call scanning cannot mask a changed raw token"
+        (quality_fmt_token_refused
+          "def value : Nat := wrap(\n  r#\"a\rb\"#,\n  0,\n);\n")
+    , assert_true "lexed formatting compares the original raw token"
+        (let source : FxLexedSource := fx_lex_source
+           "def value : Nat := wrap(\n  r#\"a\rb\"#,\n  0,\n);\n" in
+          match fmt_checked_lexed source with
+          | Right _ => False
+          | Left error => match error with | FmtTokenChange => True | FmtUnstable => False end
+          end)
+    , assert_true "multiline literal normalization is refused"
+        (quality_fmt_token_refused "def text : String := \"a\n|Z=>0\nb\";\n")
+    ];
+
+def main : IO Unit := test_run quality_fmt_regressions;

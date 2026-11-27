@@ -6,9 +6,12 @@ import "semantic_definition.ouro",
   "semantic_collections.ouro",
   "semantic_quality.ouro",
   "structural_model.ouro",
-  "structural_frontend.ouro",
+  "structural_rules.ouro",
   "../../compiler/semantic_scope.ouro",
-  "../../compiler/source_name_index.ouro";
+  "../../compiler/source_spans.ouro",
+  "../../compiler/source_name_index.ouro",
+  "../../std/listx.ouro",
+  "../../std/natx.ouro";
 
 def cm_region_key (call : ClippyCallFact) : String :=
     prim_string_concat (prim_string_of_nat (cm_call_branch call))
@@ -19,13 +22,20 @@ def cm_work_key (call : ClippyCallFact) : String :=
       (prim_string_of_nat (cm_call_callee call)) (cm_args_key (cm_call_args call)));
 
 def cm_work_eligible (call : ClippyCallFact) : Bool :=
-    andb (all CmValue cm_value_known (cm_call_args call)) (andb (cm_call_pure call) (andb (cm_args_dynamic (cm_call_args call))
-      (andb(eq_nat(cm_call_cost call, 1), elem Nat eq_nat (cm_call_role call) [15,16,17,42,47,50]))));
+    let (CmCall _ _ _ _ role pure cost args _) := call in
+    if andb pure (eq_nat cost 1) then
+      if elem Nat eq_nat role [15,16,17,42,47,50] then
+        if all CmValue cm_value_known args then cm_args_dynamic args else False
+      else False
+    else False;
 
 def cm_traversal_eligible (call : ClippyCallFact) : Bool :=
-    andb (all CmValue cm_value_known (cm_call_args call)) (andb (cm_call_pure call) (andb (eq_nat(cm_call_cost call, 1))
-      (andb (notb (cm_value_constant (cm_last_value (cm_call_args call))))
-        (elem Nat eq_nat (cm_call_role call) [18,19,20,22,43,48]))));
+    let (CmCall _ _ _ _ role pure cost args _) := call in
+    if andb pure (eq_nat cost 1) then
+      if elem Nat eq_nat role [18,19,20,22,43,48] then
+        if all CmValue cm_value_known args then notb (cm_value_constant (cm_last_value args)) else False
+      else False
+    else False;
 
 -- Adjacent equal keys establish equal declaration, argument identities and
 -- execution region. Calls separated by effects/branches have different keys.
@@ -149,6 +159,9 @@ def cm_nested_value (call : ClippyCallFact) : CmValue :=
         end
     end;
 
+def cm_nested_producer_value (value : CmValue) : Bool :=
+    andb (notb (cm_value_io value)) (elem Nat eq_nat (cm_value_kind value) [6,7,8,16,17]);
+
 def cm_composition_proof (kind : CmProofKind) (decl : ScDecl) (owner : String)
     (outer : ClippyCallFact) (inner : ClippyCallFact)
     (outer_arity : Nat) (inner_arity : Nat) (facts : List CmEvidence)
@@ -168,8 +181,7 @@ def cm_composition_proof (kind : CmProofKind) (decl : ScDecl) (owner : String)
              (andb (eq_nat(length(CmValue, cm_call_args inner), inner_arity))
                (eq_nat(length(CmValue, cm_call_args outer), outer_arity))),
            cm_known_fact CmProducerLineage
-             (andb (elem Nat eq_nat (cm_value_kind consumed) [6,7,8])
-               (andb(notb (cm_value_io consumed), eq_nat(cm_value_id consumed, cm_call_node inner)))),
+             (andb(cm_nested_producer_value consumed, eq_nat(cm_value_id consumed, cm_call_node inner))),
            cm_known_fact CmSameRegion
              (andb (eq_nat(cm_call_branch inner, cm_call_branch outer))
                (eq_nat(cm_call_epoch inner, cm_call_epoch outer)))] facts) message);
@@ -349,8 +361,7 @@ def cm_nested_source (call : ClippyCallFact) : Nat :=
 def cm_nested_request (call : ClippyCallFact) : Bool :=
     andb (orb (cm_result_contract_role (cm_call_role call))
         (elem Nat eq_nat (cm_call_role call) [18,20,21,33,34,35,36,37,40,41,42,43,44,45,51,52,53,55,56,57,61,62]))
-      (andb (elem Nat eq_nat (cm_value_kind (cm_nested_value call)) [6,7,8])
-        (notb (cm_value_io (cm_nested_value call))));
+      (cm_nested_producer_value (cm_nested_value call));
 
 def cm_producers_at (id : Nat) : List ClippyCallFact -> List ClippyCallFact :=
   fix advance (calls : List ClippyCallFact) : List ClippyCallFact :=
@@ -368,25 +379,15 @@ def cm_bound_producers (events : List CmEvent) : List Nat :=
       ((fix go (remaining : List CmEvent) : List Nat :=
         match remaining with
         | Nil => []
-        | Cons event rest => match event with
-          | CmBindEvent binding =>
+        | Cons event rest =>
+            if let CmBindEvent binding := (event : CmEvent) then
               let value : CmValue := cm_binding_value binding in
-              match eq_nat(cm_value_kind value, 6) with
-              | True => Cons(Nat, cm_value_id value, go rest)
-              | False => go rest
-              end
-          | CmCallEvent _ => go rest
-          | CmUseEvent _ => go rest
-          | CmFlowEvent _ => go rest
-          | CmTraversalEvent _ => go rest
-          | CmRecursionEvent _ => go rest
-          | CmWrapperEvent _ => go rest
-          | CmFinding _ => go rest
-          | CmToken _ _ => go rest
-          end
+              if eq_nat(cm_value_kind value, 6) then Cons(Nat, cm_value_id value, go rest)
+              else go rest
+            else go rest
         end) events);
 
--- One sorted join serves old and collection-specific proof consumers.
+-- One sorted join serves both the built-in and collection-specific laws.
 -- The optional consumer never receives expressions or an event stream.
 def cm_nested_laws_using (decl : ScDecl) (owner : String)
     (calls : List ClippyCallFact) (bound : List Nat)
@@ -466,14 +467,13 @@ def cm_definition_proofs_using_join (unit : ClippySemanticUnit) (item : CmDefini
     (nested : ScDecl -> String -> List ClippyCallFact -> List Nat -> List CgSProof) : List CgSProof :=
     let owner : String := cm_name(cm_intern unit, sc_decl_name (cm_definition_decl item)) in
     let events : List CmEvent := cm_definition_events item in
-    let observed : List Nat := cm_flow_ids [3,4,6,9] events in
+    let (CmResultFlowIdsOf checked parsed observed) := cm_result_flow_ids events in
     let required : List CgSProof := append CgSProof
-        (cm_unobserved(cm_definition_decl item, owner, cm_flow_ids [1] events, observed, Nothing Nat))
-        (cm_unobserved_pure_parse(cm_definition_decl item, owner, cm_flow_ids [10] events, observed, Nothing Nat)) in
+        (cm_unobserved(cm_definition_decl item, owner, checked, observed, Nothing Nat))
+        (cm_unobserved_pure_parse(cm_definition_decl item, owner, parsed, observed, Nothing Nat)) in
     let paths : List CgSProof := cm_result_path_proofs
         (cm_render_proof(cm_definition_decl item, owner)) (cm_definition_decl item) events calls in
-    cm_with_locations unit item
-      (append CgSProof (append CgSProof
+    append CgSProof (append CgSProof
         (cm_findings (cm_definition_decl item) owner events)
         (append CgSProof paths
           (nested(cm_definition_decl item, owner, calls, cm_bound_producers events))))
@@ -483,7 +483,7 @@ def cm_definition_proofs_using_join (unit : ClippySemanticUnit) (item : CmDefini
           cm_work_key (filter ClippyCallFact cm_work_eligible calls))
           (cm_repeated (cm_definition_decl item) owner CmRepeatedTraversalProof
             "the same registered pure traversal is repeated with identical callee and all argument identities in one effect-free region"
-            cm_work_key (filter ClippyCallFact cm_traversal_eligible calls)))));
+            cm_work_key (filter ClippyCallFact cm_traversal_eligible calls))));
 
 -- Structural streams include signature and body. Only binder declarations
 -- and binder uses differ between exact and alpha streams.
@@ -491,28 +491,52 @@ def cm_tokens (exact : Bool) (events : List CmEvent) : List Nat :=
     (fix go (remaining : List CmEvent) : List Nat :=
       match remaining with
       | Nil => []
-      | Cons event rest => match event with
-        | CmToken alpha spelling => Cons Nat
+      | Cons event rest => if let CmToken alpha spelling := (event : CmEvent) then
+          Cons Nat
             (match exact with | True => spelling | False => alpha end) (go rest)
-        | CmCallEvent _ => go rest
-        | CmBindEvent _ => go rest
-        | CmUseEvent _ => go rest
-        | CmFlowEvent _ => go rest
-        | CmTraversalEvent _ => go rest
-        | CmRecursionEvent _ => go rest
-        | CmWrapperEvent _ => go rest
-        | CmFinding _ => go rest
-        end
+        else go rest
       end) events;
 
-def cm_hash (tokens : List Nat) : Nat :=
-    -- Local bucket key only. Decimal token framing is unambiguous, and full
-    -- structural comparison is still mandatory after the bucket hits.
-    foldl Nat Nat (fun (acc : Nat) (token : Nat) => add(mul acc 131, token)) Z tokens;
+inductive CmCloneRank : Type :=
+  | CmCloneRankOf : Nat -> List Nat -> CmCloneRank;
+
+private def cm_clone_rank_carry : Nat -> Nat -> List Nat -> List Nat :=
+  fix finish (fuel : Nat) (carry : Nat) (digits : List Nat) : List Nat :=
+    match fuel with
+    | Z => digits
+    | S rest => match carry with
+      | Z => digits
+      | S _ =>
+          let (MkPair next digit) := divmod_nat carry 131 in
+          finish rest next (Cons Nat digit digits)
+      end
+    end;
+
+-- Form the exact polynomial in base 131 to preserve proof order. Splitting
+-- the sum from the low end keeps the carry independent of token position.
+def cm_clone_rank (tokens : List Nat) : CmCloneRank :=
+    let (MkPair carry digits) := foldl Nat (Pair Nat (List Nat))
+      (fun (acc : Pair Nat (List Nat)) (token : Nat) =>
+        let (MkPair carry_in digits_in) := acc in
+        let (MkPair next digit) := divmod_nat(add token carry_in, 131) in
+        MkPair Nat (List Nat) next (Cons Nat digit digits_in))
+      (MkPair Nat (List Nat) Z []) (reverse_lin Nat tokens) in
+    let significant : List Nat := drop_while Nat (eq_nat Z)
+      (cm_clone_rank_carry carry carry digits) in
+    CmCloneRankOf (length Nat significant) significant;
+
+def cm_clone_rank_compare (left : CmCloneRank) (right : CmCloneRank) : Ordering :=
+    let (CmCloneRankOf left_len left_digits) := left in
+    let (CmCloneRankOf right_len right_digits) := right in
+    match compareNat left_len right_len with
+    | EQ => source_name_compare left_digits right_digits
+    | LT => LT
+    | GT => GT
+    end;
 
 inductive CmClone : Type :=
-  | CmCloneOf : Nat -> ScDecl -> List Nat -> List Nat -> CmClone;
-def cm_clone_hash (item : CmClone) : Nat := match item with | CmCloneOf hash _ _ _ => hash end;
+  | CmCloneOf : CmCloneRank -> ScDecl -> List Nat -> List Nat -> CmClone;
+def cm_clone_key (item : CmClone) : CmCloneRank := match item with | CmCloneOf rank _ _ _ => rank end;
 def cm_clone_owner (item : CmClone) : Nat := match item with | CmCloneOf _ owner _ _ => sc_decl_name owner end;
 def cm_clone_decl (item : CmClone) : ScDecl :=
     match item with | CmCloneOf _ decl _ _ => decl end;
@@ -520,7 +544,7 @@ def cm_clone_alpha (item : CmClone) : List Nat := match item with | CmCloneOf _ 
 def cm_clone_exact (item : CmClone) : List Nat := match item with | CmCloneOf _ _ _ exact => exact end;
 
 def cm_clone_le (a : CmClone) (b : CmClone) : Bool :=
-    match compareNat(cm_clone_hash a, cm_clone_hash b) with
+    match cm_clone_rank_compare(cm_clone_key a, cm_clone_key b) with
     | LT => True | GT => False
     | EQ => match source_name_compare(cm_clone_alpha a, cm_clone_alpha b) with
       | LT => True | EQ => True | GT => False end
@@ -543,14 +567,7 @@ def cm_clone_call_known (apis : CmApiIndex) (call : ClippyCallFact) : Bool :=
 -- clone eligibility proof needs neither another API lookup nor the rest of
 -- the call list. The definition's complete semantic visit already happened.
 def cm_clone_calls_known (apis : CmApiIndex) : List ClippyCallFact -> Bool :=
-  fix go (calls : List ClippyCallFact) : Bool :=
-    match calls with
-    | Nil => True
-    | Cons call rest => match cm_clone_call_known apis call with
-      | False => False
-      | True => go rest
-      end
-    end;
+  all ClippyCallFact (cm_clone_call_known apis);
 
 -- These are eligibility checks, not truncated analysis. Every selected
 -- candidate still retains and compares its complete alpha and exact streams.
@@ -566,44 +583,35 @@ def cm_has_tokens (needed : Nat) (events : List CmEvent) : Bool :=
     | Z => True
     | S less => match pending with
       | Nil => False
-      | Cons event rest => match event with
-        | CmToken _ _ => go rest less
-        | CmCallEvent _ => go rest remaining
-        | CmBindEvent _ => go rest remaining
-        | CmUseEvent _ => go rest remaining
-        | CmFlowEvent _ => go rest remaining
-        | CmTraversalEvent _ => go rest remaining
-        | CmRecursionEvent _ => go rest remaining
-        | CmWrapperEvent _ => go rest remaining
-        | CmFinding _ => go rest remaining
-        end
+      | Cons event rest => if let CmToken _ _ := (event : CmEvent) then go rest less else go rest remaining
       end
     end) events needed;
 
 def cm_clone_candidate (unit : ClippySemanticUnit) (apis : CmApiIndex)
     (item : CmDefinition) (calls : List ClippyCallFact) : List CmClone :=
-    let decl : ScDecl := cm_definition_decl item in
-    let boundary : Bool := orb (cm_contract_policy (cm_contract_for unit decl))
-      (orb(cm_boundary unit decl 1, cm_boundary unit decl 3)) in
-    match boundary with
-    | True => []
-    | False => match cm_has_two_calls calls with
-      | False => []
-      | True => match cm_clone_calls_known apis calls with
+    match cm_has_two_calls calls with
+    | False => []
+    | True =>
+      let decl : ScDecl := cm_definition_decl item in
+      let boundary : Bool := if cm_definition_has_policy unit apis decl then True
+        else if cm_boundary unit decl 1 then True else cm_boundary unit decl 3 in
+      match boundary with
+      | True => []
+      | False => match cm_clone_calls_known apis calls with
         | False => []
         | True => match cm_has_tokens(120, cm_definition_events item) with
           | False => []
           | True =>
               let alpha : List Nat := cm_tokens(False, cm_definition_events item) in
-              [CmCloneOf (cm_hash alpha) decl alpha
+              [CmCloneOf (cm_clone_rank alpha) decl alpha
                 (cm_tokens(True, cm_definition_events item))]
           end
         end
       end
     end;
 
--- Cheap hashes choose a bucket; full comparison occurs only in that bucket.
--- Sorting full streams inside hash collisions keeps equal streams adjacent
+-- The rank chooses a bucket; full comparison occurs only in that bucket.
+-- Sorting full streams inside rank collisions keeps equal streams adjacent
 -- without a global N-squared pairwise comparison or lossy collision handling.
 def cm_duplicate_proofs (unit : ClippySemanticUnit) : List CmClone -> List CgSProof :=
   fix go (clones : List CmClone) : List CgSProof :=
@@ -611,9 +619,9 @@ def cm_duplicate_proofs (unit : ClippySemanticUnit) : List CmClone -> List CgSPr
     | Nil => []
     | Cons first rest => match rest with
       | Nil => []
-      | Cons second _ => match eq_nat(cm_clone_hash first, cm_clone_hash second) with
-        | False => go rest
-        | True => match source_name_compare(cm_clone_alpha first, cm_clone_alpha second) with
+      | Cons second _ => match cm_clone_rank_compare(cm_clone_key first, cm_clone_key second) with
+        | LT => go rest | GT => go rest
+        | EQ => match source_name_compare(cm_clone_alpha first, cm_clone_alpha second) with
           | LT => go rest | GT => go rest
           | EQ =>
               let kind : String := match source_name_compare(cm_clone_exact first, cm_clone_exact second) with
@@ -635,34 +643,37 @@ def cm_duplicate_proofs (unit : ClippySemanticUnit) : List CmClone -> List CgSPr
 -- definition's event graph. Reverse once to preserve declaration order and
 -- the stable tie order of equal clone keys. No output is emitted until the
 -- entire fold succeeds, so a late failure cannot publish partial findings.
-def cm_fold_definition_proofs (unit : ClippySemanticUnit) (apis : CmApiIndex)
+def cm_fold_root_proofs (unit : ClippySemanticUnit) (apis : CmApiIndex)
     : List ScDecl -> List (List CgSProof) -> List CmClone
-    -> Either QualityInputError (List CgSProof) :=
+    -> CgSSpanCache -> Either QualityInputError (Pair (List CgSProof) CgSSpanCache) :=
   fix go (decls : List ScDecl) (chunks : List (List CgSProof)) (clones : List CmClone)
-      : Either QualityInputError (List CgSProof) :=
+      (cache : CgSSpanCache) : Either QualityInputError (Pair (List CgSProof) CgSSpanCache) :=
     match decls with
-    | Nil => Right QualityInputError (List CgSProof)
-        (append CgSProof
-          (concat_map (List CgSProof) CgSProof (fun (chunk : List CgSProof) => chunk)
-            (reverse_lin(List CgSProof, chunks)))
-          (cm_duplicate_proofs unit (quality_sort CmClone cm_clone_le
-            (reverse_lin CmClone clones))))
+    | Nil => Right QualityInputError (Pair (List CgSProof) CgSSpanCache)
+        (MkPair (List CgSProof) CgSSpanCache
+          (append CgSProof
+            (concat_map (List CgSProof) CgSProof (fun (chunk : List CgSProof) => chunk)
+              (reverse_lin(List CgSProof, chunks)))
+            (cm_duplicate_proofs unit (quality_sort CmClone cm_clone_le
+              (reverse_lin CmClone clones)))) cache)
     | Cons decl rest => match cm_build_definition unit apis decl with
-      | Left error => Left QualityInputError (List CgSProof) error
+      | Left error => Left QualityInputError (Pair (List CgSProof) CgSSpanCache) error
       | Right selected => match selected with
-        | Nothing => go rest chunks clones
+        | Nothing => go rest chunks clones cache
         | Just item =>
             let calls : List ClippyCallFact := cm_calls (cm_definition_events item) in
             let proofs : List CgSProof := cm_definition_proofs_using_join unit item calls
                 (cm_collection_laws_with_bindings apis) in
-            let candidates : List CmClone := cm_clone_candidate unit apis item calls in
-            let next_chunks : List (List CgSProof) := match proofs with
-              | Nil => chunks
-              | Cons _ _ => Cons (List CgSProof) proofs chunks end in
-            go rest next_chunks
-              (foldl CmClone (List CmClone)
-                (fun (acc : List CmClone) (candidate : CmClone) =>
-                  Cons CmClone candidate acc) clones candidates)
+            let next_clones : List CmClone := foldl CmClone (List CmClone)
+                (fun (acc : List CmClone) (candidate : CmClone) => Cons CmClone candidate acc)
+                clones (cm_clone_candidate unit apis item calls) in
+            match proofs with
+            | Nil => go rest chunks next_clones cache
+            | Cons _ _ =>
+                let spans : Maybe CgSSourceSpans := cg_s_root_span_map (cm_source unit) cache in
+                let located : List CgSProof := cg_s_locate spans (cm_definition_spans item) proofs in
+                go rest (Cons (List CgSProof) located chunks) next_clones (CgSSpansReady spans)
+            end
         end
       end
     end;
@@ -671,17 +682,15 @@ def cm_fold_definition_proofs (unit : ClippySemanticUnit) (apis : CmApiIndex)
 def cm_contract_inventory_checked : Either QualityInputError Unit :=
     cm_validate_contracts cm_contracts;
 
-def cm_semantic_proofs (unit : ClippySemanticUnit) : Either QualityInputError (List CgSProof) :=
+def cm_semantic_proofs (unit : ClippySemanticUnit)
+    : Either QualityInputError (Pair (List CgSProof) CgSSpanCache) :=
     match cm_contract_inventory_checked with
-    | Left error => Left QualityInputError (List CgSProof) error
-    | Right _ => match cm_validate_contract_bindings unit cm_contracts with
-      | Left error => Left QualityInputError (List CgSProof) error
-      | Right _ => match cm_build_apis(unit, cm_index unit) with
-      | Left error => Left QualityInputError (List CgSProof) error
+    | Left error => Left QualityInputError (Pair (List CgSProof) CgSSpanCache) error
+    | Right _ => match cm_build_checked_apis unit with
+      | Left error => Left QualityInputError (Pair (List CgSProof) CgSSpanCache) error
       | Right initial_apis =>
         let summaries : CsAnalysis := cs_analyze unit initial_apis cm_visit_fuel cm_analyze_depth in
         let apis : CmApiIndex := cs_cache summaries in
-        cm_fold_definition_proofs unit apis (cm_declarations unit) [] []
-      end
+        cm_fold_root_proofs unit apis (cm_declarations unit) [] [] CgSSpansPending
       end
     end;

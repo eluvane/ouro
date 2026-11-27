@@ -1,0 +1,159 @@
+import "source_debug_map.ouro", "managed_stdio_compile.ouro", "../driver.ouro";
+
+inductive NativeDebugCompilation : Type :=
+  | NativeDebugCompilationOf : SourceOriginCompilation -> Either NativeSourceError NativeImage
+      -> Either NativeDebugError NativeSourceMap -> NativeDebugCompilation;
+
+def native_debug_build_managed (fuel : Nat) (entry : Nat) (program : CheckedProgram) (types : List Nat)
+    : Either NativeLowerError (Pair ManagedProgramParts (List NativeFunctionOrigin)) :=
+    lower_bind ManagedSourcePlan (Pair ManagedProgramParts (List NativeFunctionOrigin))
+      (managed_prepare_rechecked fuel entry program types)
+      (fun (plan : ManagedSourcePlan) => match plan with | ManagedSourcePlanOf compiler contracts _ _ _ =>
+        lower_bind (List MirFunction) (Pair ManagedProgramParts (List NativeFunctionOrigin))
+          (lower_functions_indexed fuel (managed_compiler_program compiler) (managed_compiler_environment compiler)
+            contracts contracts)
+          (managed_finish_plan_with_origins
+            (fun (work : Unit -> Either NativeLowerError ManagedState) => work MkUnit) fuel plan)
+        end);
+
+private def native_debug_managed_rechecked (limits : MirLimits) (entry : Nat)
+    (rechecked : NativeRecheckedProgram)
+    : Either NativeSourceError (Pair NativeLoweredProgram (List NativeFunctionOrigin)) :=
+    let fuel : Nat := native_rechecked_fuel rechecked in
+    let checked : CheckedProgram := native_rechecked_program rechecked in
+    match checked_program_type_globals_indexed source_normalize_indexed fuel checked with
+    | CErr error => Left NativeSourceError (Pair NativeLoweredProgram (List NativeFunctionOrigin)) (NativeSourceCheckError error)
+    | COk types => match native_debug_build_managed fuel entry checked types with
+      | Left error => Left NativeSourceError (Pair NativeLoweredProgram (List NativeFunctionOrigin)) (NativeSourceLowerError error)
+      | Right built => match built with | MkPair parts origins => match managed_validate_parts limits parts with
+        | Left error => Left NativeSourceError (Pair NativeLoweredProgram (List NativeFunctionOrigin)) (NativeSourceLowerError error)
+        | Right lowered => Right NativeSourceError (Pair NativeLoweredProgram (List NativeFunctionOrigin))
+            (MkPair NativeLoweredProgram (List NativeFunctionOrigin) lowered origins)
+        end end
+      end
+    end;
+
+def native_debug_managed_checked (fuel : Nat) (limits : MirLimits) (entry : Nat) (input : CheckedProgram)
+    : Either NativeSourceError (Pair NativeLoweredProgram (List NativeFunctionOrigin)) :=
+    match native_prepare_rechecked_program fuel input with
+    | Left error => Left NativeSourceError (Pair NativeLoweredProgram (List NativeFunctionOrigin)) (NativeSourceLowerError error)
+    | Right rechecked => native_debug_managed_rechecked limits entry rechecked
+    end;
+
+def native_debug_scalar_rows (lowered : NativeLoweredProgram) : List NativeFunctionOrigin :=
+    match lowered with | NativeLoweredOf _ contracts mir => match mir with | MirProgramDef functions _ _ _ =>
+      let indexed : Pair EntryIndex EntryIndex :=
+        (fix collect (remaining : List LowerContract) (seen : EntryIndex) (duplicates : EntryIndex)
+            : Pair EntryIndex EntryIndex :=
+          match remaining with
+          | Nil => MkPair EntryIndex EntryIndex seen duplicates
+          | Cons contract rest => match contract with | LowerContractOf id _ _ _ binding =>
+            match binding with
+            | Just _ => collect rest seen duplicates
+            | Nothing => match entry_index_lookup id seen with
+              | Nothing => collect rest (entry_index_reserve id seen) duplicates
+              | Just _ => collect rest seen (entry_index_reserve id duplicates)
+              end
+            end end
+          end) contracts EntryIndexEmpty EntryIndexEmpty in
+      match indexed with | MkPair seen duplicates =>
+      map MirFunction NativeFunctionOrigin (fun (function : MirFunction) =>
+        let symbol : Nat := mir_function_id function in
+        NativeFunctionOriginOf symbol
+          (match entry_index_lookup symbol duplicates with
+           | Just _ => NativeFunctionUnknown
+           | Nothing => match entry_index_lookup symbol seen with
+             | Just _ => NativeFunctionSource symbol False
+             | Nothing => NativeFunctionUnknown
+             end
+           end)) functions
+      end end end;
+
+private def native_debug_scalar_result (result : Either NativeSourceError NativeLoweredProgram)
+    : Either NativeSourceError (Pair NativeLoweredProgram (List NativeFunctionOrigin)) :=
+    match result with
+    | Left error => Left NativeSourceError (Pair NativeLoweredProgram (List NativeFunctionOrigin)) error
+    | Right lowered => Right NativeSourceError (Pair NativeLoweredProgram (List NativeFunctionOrigin))
+        (MkPair NativeLoweredProgram (List NativeFunctionOrigin) lowered (native_debug_scalar_rows lowered))
+    end;
+
+def native_debug_lower_auto (fuel : Nat) (limits : MirLimits) (entry : Nat) (checked : CheckedProgram)
+    : Either NativeSourceError (Pair NativeLoweredProgram (List NativeFunctionOrigin)) :=
+    native_lower_auto_with (Pair NativeLoweredProgram (List NativeFunctionOrigin)) fuel checked
+      (native_debug_managed_rechecked limits entry)
+      (fun (rechecked : NativeRecheckedProgram) =>
+        native_debug_scalar_result (native_scalar_lower_rechecked limits entry rechecked));
+
+-- PE-only runtime functions carry no declaration parent.
+def native_debug_image_origins (lowered : NativeLoweredProgram) (image : NativeImage)
+    (origins : List NativeFunctionOrigin) : List NativeFunctionOrigin :=
+    match lowered with | NativeLoweredOf _ _ mir => match mir with | MirProgramDef functions _ _ _ =>
+      let mir_symbols : EntryIndex := foldl MirFunction EntryIndex
+        (fun (index : EntryIndex) (function : MirFunction) => entry_index_reserve (mir_function_id function) index)
+        EntryIndexEmpty functions in
+      match image with | NativeImageOf pe _ => match pe with | PeImageFile _ addresses =>
+        append NativeFunctionOrigin origins
+          (map PeFunctionAddress NativeFunctionOrigin (fun (address : PeFunctionAddress) =>
+            NativeFunctionOriginOf (native_debug_address_id address) NativeFunctionUnknown)
+            (filter PeFunctionAddress (fun (address : PeFunctionAddress) =>
+              match entry_index_lookup (native_debug_address_id address) mir_symbols with
+              | Nothing => True | Just _ => False end) addresses))
+        end end
+      end end;
+
+def native_debug_emit (limits : MirLimits) (lowered : Pair NativeLoweredProgram (List NativeFunctionOrigin))
+    : Either NativeSourceError (Pair NativeImage (List NativeFunctionOrigin)) :=
+    match lowered with | MkPair program origins => match native_emit_image limits program with
+      | Left error => Left NativeSourceError (Pair NativeImage (List NativeFunctionOrigin)) error
+      | Right image => Right NativeSourceError (Pair NativeImage (List NativeFunctionOrigin))
+          (MkPair NativeImage (List NativeFunctionOrigin) image (native_debug_image_origins program image origins))
+      end end;
+
+def native_debug_compile_packet (fuel : Nat) (limits : MirLimits) (entry_name : List Nat)
+    (packet : CheckedSourcePacket) : Either NativeSourceError (Pair NativeImage (List NativeFunctionOrigin)) :=
+    let checked : CheckedProgram := checked_source_packet_program packet in
+    match checked_program_intern checked with | MkIntern names _ _ _ => match source_lookup_id names entry_name with
+      | Nothing => Left NativeSourceError (Pair NativeImage (List NativeFunctionOrigin))
+          (NativeSourceLowerError (LowerInvalidEntry 0))
+      | Just entry => match native_debug_lower_auto fuel limits entry checked with
+        | Left error => Left NativeSourceError (Pair NativeImage (List NativeFunctionOrigin)) error
+        | Right lowered => native_debug_emit limits lowered
+        end
+      end end;
+
+def native_debug_finish (compilation : SourceOriginCompilation)
+    (result : Either NativeSourceError (Pair NativeImage (List NativeFunctionOrigin)))
+    (paths : List (Pair (List Nat) (List Nat))) : NativeDebugCompilation :=
+    match result with
+    | Left error => NativeDebugCompilationOf compilation (Left NativeSourceError NativeImage error)
+        (Left NativeDebugError NativeSourceMap NativeDebugNoImage)
+    | Right emitted => match emitted with | MkPair image origins =>
+        NativeDebugCompilationOf compilation (Right NativeSourceError NativeImage image)
+          (match source_origin_compilation_metadata compilation with
+           | Left error => Left NativeDebugError NativeSourceMap (NativeDebugSourceMetadata error)
+           | Right metadata => match source_origin_compilation_original compilation with | MkPair original state =>
+             match original with
+             | SourceErr _ => Left NativeDebugError NativeSourceMap NativeDebugNoImage
+             | SourceOk packet => native_debug_build_map packet state metadata image origins paths
+             end end
+           end)
+      end
+    end;
+
+def native_compile_units_auto_with_source_origins (fuel : Nat) (limits : MirLimits) (entry_name : List Nat)
+    (root : List Nat) (files : List (Pair (List Nat) (List Nat)))
+    (paths : List (Pair (List Nat) (List Nat))) : NativeDebugCompilation :=
+    let compilation : SourceOriginCompilation := compile_checked_units_with_source_origins fuel root files in
+    native_debug_finish compilation
+      (match source_origin_compilation_original compilation with | MkPair original _ => match original with
+        | SourceErr failure => match failure with | SourceFailureOf error _ =>
+            Left NativeSourceError (Pair NativeImage (List NativeFunctionOrigin)) (NativeSourceCheckError error)
+          end
+        | SourceOk packet => native_debug_compile_packet fuel limits entry_name packet
+        end end) paths;
+
+def native_debug_compilation_image (compilation : NativeDebugCompilation) : Either NativeSourceError NativeImage :=
+    match compilation with | NativeDebugCompilationOf _ image _ => image end;
+
+def native_debug_compilation_map (compilation : NativeDebugCompilation) : Either NativeDebugError NativeSourceMap :=
+    match compilation with | NativeDebugCompilationOf _ _ mapping => mapping end;

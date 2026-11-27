@@ -32,15 +32,16 @@ NATIVE_CASES = (
 )
 
 
-def source_snapshot():
-    from frontend_regen import collect_units
+def source_snapshot(*, parse_bytes=None, read_source=None):
+    from frontend_regen import capture_unit_inputs
 
-    units = collect_units(ENTRY)
+    closures, captured = capture_unit_inputs((ENTRY,), parse_bytes=parse_bytes, read_source=read_source)
+    units = closures[ENTRY]
     if not units or units[-1] != ENTRY or len(set(units)) != len(units):
         raise ValueError("incomplete source replacement closure")
     if not all((ROOT / name).resolve().is_relative_to(ROOT) for name in units):
         raise ValueError("source replacement closure escapes repository")
-    return dict(units=units, sources={name: file_hash(ROOT / name) for name in units})
+    return dict(units=units, sources={name: captured[name].sha256 for name in units})
 
 
 def verify_native_report(report, image_hash):
@@ -50,7 +51,7 @@ def verify_native_report(report, image_hash):
         raise ValueError("source replacement report is incomplete, stale or has unexpected cases")
 
 
-def run_native_section(producer, work, run, build_timeout, verify_inputs):
+def run_native_section(producer, work, run, build_timeout, verify_inputs, *, parse_bytes=None):
     from frontend_native_process import inspect_image
     from repo_support import write_json_atomic
 
@@ -58,13 +59,13 @@ def run_native_section(producer, work, run, build_timeout, verify_inputs):
         return dict(status="unavailable", reason="Windows x86-64 runtime required")
     directory = work / "native-fs-replace"
     directory.mkdir()
-    before, producer_hash = source_snapshot(), file_hash(producer)
+    before, producer_hash = source_snapshot(parse_bytes=parse_bytes), file_hash(producer)
     report = dict(status="running", inputs=before, producer_sha256=producer_hash,
                   execution_backend="direct-windows-pe", external_supervisor="python")
 
     def unchanged():
         verify_inputs()
-        if source_snapshot() != before or file_hash(producer) != producer_hash:
+        if source_snapshot(parse_bytes=parse_bytes) != before or file_hash(producer) != producer_hash:
             raise ValueError("source replacement inputs changed")
 
     try:

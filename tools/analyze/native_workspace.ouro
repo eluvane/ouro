@@ -1,0 +1,523 @@
+import "native_skeleton.ouro",
+  "../quality/order.ouro",
+  "../../std/fs_create.ouro",
+  "../../std/fs_bounded.ouro",
+  "../../std/fs.ouro",
+  "../../std/pathx.ouro";
+
+-- Keep this token through staging, worker execution and cleanup. It records a
+-- creation claim; path checks do not provide an enduring directory handle.
+inductive NativeAnalyzeWorkspace : Type :=
+  | MkNativeAnalyzeWorkspace : String -> String -> String -> NativeAnalyzeWorkspace;
+
+inductive NativeAnalyzeWorkspaceError : Type :=
+  | AnalyzeWorkspaceFilesystem : String -> FsError -> NativeAnalyzeWorkspaceError
+  | AnalyzeWorkspaceRead : String -> FsBoundedReadError -> NativeAnalyzeWorkspaceError
+  | AnalyzeWorkspaceCreate : String -> String -> FsCreateDirError -> NativeAnalyzeWorkspaceError
+  | AnalyzeWorkspaceIncomplete : NativeAnalyzeWorkspace -> String -> NativeAnalyzeWorkspaceError
+  | AnalyzeWorkspaceRejected : String -> String -> NativeAnalyzeWorkspaceError;
+
+def native_analyze_workspace_error_message (error : NativeAnalyzeWorkspaceError) : String :=
+    match error with
+    | AnalyzeWorkspaceFilesystem phase cause => str_cat3 phase ": " (fs_error_message cause)
+    | AnalyzeWorkspaceRead path cause => str_cat3 path ": " (fs_bounded_read_error_message cause)
+    | AnalyzeWorkspaceCreate path anchor cause => str_cat3
+        (str_cat3 path ": " (fs_create_dir_error_message cause)) "; retained anchor: " anchor
+    | AnalyzeWorkspaceIncomplete workspace cause => let (MkNativeAnalyzeWorkspace _ anchor root) :=
+        workspace in
+      str_cat3 cause
+        "; retained created workspace and anchor: " (str_cat3 root "; " anchor)
+    | AnalyzeWorkspaceRejected phase path => str_cat3 phase ": " path
+    end;
+
+def native_analyze_workspace_ok (A : Type) (value : A) : IO (Either NativeAnalyzeWorkspaceError A) :=
+    io_pure(Either NativeAnalyzeWorkspaceError A, Right NativeAnalyzeWorkspaceError A value);
+
+def native_analyze_workspace_fail (A : Type) (phase : String) (path : String)
+    : IO (Either NativeAnalyzeWorkspaceError A) :=
+    io_pure(Either NativeAnalyzeWorkspaceError A,
+      Left NativeAnalyzeWorkspaceError A (AnalyzeWorkspaceRejected phase path));
+
+def native_analyze_workspace_path (workspace : NativeAnalyzeWorkspace) : String :=
+    match workspace with | MkNativeAnalyzeWorkspace _ _ root => root end;
+
+def native_analyze_workspace_anchor (workspace : NativeAnalyzeWorkspace) : String :=
+    match workspace with | MkNativeAnalyzeWorkspace _ anchor _ => anchor end;
+
+def native_analyze_workspace_owner_path (workspace : NativeAnalyzeWorkspace) : String :=
+    fs_child (native_analyze_workspace_path workspace) ".native-analyze-owner";
+
+def native_analyze_workspace_owner_text (workspace : NativeAnalyzeWorkspace) : String :=
+    let (MkNativeAnalyzeWorkspace parent anchor root) := workspace in
+    str_unlines ["native-analyze-workspace-v1", parent, anchor, root, ""];
+
+def native_analyze_workspace_mode_root (workspace : NativeAnalyzeWorkspace)
+    (mode : NativeSkeletonMode) : String :=
+    fs_child (native_analyze_workspace_path workspace)
+      (match mode with
+       | SkeletonLocal => "mode-local"
+       | SkeletonFormat => "format"
+       | SkeletonArchitecture => "architecture"
+       end);
+
+def native_analyze_workspace_same_path (left : String) (right : String) : Bool :=
+    str_eq (path_from_host left) (path_from_host right);
+
+def native_analyze_workspace_kind_is (directory : Bool) (kind : FsPathKind) : Bool :=
+    match kind with
+    | FsDirectory => directory
+    | FsRegularFile => notb directory
+    | FsUnsafeEntry => False
+    | FsPathUnavailable => False
+    end;
+
+def native_analyze_workspace_exact (path : String) (directory : Bool)
+    : IO (Either NativeAnalyzeWorkspaceError Unit) :=
+    match! fs_kind_checked path with
+    | Left cause => io_pure(Either NativeAnalyzeWorkspaceError Unit,
+        Left NativeAnalyzeWorkspaceError Unit (AnalyzeWorkspaceFilesystem "classify" cause))
+    | Right kind => if native_analyze_workspace_kind_is directory kind then
+        do let! actual := prim_fs_realpath path;
+                   if
+                     andb(notb(str_null actual), native_analyze_workspace_same_path actual path) then
+                     native_analyze_workspace_ok Unit MkUnit
+                   else native_analyze_workspace_fail Unit "canonical identity changed" path
+      else native_analyze_workspace_fail Unit "unsafe or unavailable path" path
+    end;
+
+def native_analyze_workspace_bytes (path : String) (expected : String)
+    : IO (Either NativeAnalyzeWorkspaceError Unit) :=
+    match! native_analyze_workspace_exact path False with
+    | Left error => io_pure(Either NativeAnalyzeWorkspaceError Unit, Left NativeAnalyzeWorkspaceError Unit error)
+    | Right _ => match! fs_read_bounded_checked (str_len expected) path with
+      | Left cause => io_pure(Either NativeAnalyzeWorkspaceError Unit,
+          Left NativeAnalyzeWorkspaceError Unit (AnalyzeWorkspaceRead path cause))
+      | Right text => if str_eq text expected then
+          native_analyze_workspace_exact path False
+        else native_analyze_workspace_fail Unit "file bytes changed" path
+      end
+    end;
+
+def native_analyze_workspace_check (workspace : NativeAnalyzeWorkspace)
+    : IO (Either NativeAnalyzeWorkspaceError Unit) :=
+    let (MkNativeAnalyzeWorkspace parent anchor root) := workspace in
+    (if
+      andb(native_analyze_workspace_same_path (path_dirname anchor) parent,
+        native_analyze_workspace_same_path root (str_concat anchor ".dir")) then
+      match! native_analyze_workspace_exact parent True with
+      | Left error => io_pure(Either NativeAnalyzeWorkspaceError Unit, Left NativeAnalyzeWorkspaceError Unit error)
+      | Right _ => match! native_analyze_workspace_bytes anchor "" with
+        | Left error => io_pure(Either NativeAnalyzeWorkspaceError Unit, Left NativeAnalyzeWorkspaceError Unit error)
+        | Right _ => match! native_analyze_workspace_exact root True with
+          | Left error => io_pure(Either NativeAnalyzeWorkspaceError Unit, Left NativeAnalyzeWorkspaceError Unit error)
+          | Right _ => native_analyze_workspace_bytes
+              (native_analyze_workspace_owner_path workspace)
+              (native_analyze_workspace_owner_text workspace)
+          end
+        end
+      end
+    else native_analyze_workspace_fail Unit "invalid ownership token" root);
+
+def native_analyze_workspace_finish_creation (workspace : NativeAnalyzeWorkspace)
+    : IO (Either NativeAnalyzeWorkspaceError NativeAnalyzeWorkspace) :=
+    let root : String := native_analyze_workspace_path workspace in
+    match! native_analyze_workspace_exact root True with
+    | Left error => io_pure(Either NativeAnalyzeWorkspaceError NativeAnalyzeWorkspace,
+        Left NativeAnalyzeWorkspaceError NativeAnalyzeWorkspace error)
+    | Right _ => do let! readable := prim_fs_listable root;
+                    if readable then
+                      match! fs_list_checked root with
+                      | Left cause => io_pure(Either NativeAnalyzeWorkspaceError NativeAnalyzeWorkspace,
+                          Left NativeAnalyzeWorkspaceError NativeAnalyzeWorkspace (AnalyzeWorkspaceFilesystem "created root list" cause))
+                      | Right names => if nullb String names then
+                          match! fs_write_checked
+                            (native_analyze_workspace_owner_path workspace)
+                            (native_analyze_workspace_owner_text workspace) with
+                          | Left cause => io_pure(Either NativeAnalyzeWorkspaceError NativeAnalyzeWorkspace,
+                              Left NativeAnalyzeWorkspaceError NativeAnalyzeWorkspace (AnalyzeWorkspaceFilesystem "write owner marker" cause))
+                          | Right _ => do let! after := native_analyze_workspace_check workspace;
+                                          io_pure(Either NativeAnalyzeWorkspaceError NativeAnalyzeWorkspace,
+                                            match after with
+                                            | Left error => Left NativeAnalyzeWorkspaceError NativeAnalyzeWorkspace error
+                                            | Right _ => Right NativeAnalyzeWorkspaceError NativeAnalyzeWorkspace workspace
+                                            end)
+                          end
+                        else
+                          native_analyze_workspace_fail NativeAnalyzeWorkspace "created root is not empty" root
+                      end
+                    else
+                      native_analyze_workspace_fail NativeAnalyzeWorkspace "created root unreadable" root
+    end;
+
+-- The exclusive temp file remains present while its distinct sibling directory
+-- is owned. No file is deleted to reserve a directory name.
+def native_analyze_workspace_create (parent : String)
+    : IO (Either NativeAnalyzeWorkspaceError NativeAnalyzeWorkspace) :=
+    match! fs_kind_checked parent with
+    | Left cause => io_pure(Either NativeAnalyzeWorkspaceError NativeAnalyzeWorkspace,
+        Left NativeAnalyzeWorkspaceError NativeAnalyzeWorkspace (AnalyzeWorkspaceFilesystem "parent" cause))
+    | Right classified => if native_analyze_workspace_kind_is True classified then
+        do let! canonical := prim_fs_realpath parent;
+                   if str_null canonical then
+                     native_analyze_workspace_fail NativeAnalyzeWorkspace "resolve workspace parent" parent
+                   else
+                     do let! anchor := prim_fs_temp_file_in canonical;
+                                 if str_null anchor then
+                                   native_analyze_workspace_fail NativeAnalyzeWorkspace "create private anchor" canonical
+                                 else
+                                   let root : String := str_concat anchor ".dir" in
+                                   let workspace : NativeAnalyzeWorkspace := MkNativeAnalyzeWorkspace canonical anchor root in
+                                   match! native_analyze_workspace_bytes anchor "" with
+                                   | Left error => io_pure(Either NativeAnalyzeWorkspaceError NativeAnalyzeWorkspace,
+                                       Left NativeAnalyzeWorkspaceError NativeAnalyzeWorkspace error)
+                                   | Right _ =>
+                                       if
+                                         native_analyze_workspace_same_path (path_dirname anchor) canonical then
+                                         match! fs_create_dir_exclusive_checked root with
+                                         | Left cause => io_pure(Either NativeAnalyzeWorkspaceError NativeAnalyzeWorkspace,
+                                             Left NativeAnalyzeWorkspaceError NativeAnalyzeWorkspace (AnalyzeWorkspaceCreate root anchor cause))
+                                         | Right _ => do let! finished := native_analyze_workspace_finish_creation workspace;
+                                                         io_pure(Either NativeAnalyzeWorkspaceError NativeAnalyzeWorkspace,
+                                                           match finished with
+                                                           | Left error => Left NativeAnalyzeWorkspaceError NativeAnalyzeWorkspace
+                                                               (AnalyzeWorkspaceIncomplete workspace (native_analyze_workspace_error_message error))
+                                                           | Right accepted => Right NativeAnalyzeWorkspaceError NativeAnalyzeWorkspace accepted
+                                                           end)
+                                         end
+                                       else
+                                         native_analyze_workspace_fail NativeAnalyzeWorkspace "anchor escaped parent" anchor
+                                   end
+      else native_analyze_workspace_fail NativeAnalyzeWorkspace "unsafe workspace parent" parent
+    end;
+
+private def native_analyze_workspace_component_with_key (name : String) (lower : String) : Bool :=
+    let base : String := match str_split lower 46 with | Nil => lower | Cons first _ => first end in
+    andb(native_skeleton_relative name,
+      andb(notb(str_contains name "/"),
+        andb(notb(orb(str_ends name ".", str_ends name " ")),
+          andb(notb(any Nat (fun (code : Nat) => orb(ltb_nat code 32,
+              elem Nat eq_nat code [34, 42, 60, 62, 63, 124, 126, 127])) (str_codes name)),
+            notb(elem String str_eq base
+              ["con", "prn", "aux", "nul", "conin$", "conout$", "com¹", "com²", "com³",
+               "lpt¹", "lpt²", "lpt³", "com1", "com2", "com3", "com4", "com5",
+               "com6", "com7", "com8", "com9", "lpt1", "lpt2", "lpt3", "lpt4", "lpt5",
+               "lpt6", "lpt7", "lpt8", "lpt9"])) )));
+
+def native_analyze_workspace_component (name : String) : Bool :=
+    native_analyze_workspace_component_with_key name (str_lower name);
+
+private def native_analyze_workspace_relative_parts (rel : String) : Maybe (List String) :=
+    if native_skeleton_relative rel then
+      let parts : List String := str_split rel 47 in
+      if leb_nat (length String parts) 128 then
+        if all String native_analyze_workspace_component parts then Just (List String) parts
+        else Nothing (List String)
+      else Nothing (List String)
+    else Nothing (List String);
+
+def native_analyze_workspace_relative (rel : String) : Bool :=
+    match native_analyze_workspace_relative_parts rel with | Nothing => False | Just _ => True end;
+
+def native_analyze_workspace_list_any (path : String)
+    : IO (Either NativeAnalyzeWorkspaceError (List String)) :=
+    match! native_analyze_workspace_exact path True with
+    | Left error => io_pure(Either NativeAnalyzeWorkspaceError (List String), Left NativeAnalyzeWorkspaceError (List String) error)
+    | Right _ => do let! readable := prim_fs_listable path;
+                    if readable then
+                      match! fs_list_checked path with
+                      | Left cause => io_pure(Either NativeAnalyzeWorkspaceError (List String),
+                          Left NativeAnalyzeWorkspaceError (List String) (AnalyzeWorkspaceFilesystem "list" cause))
+                      | Right names => do let! after := native_analyze_workspace_exact path True;
+                                          io_pure(Either NativeAnalyzeWorkspaceError (List String),
+                                            match after with
+                                            | Left error => Left NativeAnalyzeWorkspaceError (List String) error
+                                            | Right _ => Right NativeAnalyzeWorkspaceError (List String)
+                                                (quality_sort String prim_string_le names)
+                                            end)
+                      end
+                    else native_analyze_workspace_fail (List String) "directory unreadable" path
+    end;
+
+def native_analyze_workspace_names_safe (names : List String) : Bool :=
+    let keys : Maybe (List String) :=
+      (fix collect (remaining : List String) : Maybe (List String) :=
+        match remaining with
+        | Nil => Just (List String) []
+        | Cons name rest =>
+            let lower : String := str_lower name in
+            if native_analyze_workspace_component_with_key name lower then
+              match collect rest with
+              | Nothing => Nothing (List String)
+              | Just tail => Just (List String) (Cons String lower tail)
+              end
+            else Nothing (List String)
+        end) names in
+    match keys with
+    | Nothing => False
+    | Just values =>
+        (fix unique (sorted : List String) : Bool :=
+          match sorted with
+          | Nil => True
+          | Cons name rest => match rest with
+            | Nil => True
+            | Cons next _ => if str_eq name next then False else unique rest
+            end
+          end) (quality_sort String prim_string_le values)
+    end;
+
+def native_analyze_workspace_list (path : String)
+    : IO (Either NativeAnalyzeWorkspaceError (List String)) :=
+    do let! listed := native_analyze_workspace_list_any path;
+       io_pure(Either NativeAnalyzeWorkspaceError (List String),
+         match listed with
+         | Left error => Left NativeAnalyzeWorkspaceError (List String) error
+         | Right names =>
+             if native_analyze_workspace_names_safe names then Right NativeAnalyzeWorkspaceError (List String) names
+             else
+               Left NativeAnalyzeWorkspaceError (List String)
+                 (AnalyzeWorkspaceRejected "unsafe or aliased directory names" path)
+         end);
+
+def native_analyze_workspace_contains_name (name : String) (names : List String) : Bool :=
+    let lower : String := str_lower name in
+    any String (fun (candidate : String) => str_eq lower (str_lower candidate)) names;
+
+-- The caller has listed the checked parent and refused every existing spelling.
+-- FsPathUnavailable alone does not establish absence.
+def native_analyze_workspace_new_file (path : String) (contents : String)
+    : IO (Either NativeAnalyzeWorkspaceError Unit) :=
+    match! fs_kind_checked path with
+    | Left cause => io_pure(Either NativeAnalyzeWorkspaceError Unit,
+        Left NativeAnalyzeWorkspaceError Unit (AnalyzeWorkspaceFilesystem "classify new staging target" cause))
+    | Right kind => match kind with
+      | FsRegularFile => native_analyze_workspace_fail Unit "staging target is an existing file" path
+      | FsDirectory => native_analyze_workspace_fail Unit "staging target is an existing directory" path
+      | FsUnsafeEntry => native_analyze_workspace_fail Unit "staging target is unsafe" path
+      | FsPathUnavailable => do let! wrote := fs_write_checked path contents;
+                               io_pure(Either NativeAnalyzeWorkspaceError Unit,
+                                 match wrote with
+                                 | Left cause => Left NativeAnalyzeWorkspaceError Unit (AnalyzeWorkspaceFilesystem "stage" cause)
+                                 | Right _ => Right NativeAnalyzeWorkspaceError Unit MkUnit
+                                 end)
+      end
+    end;
+
+def native_analyze_workspace_directories (workspace : NativeAnalyzeWorkspace)
+    (start : String) (components : List String) : IO (Either NativeAnalyzeWorkspaceError String) :=
+  (fix directories (parts : List String) (current : String)
+      : IO (Either NativeAnalyzeWorkspaceError String) :=
+    match parts with
+    | Nil => native_analyze_workspace_ok String current
+    | Cons name rest => match! native_analyze_workspace_list current with
+      | Left error => io_pure(Either NativeAnalyzeWorkspaceError String, Left NativeAnalyzeWorkspaceError String error)
+      | Right children =>
+          let next : String := fs_child current name in
+          do let! ready :=
+               (if native_analyze_workspace_contains_name name children then
+                 native_analyze_workspace_exact next True
+               else
+                 match! fs_create_dir_exclusive_checked next with
+                 | Left cause => io_pure(Either NativeAnalyzeWorkspaceError Unit,
+                     Left NativeAnalyzeWorkspaceError Unit
+                       (AnalyzeWorkspaceCreate next (native_analyze_workspace_anchor workspace) cause))
+                 | Right _ => native_analyze_workspace_exact next True
+                 end);
+             match ready with
+             | Left error => io_pure(Either NativeAnalyzeWorkspaceError String, Left NativeAnalyzeWorkspaceError String error)
+             | Right _ => directories rest next
+             end
+      end
+    end) components start;
+
+def native_analyze_workspace_write (workspace : NativeAnalyzeWorkspace) (relative : String) (contents : String)
+    : IO (Either NativeAnalyzeWorkspaceError String) :=
+    match native_analyze_workspace_relative_parts relative with
+    | Nothing => native_analyze_workspace_fail String "invalid staging path" relative
+    | Just parts =>
+      match! native_analyze_workspace_check workspace with
+      | Left error => io_pure(Either NativeAnalyzeWorkspaceError String, Left NativeAnalyzeWorkspaceError String error)
+      | Right _ => match! native_analyze_workspace_directories workspace
+          (native_analyze_workspace_path workspace) (init String parts) with
+        | Left error => io_pure(Either NativeAnalyzeWorkspaceError String, Left NativeAnalyzeWorkspaceError String error)
+        | Right parent => match! native_analyze_workspace_list parent with
+          | Left error => io_pure(Either NativeAnalyzeWorkspaceError String, Left NativeAnalyzeWorkspaceError String error)
+          | Right names =>
+              let name : String := last String "" parts in
+              let path : String := fs_child parent name in
+              if native_analyze_workspace_contains_name name names then
+                native_analyze_workspace_fail String "staging target already exists" path
+              else
+                match! native_analyze_workspace_new_file path contents with
+                | Left error => io_pure(Either NativeAnalyzeWorkspaceError String,
+                    Left NativeAnalyzeWorkspaceError String error)
+                | Right _ => match!
+                    native_analyze_workspace_bytes path contents with
+                  | Left error => io_pure(Either NativeAnalyzeWorkspaceError String, Left NativeAnalyzeWorkspaceError String error)
+                  | Right _ => do let! after := native_analyze_workspace_check workspace;
+                                  io_pure(Either NativeAnalyzeWorkspaceError String,
+                                    match after with
+                                    | Left error => Left NativeAnalyzeWorkspaceError String error
+                                    | Right _ => Right NativeAnalyzeWorkspaceError String path
+                                    end)
+                  end
+                end
+          end
+        end
+      end
+    end;
+
+def native_analyze_workspace_stage_contents (workspace : NativeAnalyzeWorkspace)
+    (mode : NativeSkeletonMode) (rel : String) (original : String) (contents : String)
+    : IO (Either NativeAnalyzeWorkspaceError String) :=
+    match native_skeleton_project mode rel original with
+    | Left _ => native_analyze_workspace_fail String "invalid skeleton plan" rel
+    | Right checked => let (MkPair expected _) := checked in
+      if str_eq contents expected then
+        native_analyze_workspace_write workspace
+          (str_cat3 (path_basename (native_analyze_workspace_mode_root workspace mode)) "/" rel) contents
+      else native_analyze_workspace_fail String "skeleton contents differ from canonical plan" rel
+    end;
+
+def native_analyze_workspace_baseline_relative (workspace : NativeAnalyzeWorkspace)
+    (mode : NativeSkeletonMode) (rel : String) : String :=
+    str_cat4 "api-baseline/" (path_basename (native_analyze_workspace_mode_root workspace mode)) "/"
+      (str_concat rel ".tsv");
+
+-- Local and strict-format passes can use different baselines for the same file.
+def native_analyze_workspace_baseline (workspace : NativeAnalyzeWorkspace) (mode : NativeSkeletonMode)
+    (rel : String) (plan : NativeBaselinePlan)
+    : IO (Either NativeAnalyzeWorkspaceError (Maybe String)) :=
+    match plan with
+    | NativeBaselineUnchanged actual =>
+        if andb(str_eq actual rel, native_analyze_workspace_relative rel) then
+          do let! checked := native_analyze_workspace_check workspace;
+                     io_pure(Either NativeAnalyzeWorkspaceError (Maybe String),
+                       match checked with
+                       | Left error => Left NativeAnalyzeWorkspaceError (Maybe String) error
+                       | Right _ => Right NativeAnalyzeWorkspaceError (Maybe String) (Nothing String)
+                       end)
+        else native_analyze_workspace_fail (Maybe String) "baseline binding differs" rel
+    | MkNativeBaselineShard actual original contents sentinel =>
+        match native_skeleton_baseline rel (Just String original) with
+        | Left _ => native_analyze_workspace_fail (Maybe String) "invalid baseline plan" rel
+        | Right checked => match checked with
+          | NativeBaselineUnchanged _ => native_analyze_workspace_fail (Maybe String) "baseline plan kind differs" rel
+          | MkNativeBaselineShard _ _ expected expected_sentinel =>
+              match andb(str_eq actual rel, andb(str_eq contents expected,
+                  if sentinel then expected_sentinel else notb expected_sentinel)) with
+              | False => native_analyze_workspace_fail (Maybe String) "baseline contents differ from canonical plan" rel
+              | True => do let! written := native_analyze_workspace_write workspace
+                   (native_analyze_workspace_baseline_relative workspace mode rel) contents;
+                  io_pure(Either NativeAnalyzeWorkspaceError (Maybe String),
+                    match written with
+                    | Left error => Left NativeAnalyzeWorkspaceError (Maybe String) error
+                    | Right path => Right NativeAnalyzeWorkspaceError (Maybe String) (Just String path)
+                    end)
+              end
+          end
+        end
+    end;
+
+def native_analyze_workspace_inventory : Nat -> NativeAnalyzeWorkspace -> List String
+    -> List (Pair String Bool) -> IO (Either NativeAnalyzeWorkspaceError (List (Pair String Bool))) :=
+  fix inventory (left : Nat) (workspace : NativeAnalyzeWorkspace) (todo : List String)
+      (reverse_entries : List (Pair String Bool))
+      : IO (Either NativeAnalyzeWorkspaceError (List (Pair String Bool))) :=
+    match todo with
+    | Nil => native_analyze_workspace_ok (List (Pair String Bool)) reverse_entries
+    | Cons path rest => match left with
+      | Z => native_analyze_workspace_fail (List (Pair String Bool)) "cleanup entry limit" path
+      | S remaining =>
+          if path_under (native_analyze_workspace_path workspace) path then
+            match! fs_kind_checked path with
+            | Left cause => io_pure(Either NativeAnalyzeWorkspaceError (List (Pair String Bool)),
+                Left NativeAnalyzeWorkspaceError (List (Pair String Bool)) (AnalyzeWorkspaceFilesystem "cleanup classify" cause))
+            | Right kind => match kind with
+              | FsPathUnavailable => native_analyze_workspace_fail (List (Pair String Bool)) "cleanup path unavailable" path
+              | FsUnsafeEntry => native_analyze_workspace_fail (List (Pair String Bool)) "cleanup unsafe entry" path
+              | FsRegularFile => match! native_analyze_workspace_exact path False with
+                | Left error => io_pure(Either NativeAnalyzeWorkspaceError (List (Pair String Bool)),
+                    Left NativeAnalyzeWorkspaceError (List (Pair String Bool)) error)
+                | Right _ => inventory remaining workspace rest
+                    (if native_analyze_workspace_same_path path (native_analyze_workspace_owner_path workspace)
+                     then reverse_entries else Cons (Pair String Bool) (MkPair String Bool path False) reverse_entries)
+                end
+              | FsDirectory => match! native_analyze_workspace_list path with
+                | Left error => io_pure(Either NativeAnalyzeWorkspaceError (List (Pair String Bool)),
+                    Left NativeAnalyzeWorkspaceError (List (Pair String Bool)) error)
+                | Right names => inventory remaining workspace
+                    (append String (map String String (fs_child path) names) rest)
+                    (if native_analyze_workspace_same_path path (native_analyze_workspace_path workspace)
+                     then reverse_entries else Cons (Pair String Bool) (MkPair String Bool path True) reverse_entries)
+                end
+              end
+            end
+          else
+            native_analyze_workspace_fail (List (Pair String Bool)) "cleanup path escaped root" path
+      end
+    end;
+
+def native_analyze_workspace_remove (path : String) (directory : Bool)
+    : IO (Either NativeAnalyzeWorkspaceError Unit) :=
+    match! native_analyze_workspace_exact path directory with
+    | Left error => io_pure(Either NativeAnalyzeWorkspaceError Unit, Left NativeAnalyzeWorkspaceError Unit error)
+    | Right _ => do fs_remove path;
+                    match! native_analyze_workspace_list_any (path_dirname path) with
+                    | Left error => io_pure(Either NativeAnalyzeWorkspaceError Unit, Left NativeAnalyzeWorkspaceError Unit error)
+                    | Right names => if
+                        native_analyze_workspace_contains_name (path_basename path) names then
+                        native_analyze_workspace_fail Unit "removal did not remove entry" path
+                      else native_analyze_workspace_ok Unit MkUnit
+                    end
+    end;
+
+def native_analyze_workspace_remove_entry (workspace : NativeAnalyzeWorkspace)
+    (state : Either NativeAnalyzeWorkspaceError Unit) (entry : Pair String Bool)
+    : IO (Either NativeAnalyzeWorkspaceError Unit) :=
+    match state with
+    | Left error => io_pure(Either NativeAnalyzeWorkspaceError Unit, Left NativeAnalyzeWorkspaceError Unit error)
+    | Right _ => match! native_analyze_workspace_check workspace with
+      | Left error => io_pure(Either NativeAnalyzeWorkspaceError Unit, Left NativeAnalyzeWorkspaceError Unit error)
+      | Right _ => match entry with | MkPair path directory => native_analyze_workspace_remove path directory end
+      end
+    end;
+
+-- Preflight counts all entries before deletion. Reverse preorder removes each
+-- child before its parent. The marker and anchor remain until children are gone.
+def native_analyze_workspace_cleanup (workspace : NativeAnalyzeWorkspace)
+    : IO (Either NativeAnalyzeWorkspaceError Unit) :=
+    match! native_analyze_workspace_check workspace with
+    | Left error => io_pure(Either NativeAnalyzeWorkspaceError Unit, Left NativeAnalyzeWorkspaceError Unit error)
+    | Right _ => match! native_analyze_workspace_inventory fs_walk_fuel workspace
+        [native_analyze_workspace_path workspace] (Nil (Pair String Bool)) with
+      | Left error => io_pure(Either NativeAnalyzeWorkspaceError Unit, Left NativeAnalyzeWorkspaceError Unit error)
+      | Right entries => match! io_fold (Pair String Bool) (Either NativeAnalyzeWorkspaceError Unit)
+          (native_analyze_workspace_remove_entry workspace) (Right NativeAnalyzeWorkspaceError Unit MkUnit) entries with
+        | Left error => io_pure(Either NativeAnalyzeWorkspaceError Unit, Left NativeAnalyzeWorkspaceError Unit error)
+        | Right _ => match! native_analyze_workspace_check workspace with
+          | Left error => io_pure(Either NativeAnalyzeWorkspaceError Unit, Left NativeAnalyzeWorkspaceError Unit error)
+          | Right _ => match!
+              native_analyze_workspace_list (native_analyze_workspace_path workspace) with
+            | Left error => io_pure(Either NativeAnalyzeWorkspaceError Unit, Left NativeAnalyzeWorkspaceError Unit error)
+            | Right names => if
+                str_eq (str_join "\n" names) ".native-analyze-owner" then
+                match!
+                  native_analyze_workspace_remove (native_analyze_workspace_owner_path workspace) False with
+                | Left error => io_pure(Either NativeAnalyzeWorkspaceError Unit, Left NativeAnalyzeWorkspaceError Unit error)
+                | Right _ => match!
+                    native_analyze_workspace_remove (native_analyze_workspace_path workspace) True with
+                  | Left error => io_pure(Either NativeAnalyzeWorkspaceError Unit, Left NativeAnalyzeWorkspaceError Unit error)
+                  | Right _ => match!
+                      native_analyze_workspace_bytes (native_analyze_workspace_anchor workspace) "" with
+                    | Left error => io_pure(Either NativeAnalyzeWorkspaceError Unit, Left NativeAnalyzeWorkspaceError Unit error)
+                    | Right _ => native_analyze_workspace_remove (native_analyze_workspace_anchor workspace) False
+                    end
+                  end
+                end
+              else
+                native_analyze_workspace_fail Unit "cleanup root has unexpected entries" (native_analyze_workspace_path workspace)
+            end
+          end
+        end
+      end
+    end;

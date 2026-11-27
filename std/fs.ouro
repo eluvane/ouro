@@ -41,19 +41,19 @@ def fs_read_lines (path : String) : IO (List String) :=
 def fs_write_lines (path : String) (ls : List String) : IO Unit :=
     fs_write(path, str_join "\n" ls);
 
--- Directory entries as full paths, in the order the host reported them.
 def fs_child (dir : String) (name : String) : String :=
     let parts : List String := ([dir, name] : List String) in
     path_join parts;
 
+-- Join the directory path with each entry name. Preserve the host entry order.
 def fs_list_paths (dir : String) : IO (List String) :=
     io_bind (List String) (List String) (fs_list dir)
       (fun (names : List String) =>
         io_pure (List String)
           (map String String (fs_child dir) names));
 
--- Recursive inventory remains compact for common tools while failing closed:
--- exhaustion, unreadable entries, and links/reparse points return no partial list.
+-- The walk returns no partial list on budget exhaustion, unreadable paths,
+-- links, or reparse points.
 def fs_walk_go : Nat -> List String -> List String
     -> IO (Maybe (List String)) :=
   fix fs_walk_go (left : Nat) (todo : List String) (rev : List String)
@@ -194,7 +194,8 @@ def fs_file_exists (path : String) : IO Bool := fs_is_file path;
 
 def fs_dir_exists (path : String) : IO Bool := fs_is_dir path;
 
-def fs_check_file (path : String) : IO (Either FsError Unit) :=
+private def fs_check_path_kind (path : String) (matches_kind : Bool -> Bool)
+    (wrong_kind : String -> FsError) : IO (Either FsError Unit) :=
     match fs_nonempty_path path with
     | Left e => fs_err Unit e
     | Right _ =>
@@ -204,40 +205,34 @@ def fs_check_file (path : String) : IO (Either FsError Unit) :=
             | False => fs_err(Unit, FsMissing path)
             | True =>
                 io_bind Bool (Either FsError Unit) (fs_is_dir path)
-                  (fun (isdir : Bool) =>
-                    match isdir with
-                    | True => fs_err(Unit, FsExpectedFile path)
-                    | False => fs_ok Unit MkUnit
+                  (fun (is_directory : Bool) =>
+                    match matches_kind is_directory with
+                    | True => fs_ok Unit MkUnit
+                    | False => fs_err(Unit, wrong_kind path)
                     end)
             end)
     end;
+
+def fs_check_file (path : String) : IO (Either FsError Unit) :=
+    fs_check_path_kind path notb FsExpectedFile;
 
 def fs_check_dir (path : String) : IO (Either FsError Unit) :=
-    match fs_nonempty_path path with
-    | Left e => fs_err Unit e
-    | Right _ =>
-        io_bind Bool (Either FsError Unit) (fs_exists path)
-          (fun (exists : Bool) =>
-            match exists with
-            | False => fs_err(Unit, FsMissing path)
-            | True =>
-                io_bind Bool (Either FsError Unit) (fs_is_dir path)
-                  (fun (isdir : Bool) =>
-                    match isdir with
-                    | True => fs_ok Unit MkUnit
-                    | False => fs_err(Unit, FsExpectedDirectory path)
-                    end)
-            end)
-    end;
+    fs_check_path_kind path (fun (is_directory : Bool) => is_directory) FsExpectedDirectory;
 
+-- After the precheck, OS open/length/read errors become FsOperationFailed.
+-- Partial bytes are never success; malformed text, guards and cleanup exit 73.
 def fs_read_checked (path : String) : IO (Either FsError String) :=
     io_bind (Either FsError Unit) (Either FsError String) (fs_check_file path)
       (fun (ready : Either FsError Unit) =>
         match ready with
         | Left e => fs_err String e
         | Right _ =>
-            io_bind String (Either FsError String) (fs_read path)
-              (fun (text : String) => fs_ok String text)
+            io_bind (Pair Nat String) (Either FsError String) (prim_fs_read_file_status path)
+              (fun (reply : Pair Nat String) => match reply with | MkPair status text =>
+                match eq_nat status 0 with
+                | True => fs_ok String text
+                | False => fs_err String (FsOperationFailed (str_concat "read OS status=" (prim_string_of_nat status)) path)
+                end end)
         end);
 
 def fs_write_checked (path : String) (content : String) : IO (Either FsError Unit) :=

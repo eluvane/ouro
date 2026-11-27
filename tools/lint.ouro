@@ -3,6 +3,8 @@
 -- @entry main
 
 import "lint_worker.ouro",
+  "selftest_fs.ouro",
+  "native_path.ouro",
   "../compiler/base.ouro",
   "../std/collections.ouro",
   "../std/text.ouro";
@@ -24,16 +26,12 @@ def lint_family_name (f : LintFamily) : String :=
     end;
 
 def lint_parse_family (name : String) : Maybe LintFamily :=
-    match prim_string_eq name "language" with
-    | True => Just LintFamily LintFamLanguage
-    | False => match prim_string_eq name "style" with
-      | True => Just LintFamily LintFamStyle
-      | False => match prim_string_eq name "semantic" with
-        | True => Just LintFamily LintFamSemantic
-        | False => Nothing LintFamily
-        end
-      end
-    end;
+    if prim_string_eq name "language" then Just LintFamily LintFamLanguage
+    else
+      if prim_string_eq name "style" then Just LintFamily LintFamStyle
+      else
+        if prim_string_eq name "semantic" then Just LintFamily LintFamSemantic
+        else Nothing LintFamily;
 
 def lint_known_profiles : List String :=
     [ "project", "strict", "release" ];
@@ -51,10 +49,7 @@ def lint_has_family (xs : List LintFamily) (f : LintFamily) : Bool :=
     elem LintFamily lint_family_eq f xs;
 
 def lint_add_family (xs : List LintFamily) (f : LintFamily) : List LintFamily :=
-    match lint_has_family xs f with
-    | True => xs
-    | False => append LintFamily xs ([f] : List LintFamily)
-    end;
+    if lint_has_family xs f then xs else append LintFamily xs ([f] : List LintFamily);
 
 inductive LintArgError : Type :=
   | LintUnknownOption : String -> LintArgError
@@ -81,52 +76,42 @@ inductive LintShard : Type :=
   | MkLintShard : Nat -> Nat -> LintShard;
 
 def lint_shard_nat (value : String) : Maybe Nat :=
-    match andb(leb_nat(str_len value, 3), str_is_digits value) with
-    | False => Nothing Nat
-    | True => str_parse_nat value
-    end;
+    if andb(leb_nat(str_len value, 3), str_is_digits value) then str_parse_nat value else Nothing Nat;
 
 def lint_parse_shard (value : String) : Either LintArgError LintShard :=
     let invalid : Either LintArgError LintShard :=
       Left LintArgError LintShard (LintInvalidShard value) in
-    match leb_nat(str_len value, 7) with
-    | False => invalid
-    | True => match str_split_first value "/" with
+    if leb_nat(str_len value, 7) then
+      match str_split_first value "/" with
       | Nothing => invalid
-      | Just parts => match parts with
-        | MkPair index_text total_text => match lint_shard_nat index_text with
+      | Just parts => let (MkPair index_text total_text) := parts in
+        match lint_shard_nat index_text with
+        | Nothing => invalid
+        | Just index => match lint_shard_nat total_text with
           | Nothing => invalid
-          | Just index => match lint_shard_nat total_text with
-            | Nothing => invalid
-            | Just total => match andb (notb (eq_nat index Z))
-                (andb(leb_nat index total, leb_nat total 128)) with
-              | False => invalid
-              | True => Right LintArgError LintShard (MkLintShard index total)
-              end
-            end
+          | Just total => if
+              andb (notb (eq_nat index Z))
+                (andb(leb_nat index total, leb_nat total 128)) then
+              Right LintArgError LintShard (MkLintShard index total)
+            else invalid
           end
         end
       end
-    end;
+    else invalid;
 
 -- Select after the complete checked inventory; each shard retains file order.
 def lint_shard_paths (shard : LintShard) (files : List String) : List String :=
-    match shard with
-    | MkLintShard index total =>
-        let wanted : Nat := sub index 1 in
-        (fix select (paths : List String) (position : Nat) : List String :=
-          match paths with
-          | Nil => Nil String
-          | Cons path rest =>
-              let next : Nat := match eq_nat (S position) total with
-                | True => Z | False => S position end in
-              let remaining : List String := select rest next in
-              match eq_nat position wanted with
-              | True => Cons String path remaining
-              | False => remaining
-              end
-          end) files Z
-    end;
+    let (MkLintShard index total) := shard in
+    let wanted : Nat := sub index 1 in
+    (fix select (paths : List String) (position : Nat) : List String :=
+      match paths with
+      | Nil => Nil String
+      | Cons path rest =>
+          let next : Nat := match eq_nat (S position) total with
+            | True => Z | False => S position end in
+          let remaining : List String := select rest next in
+          if eq_nat position wanted then Cons String path remaining else remaining
+      end) files Z;
 
 def lint_shard_inventory (shard : Maybe LintShard)
     (inventory : Either QualityInputError (List String))
@@ -140,6 +125,36 @@ def lint_shard_inventory (shard : Maybe LintShard)
         | Cons path rest => Right QualityInputError (List String) (Cons String path rest)
         end
       end
+    end;
+
+def lint_local_inventory (parent : Maybe LintShard) (subshard : Maybe String)
+    (inventory : Either QualityInputError (List String))
+    : Either QualityInputError (List String) :=
+    match lint_shard_inventory parent inventory with
+    | Left e => Left QualityInputError (List String) e
+    | Right files => match subshard with
+      | Nothing => Right QualityInputError (List String) files
+      | Just value => match parent with
+        | Nothing => Left QualityInputError (List String)
+            (QualityInvalidInput "local lint subshard requires --shard")
+        | Just _ => match lint_parse_shard value with
+          | Left e => Left QualityInputError (List String)
+              (QualityInvalidInput(lint_arg_error_message e))
+          | Right selected => Right QualityInputError (List String) (lint_shard_paths selected files)
+          end
+        end
+      end
+    end;
+
+def lint_local_subshard : IO (Maybe String) :=
+    match! prim_env_get "OURO_CI_LINT_STAGE" with
+    | Nothing => io_pure(Maybe String, Nothing String)
+    | Just stage => if str_eq stage "worker" then
+        match! prim_env_get "OURO_CI_LINT_SUBSHARD" with
+        | Nothing => io_pure(Maybe String, Just String "")
+        | Just part => io_pure(Maybe String, Just String part)
+        end
+      else io_pure(Maybe String, Nothing String)
     end;
 
 inductive LintRequest : Type :=
@@ -160,15 +175,15 @@ def lint_req_shard (r : LintRequest) : Maybe LintShard :=
 def lint_finish_parse (profile : String) (explicit : Bool)
     (families : List LintFamily) (rev : List String) (shard : Maybe LintShard)
     : Either LintArgError LintRequest :=
-    match explicit with
-    | False => Right LintArgError LintRequest
-        (MkLintRequest profile lint_all_families (reverse_lin String rev) shard)
-    | True => match families with
+    if explicit then
+      match families with
       | Nil => Left LintArgError LintRequest LintMissingFamily
       | Cons _ _ => Right LintArgError LintRequest
           (MkLintRequest profile families (reverse_lin String rev) shard)
       end
-    end;
+    else
+      Right LintArgError LintRequest
+        (MkLintRequest profile lint_all_families (reverse_lin String rev) shard);
 
 def lint_parse_args : List String -> String -> Bool -> List LintFamily
     -> List String -> Maybe LintShard -> Either LintArgError LintRequest :=
@@ -178,120 +193,77 @@ def lint_parse_args : List String -> String -> Bool -> List LintFamily
     match args with
     | Nil => lint_finish_parse profile explicit families rev shard
     | Cons arg rest =>
-        match prim_string_eq arg "--" with
-        | True => match lint_finish_parse profile explicit families rev shard with
+        if prim_string_eq arg "--" then
+          match lint_finish_parse profile explicit families rev shard with
           | Left e => Left LintArgError LintRequest e
           | Right req => Right LintArgError LintRequest
               (MkLintRequest (lint_req_profile req) (lint_req_families req)
                 (append String (lint_req_roots req) rest) (lint_req_shard req))
           end
-        | False =>
-            match prim_string_eq arg "--deny" with
-            | True => go rest profile explicit families rev shard
-            | False =>
-                match prim_string_eq arg "--profile" with
-                | True => match rest with
-                  | Nil => Left LintArgError LintRequest (LintMissingValue arg)
-                  | Cons value more =>
-                      match prim_string_length value with
-                      | Z => Left LintArgError LintRequest (LintMissingValue arg)
-                      | S _ => match lint_known_profile value with
-                        | False => Left LintArgError LintRequest
-                            (LintUnknownProfile value)
-                        | True => go more value explicit families rev shard
-                        end
-                      end
+        else
+          if prim_string_eq arg "--deny" then go rest profile explicit families rev shard
+          else
+            if prim_string_eq arg "--profile" then
+              match rest with
+              | Nil => Left LintArgError LintRequest (LintMissingValue arg)
+              | Cons value more =>
+                  match prim_string_length value with
+                  | Z => Left LintArgError LintRequest (LintMissingValue arg)
+                  | S _ => if lint_known_profile value then
+                      go more value explicit families rev shard
+                    else
+                      Left LintArgError LintRequest
+                        (LintUnknownProfile value)
                   end
-                | False =>
-                    match prim_string_eq arg "--family" with
-                    | True => match rest with
-                      | Nil => Left LintArgError LintRequest LintMissingFamily
-                      | Cons value more =>
-                          match prim_string_length value with
-                          | Z => Left LintArgError LintRequest LintMissingFamily
-                          | S _ => match lint_parse_family value with
-                            | Nothing => Left LintArgError LintRequest
-                                (LintUnknownFamily value)
-                            | Just fam => go more profile True
-                                (lint_add_family families fam) rev shard
-                            end
-                          end
+              end
+            else
+              if prim_string_eq arg "--family" then
+                match rest with
+                | Nil => Left LintArgError LintRequest LintMissingFamily
+                | Cons value more =>
+                    match prim_string_length value with
+                    | Z => Left LintArgError LintRequest LintMissingFamily
+                    | S _ => match lint_parse_family value with
+                      | Nothing => Left LintArgError LintRequest
+                          (LintUnknownFamily value)
+                      | Just fam => go more profile True
+                          (lint_add_family families fam) rev shard
                       end
-                    | False =>
-                        match prim_string_eq arg "--shard" with
-                        | True => match shard with
-                          | Just _ => Left LintArgError LintRequest LintRepeatedShard
-                          | Nothing => match rest with
-                            | Nil => Left LintArgError LintRequest (LintMissingValue arg)
-                            | Cons value more => match str_null value with
-                              | True => Left LintArgError LintRequest (LintMissingValue arg)
-                              | False => match lint_parse_shard value with
-                                | Left e => Left LintArgError LintRequest e
-                                | Right selected => go more profile explicit families rev
-                                    (Just LintShard selected)
-                                end
-                              end
-                            end
-                          end
-                        | False => match prim_string_starts arg "--" with
-                          | True => Left LintArgError LintRequest (LintUnknownOption arg)
-                          | False => go rest profile explicit families
-                              (Cons String arg rev) shard
-                          end
-                        end
                     end
                 end
-            end
-        end
-    end;
-
-def lint_is_sep (c : Nat) : Bool :=
-    orb(eqNat c 47, eqNat c 92);
-
-def lint_last_sep : List Nat -> Nat -> Maybe Nat :=
-  fix go (cs : List Nat) (i : Nat) : Maybe Nat :=
-    match cs with
-    | Nil => Nothing Nat
-    | Cons c rest =>
-        match go(rest, add i 1) with
-        | Just later => Just Nat later
-        | Nothing => match lint_is_sep c with
-          | True => Just Nat i
-          | False => Nothing Nat
-          end
-        end
+              else
+                if prim_string_eq arg "--shard" then
+                  match shard with
+                  | Just _ => Left LintArgError LintRequest LintRepeatedShard
+                  | Nothing => match rest with
+                    | Nil => Left LintArgError LintRequest (LintMissingValue arg)
+                    | Cons value more => if str_null value then
+                        Left LintArgError LintRequest (LintMissingValue arg)
+                      else
+                        match lint_parse_shard value with
+                        | Left e => Left LintArgError LintRequest e
+                        | Right selected => go more profile explicit families rev
+                            (Just LintShard selected)
+                        end
+                    end
+                  end
+                else
+                  if prim_string_starts arg "--" then
+                    Left LintArgError LintRequest (LintUnknownOption arg)
+                  else
+                    go rest profile explicit families
+                      (Cons String arg rev) shard
     end;
 
 def lint_dirname (path : String) : String :=
-    match lint_last_sep(prim_string_to_char_codes path, 0) with
-    | Nothing => "."
-    | Just index =>
-        match orb (eqNat index 0)
-            (andb (eqNat index 2)
-              (prim_string_eq(prim_string_slice path 1 1, ":"))) with
-        | True => prim_string_slice path 0 (add index 1)
-        | False => prim_string_slice path 0 index
-        end
-    end;
+    native_path_dirname path;
 
 def lint_join (dir : String) (name : String) : String :=
-    match prim_string_length dir with
-    | Z => name
-    | S last => match lint_is_sep (prim_string_byte_at dir last) with
-      | True => concat dir name
-      | False => concat(dir, concat "/" name)
-      end
-    end;
+    native_path_join dir name;
 
 def lint_choose_exe (windows : String) (base : String) (win : Bool) (posix : Bool)
     : Maybe String :=
-    match win with
-    | True => Just String windows
-    | False => match posix with
-      | True => Just String base
-      | False => Nothing String
-      end
-    end;
+    if win then Just String windows else if posix then Just String base else Nothing String;
 
 def lint_pick_exe (base : String) : IO (Maybe String) :=
     let windows : String := concat base ".exe" in
@@ -300,41 +272,38 @@ def lint_pick_exe (base : String) : IO (Maybe String) :=
        io_pure(Maybe String, lint_choose_exe windows base win posix)
 
 def lint_env_exe (name : String) : IO (Either String (Maybe String)) :=
-    do let! env := prim_env_get name;
-       match env with
-       | Nothing => io_pure (Either(String, Maybe String))
-           (Right(String, Maybe String, Nothing String))
-       | Just path =>
-           match prim_string_length path with
-           | Z => io_pure (Either(String, Maybe String))
-               (Right(String, Maybe String, Nothing String))
-           | S _ =>
-               do let! exists := prim_fs_exists path;
-                  io_pure (Either(String, Maybe String))
-                    (match exists with
-                     | True => Right(String, Maybe String, Just String path)
-                     | False => Left String (Maybe String)
-                         (concat(name, concat " is not an executable: " path))
-                     end)
-           end
-       end
+    match! prim_env_get name with
+    | Nothing => io_pure (Either(String, Maybe String))
+        (Right(String, Maybe String, Nothing String))
+    | Just path =>
+        match prim_string_length path with
+        | Z => io_pure (Either(String, Maybe String))
+            (Right(String, Maybe String, Nothing String))
+        | S _ =>
+            do let! exists := prim_fs_exists path;
+               io_pure (Either(String, Maybe String))
+                 (if exists then Right(String, Maybe String, Just String path)
+                   else
+                     Left String (Maybe String)
+                       (concat(name, concat " is not an executable: " path)))
+        end
+    end
 
 def lint_locate_companion (env_name : String) (sibling : String)
     (argv0 : String) : IO (Either String (Maybe String)) :=
-    do let! env := lint_env_exe env_name;
-       match env with
-       | Left msg => io_pure (Either(String, Maybe String))
-           (Left(String, Maybe String, concat "LINT_FAIL: " msg))
-       | Right found => match found with
-         | Just path => io_pure (Either(String, Maybe String))
-             (Right(String, Maybe String, Just String path))
-         | Nothing =>
-             do let! sibling_exe := lint_pick_exe
-                  (lint_join(lint_dirname argv0, sibling));
-                io_pure (Either(String, Maybe String))
-                  (Right String (Maybe String) sibling_exe)
-         end
-       end
+    match! lint_env_exe env_name with
+    | Left msg => io_pure (Either(String, Maybe String))
+        (Left(String, Maybe String, concat "LINT_FAIL: " msg))
+    | Right found => match found with
+      | Just path => io_pure (Either(String, Maybe String))
+          (Right(String, Maybe String, Just String path))
+      | Nothing =>
+          do let! sibling_exe := lint_pick_exe
+               (lint_join(lint_dirname argv0, sibling));
+             io_pure (Either(String, Maybe String))
+               (Right String (Maybe String) sibling_exe)
+      end
+    end
 
 def lint_missing_companion (label : String) (sibling : String)
     (env_name : String) : String :=
@@ -387,48 +356,42 @@ def lint_semantic_companion_paths (exe : String) (profile : String)
 def lint_require_companion (wanted : Bool) (label : String) (sibling : String)
     (env_name : String) (argv0 : String)
     : IO (Either String (Maybe String)) :=
-    match wanted with
-    | False => io_pure (Either(String, Maybe String))
-        (Right(String, Maybe String, Nothing String))
-    | True =>
-        do let! located := lint_locate_companion env_name sibling argv0;
-           io_pure (Either(String, Maybe String))
-             (match located with
-              | Left msg => Left String (Maybe String) msg
-              | Right found => match found with
-                | Nothing => Left String (Maybe String)
-                    (lint_missing_companion label sibling env_name)
-                | Just path => Right(String, Maybe String, Just String path)
-                end
-              end)
-    end;
+    (if wanted then
+      do let! located := lint_locate_companion env_name sibling argv0;
+         io_pure (Either(String, Maybe String))
+           (match located with
+            | Left msg => Left String (Maybe String) msg
+            | Right found => match found with
+              | Nothing => Left String (Maybe String)
+                  (lint_missing_companion label sibling env_name)
+              | Just path => Right(String, Maybe String, Just String path)
+              end
+            end)
+    else
+      io_pure (Either(String, Maybe String))
+        (Right(String, Maybe String, Nothing String)));
 
 def lint_family_language (wanted : Bool) (exe : String) (files : List String)
     : IO Nat :=
-    match wanted with
-    | False => io_pure Nat Z
-    | True => lint_paths exe files
-    end;
+    if wanted then lint_paths exe files else io_pure Nat Z;
 
 def lint_family_companion (wanted : Bool) (exe : Maybe String)
     (args_of : String -> List String) (files : List String) : IO Nat :=
-    match wanted with
-    | False => io_pure Nat Z
-    | True => match exe with
+    if wanted then
+      match exe with
       | Nothing => io_pure(Nat, S Z)
       | Just path => lint_companion_paths path args_of files
       end
-    end;
+    else io_pure Nat Z;
 
 def lint_family_semantic (wanted : Bool) (exe : Maybe String)
     (profile : String) (files : List String) : IO Nat :=
-    match wanted with
-    | False => io_pure Nat Z
-    | True => match exe with
+    if wanted then
+      match exe with
       | Nothing => io_pure(Nat, S Z)
       | Just path => lint_semantic_companion_paths path profile files
       end
-    end;
+    else io_pure Nat Z;
 
 def start (argv : List String) : IO Unit :=
     match lint_parse_args (tail String argv) "project" False
@@ -448,61 +411,51 @@ def start (argv : List String) : IO Unit :=
         let want_style : Bool := lint_has_family families LintFamStyle in
         let want_semantic : Bool := lint_has_family families LintFamSemantic in
         do let! inventory := gather roots;
-           match lint_shard_inventory (lint_req_shard req) inventory with
+            let! local_subshard := lint_local_subshard;
+            match lint_local_inventory (lint_req_shard req) local_subshard inventory with
            | Left e =>
                do eprintln (quality_input_message e);
                   exit 2
            | Right files =>
                let argv0 : String := nth String "" Z argv in
-               do let! style := lint_require_companion want_style "style"
-                    "ouro-lint-style" "OURO_LINT_STYLE_EXE" argv0;
-                  match style with
-                  | Left msg =>
-                      do eprintln msg;
-                         exit (S Z)
-                  | Right style_exe =>
-                      do let! semantic := lint_require_companion want_semantic
-                           "semantic" "ouro-clippy-grade-firewall"
-                           "OURO_LINT_SEMANTIC_EXE" argv0;
-                         match semantic with
-                         | Left msg =>
-                             do eprintln msg;
-                                exit (S Z)
-                         | Right semantic_exe =>
-                             do let! language_status :=
-                                  lint_family_language want_language argv0 files;
-                                let! style_status := lint_family_companion
-                                  want_style style_exe (lint_style_args profile)
-                                  files;
-                                let! semantic_status := lint_family_semantic
-                                  want_semantic semantic_exe profile files;
-                                exit (lint_join_status language_status
-                                  (lint_join_status style_status semantic_status))
-                         end
-                  end
+               match! lint_require_companion want_style "style"
+                 "ouro-lint-style" "OURO_LINT_STYLE_EXE" argv0 with
+               | Left msg =>
+                   do eprintln msg;
+                      exit (S Z)
+               | Right style_exe =>
+                   match! lint_require_companion want_semantic
+                     "semantic" "ouro-clippy-grade-firewall"
+                     "OURO_LINT_SEMANTIC_EXE" argv0 with
+                   | Left msg =>
+                       do eprintln msg;
+                          exit (S Z)
+                   | Right semantic_exe =>
+                       do let! language_status :=
+                            lint_family_language want_language argv0 files;
+                          let! style_status := lint_family_companion
+                            want_style style_exe (lint_style_args profile)
+                            files;
+                          let! semantic_status := lint_family_semantic
+                            want_semantic semantic_exe profile files;
+                          exit (lint_join_status language_status
+                            (lint_join_status style_status semantic_status))
+                   end
+               end
            end
     end;
 
 def lint_selftest_write (path : String) (body : String) : IO Unit :=
-    do let! wrote := fs_write_checked path body;
-       match wrote with
-       | Left e =>
-           do eprintln (concat("LINT_SUITE: FAIL ", fs_error_message e));
-              exit (S Z)
-       | Right _ => io_unit
-       end;
-       let! loaded := quality_read_file path;
-       match loaded with
+    do selftest_fs_require "LINT_SUITE: FAIL " (fs_write_checked path body);
+       match! quality_read_file path with
        | Left e =>
            do eprintln (concat("LINT_SUITE: FAIL ", quality_input_message e));
               exit (S Z)
        | Right actual =>
-           match prim_string_eq actual body with
-           | True => io_unit
-           | False =>
-               do eprintln (concat "LINT_SUITE: FAIL output readback differs: " path);
-                  exit (S Z)
-           end
+           if prim_string_eq actual body then io_unit
+           else
+             do eprintln (concat "LINT_SUITE: FAIL output readback differs: " path);
+                exit (S Z)
        end
 
 def lint_selftest_output_path (out : String) (label : String) (path : String)
@@ -510,42 +463,34 @@ def lint_selftest_output_path (out : String) (label : String) (path : String)
     quality_child(out, lint_cat4 label "_" (lint_path_stem path) suffix);
 
 def lint_selftest_case_pass (expect_findings : Bool) (r : ProcResult) : Bool :=
-    match expect_findings with
-    | True =>
-        andb (eqNat(proc_code r, S Z))
-          (andb (notb (prim_string_eq(proc_stdout r, "")))
-            (prim_string_eq(proc_stderr r, "")))
-    | False =>
-        andb (eqNat(proc_code r, Z))
-          (andb (prim_string_eq(proc_stdout r, ""))
-            (prim_string_eq(proc_stderr r, "")))
-    end;
+    if expect_findings then
+      andb (eqNat(proc_code r, S Z))
+        (andb (notb (prim_string_eq(proc_stdout r, "")))
+          (prim_string_eq(proc_stderr r, "")))
+    else
+      andb (eqNat(proc_code r, Z))
+        (andb (prim_string_eq(proc_stdout r, ""))
+          (prim_string_eq(proc_stderr r, "")));
 
 def lint_selftest_case_finish (expect_findings : Bool) (path : String)
     (r : ProcResult) : IO Bool :=
-    match lint_selftest_case_pass expect_findings r with
-    | True => io_pure Bool True
-    | False =>
-        match expect_findings with
-        | True =>
-            do println (concat "MISS " path);
-               io_pure Bool False
-        | False =>
-            do println (concat "FP " path);
-               io_foreach String
-                 (fun (line : String) => println (concat "  " line))
-                 (prim_string_split(proc_stdout r, 10));
-               io_pure Bool False
-        end
-    end;
+    (if lint_selftest_case_pass expect_findings r then io_pure Bool True
+    else
+      if expect_findings then
+        do println (concat "MISS " path);
+           io_pure Bool False
+      else
+        do println (concat "FP " path);
+           io_foreach String
+             (fun (line : String) => println (concat "  " line))
+             (prim_string_split(proc_stdout r, 10));
+           io_pure Bool False);
 
 def lint_selftest_write_result (stdout_path : String) (stderr_path : String)
     (result : ProcResult) : IO Unit :=
-    match result with
-    | MkProcResult _ stdout stderr =>
-        do lint_selftest_write stdout_path stdout;
-           lint_selftest_write stderr_path stderr
-    end;
+    let (MkProcResult _ stdout stderr) := result in
+    do lint_selftest_write stdout_path stdout;
+       lint_selftest_write stderr_path stderr;
 
 def lint_selftest_write_case (label : String) (out : String) (path : String)
     (result : ProcResult) : IO Unit :=
@@ -555,16 +500,15 @@ def lint_selftest_write_case (label : String) (out : String) (path : String)
 
 def lint_selftest_process_case (exe : String) (expect_findings : Bool)
     (label : String) (out : String) (path : String) : IO Bool :=
-    do let! loaded := quality_read_file path;
-       match loaded with
-       | Left e =>
-           do eprintln (concat("LINT_SUITE: FAIL ", quality_input_message e));
-              io_pure Bool False
-       | Right _ =>
-           do let! result := process_run_spec (command_spec(exe, ["--single-file", path] : List String));
-              lint_selftest_write_case label out path result;
-              lint_selftest_case_finish expect_findings path result
-       end
+    match! quality_read_file path with
+    | Left e =>
+        do eprintln (concat("LINT_SUITE: FAIL ", quality_input_message e));
+           io_pure Bool False
+    | Right _ =>
+        do let! result := process_run_spec (command_spec(exe, ["--single-file", path] : List String));
+           lint_selftest_write_case label out path result;
+           lint_selftest_case_finish expect_findings path result
+    end
 
 def lint_selftest_files (exe : String) (expect_findings : Bool) (label : String)
     (out : String) (paths : List String) : IO Nat :=
@@ -573,61 +517,53 @@ def lint_selftest_files (exe : String) (expect_findings : Bool) (label : String)
         io_bind Bool Nat
           (lint_selftest_process_case exe expect_findings label out path)
           (fun (passed : Bool) =>
-            match passed with
-            | True => io_pure Nat failures
-            | False => io_pure(Nat, S failures)
-            end))
+            if passed then io_pure Nat failures else io_pure(Nat, S failures)))
       Z paths;
 
 def lint_selftest_paths (root : String)
     : IO (Either QualityInputError (List String)) :=
     do let! kind := prim_fs_kind root;
-       match eqNat(kind, S (S Z)) with
-       | False => io_pure (Either(QualityInputError, List String))
-           (Left(QualityInputError, List String, QualityInvalidInput root))
-       | True =>
-           do let! listable := prim_fs_listable root;
-              match listable with
-              | False => io_pure (Either(QualityInputError, List String))
-                  (Left(QualityInputError, List String, QualityUnreadableDirectory root))
-              | True =>
-                  do let! names := prim_fs_list_dir root;
-                     io_pure (Either(QualityInputError, List String))
-                       (Right QualityInputError (List String)
-                         (map String String (quality_child root)
-                           (filter String (fun (path : String) =>
-                             prim_string_ends path ".ouro")
-                             (sort_insert String prim_string_le names))))
-              end
-       end
+       (if eqNat(kind, S (S Z)) then
+         do let! listable := prim_fs_listable root;
+            if listable then
+              do let! names := prim_fs_list_dir root;
+                 io_pure (Either(QualityInputError, List String))
+                   (Right QualityInputError (List String)
+                     (map String String (quality_child root)
+                       (filter String (fun (path : String) =>
+                         prim_string_ends path ".ouro")
+                         (sort_insert String prim_string_le names))))
+            else
+              io_pure (Either(QualityInputError, List String))
+                (Left(QualityInputError, List String, QualityUnreadableDirectory root))
+       else
+         io_pure (Either(QualityInputError, List String))
+           (Left(QualityInputError, List String, QualityInvalidInput root)))
 
 def lint_selftest_group (exe : String) (expect_findings : Bool) (label : String)
     (root : String) (out : String) : IO Nat :=
-    do let! loaded := lint_selftest_paths root;
-       match loaded with
-       | Left e =>
-           do eprintln (concat("LINT_SUITE: FAIL ", quality_input_message e));
-              io_pure(Nat, S Z)
-       | Right paths =>
-           match paths with
-           | Nil =>
-               do eprintln (concat "LINT_SUITE: FAIL no fixtures under " root);
-                  io_pure(Nat, S Z)
-           | Cons _ _ => lint_selftest_files exe expect_findings label out paths
-           end
-       end
+    match! lint_selftest_paths root with
+    | Left e =>
+        do eprintln (concat("LINT_SUITE: FAIL ", quality_input_message e));
+           io_pure(Nat, S Z)
+    | Right paths =>
+        match paths with
+        | Nil =>
+            do eprintln (concat "LINT_SUITE: FAIL no fixtures under " root);
+               io_pure(Nat, S Z)
+        | Cons _ _ => lint_selftest_files exe expect_findings label out paths
+        end
+    end
 
 def lint_arg_value (prefix : String) (fallback : String) : List String -> String :=
   fix lint_arg_value (xs : List String) : String :=
     match xs with
     | Nil => fallback
     | Cons x rest =>
-        match prim_string_starts x prefix with
-        | True =>
-            let n : Nat := prim_string_length prefix in
-            prim_string_slice x n (sub(prim_string_length x, n))
-        | False => lint_arg_value rest
-        end
+        if prim_string_starts x prefix then
+          let n : Nat := prim_string_length prefix in
+          prim_string_slice x n (sub(prim_string_length x, n))
+        else lint_arg_value rest
     end;
 
 def lint_cache_contracts : Bool :=
@@ -680,51 +616,56 @@ def lint_selective_unbound_count (source : String) (known : List String)
     end;
 
 def lint_selective_contracts : Bool :=
-    match lint_select_rules "main.ouro"
-        "import \"a.ouro\" as A exposing (Visible as Pick, Build as Make);" with
-    | Left _ => False
-    | Right selected =>
-        let names : List LintNameFact :=
-          [MkLintNameFact "./a.ouro" ["Visible", "Build", "Hidden"]
-            ["Build"]] in
-        match lint_selected_inventory selected names with
-        | MkPair picked ctors =>
-            let aliases : List (Pair String String) :=
-              [MkPair String String "A" "./a.ouro"] in
-            let qualified : List String := lint_qualified_selected_for_path
-              "./a.ouro" aliases selected ["Visible", "Hidden"] in
-            let known : List String := append String picked qualified in
-            let pick_known : Bool := mem_str "Pick" picked in
-            let make_ctor : Bool := mem_str "Make" ctors in
-            let hidden_unselected : Bool := notb (mem_str "Hidden" picked) in
-            let visible_qualified : Bool := mem_str "A@Visible" qualified in
-            let hidden_unqualified : Bool := notb (mem_str "A@Hidden" qualified) in
-            let pick_clean : Bool := lint_selective_unbound_count
-              "import \"a.ouro\" as A exposing (Visible as Pick, Build as Make); def chosen : Type := Pick;"
-              known ctors Z in
-            let hidden_reported : Bool := lint_selective_unbound_count
-              "import \"a.ouro\" as A exposing (Visible as Pick, Build as Make); def hidden : Type := A.Hidden;"
-              known ctors (S Z) in
-            let missing_reported : Bool := lint_selective_unbound_count
-              "import \"a.ouro\" as A exposing (Visible as Pick, Build as Make); def bad : Type := Missing;"
-              known ctors (S Z) in
-            all Bool (fun (passed : Bool) => passed)
-              [pick_known, make_ctor, hidden_unselected, visible_qualified,
-                hidden_unqualified, pick_clean, hidden_reported, missing_reported]
-        end
-    end;
+    let (MkPair reg prepared) :=
+      prep_codes_with_imports (ncodes
+        "import \"a.ouro\" as A exposing (Visible as Pick, Build as Make);") in
+    match prepared with
+  | LintPrepErr _ => False
+  | LintPrepOk _ =>
+      let selected : List LintSelectFact := lint_import_selections "main.ouro" reg in
+      let names : List LintNameFact :=
+        [MkLintNameFact "./a.ouro" ["Visible", "Build", "Hidden"]
+          ["Build"]] in
+      let (MkPair picked ctors) := lint_selected_inventory selected names in
+      let aliases : List (Pair String String) :=
+        [MkPair String String "A" "./a.ouro"] in
+      let qualified : List String := lint_qualified_selected_for_path
+        "./a.ouro" aliases selected ["Visible", "Hidden"] in
+      let known : List String := append String picked qualified in
+      let pick_known : Bool := mem_str "Pick" picked in
+      let make_ctor : Bool := mem_str "Make" ctors in
+      let hidden_unselected : Bool := notb (mem_str "Hidden" picked) in
+      let visible_qualified : Bool := mem_str "A@Visible" qualified in
+      let hidden_unqualified : Bool := notb (mem_str "A@Hidden" qualified) in
+      let qualified_order : Bool := list_eq String prim_string_eq
+        (lint_qualified_selected_for_path "./a.ouro"
+          [MkPair String String "A" "./a.ouro", MkPair String String "B" "./a.ouro"]
+          selected ["Hidden", "Build", "Visible", "Visible"])
+        ["A@Build", "A@Visible", "A@Visible", "B@Build", "B@Visible", "B@Visible"] in
+      let pick_clean : Bool := lint_selective_unbound_count
+        "import \"a.ouro\" as A exposing (Visible as Pick, Build as Make); def chosen : Type := Pick;"
+        known ctors Z in
+      let hidden_reported : Bool := lint_selective_unbound_count
+        "import \"a.ouro\" as A exposing (Visible as Pick, Build as Make); def hidden : Type := A.Hidden;"
+        known ctors (S Z) in
+      let missing_reported : Bool := lint_selective_unbound_count
+        "import \"a.ouro\" as A exposing (Visible as Pick, Build as Make); def bad : Type := Missing;"
+        known ctors (S Z) in
+      all Bool (fun (passed : Bool) => passed)
+        [pick_known, make_ctor, hidden_unselected, visible_qualified,
+          hidden_unqualified, qualified_order, pick_clean, hidden_reported, missing_reported]
+  end;
 
 def lint_selective_transitive_contracts : Bool :=
   match lint_select_rules "b.ouro"
       "import \"a.ouro\" exposing (Visible as Pick);" with
   | Left _ => False
   | Right selectors =>
-      match lint_selected_inventory selectors
-          [MkLintNameFact "./a.ouro" ["Visible", "Hidden"] []] with
-      | MkPair names ctors =>
-          andb(mem_str "Pick" names,
-            andb(notb (mem_str "Hidden" names), nullb String ctors))
-      end
+      let (MkPair names ctors) :=
+        lint_selected_inventory selectors
+          [MkLintNameFact "./a.ouro" ["Visible", "Hidden"] []] in
+      andb(mem_str "Pick" names,
+        andb(notb (mem_str "Hidden" names), nullb String ctors))
   end;
 
 def lint_parse_ok (args : List String) (profile : String)
@@ -770,13 +711,12 @@ def lint_shard_request_ok (value : String) (index : Nat) (total : Nat) : Bool :=
     | Left _ => False
     | Right req => match lint_req_shard req with
       | Nothing => False
-      | Just shard => match shard with
-        | MkLintShard actual_index actual_total => all Bool (fun (passed : Bool) => passed)
-            [ eq_nat actual_index index, eq_nat actual_total total
-            , str_eq(lint_req_profile req, "project")
-            , list_eq LintFamily lint_family_eq (lint_req_families req) lint_all_families
-            , list_eq String str_eq (lint_req_roots req) ["std"] ]
-        end
+      | Just shard => let (MkLintShard actual_index actual_total) := shard in
+        all Bool (fun (passed : Bool) => passed)
+          [ eq_nat actual_index index, eq_nat actual_total total
+          , str_eq(lint_req_profile req, "project")
+          , list_eq LintFamily lint_family_eq (lint_req_families req) lint_all_families
+          , list_eq String str_eq (lint_req_roots req) ["std"] ]
       end
     end;
 
@@ -787,9 +727,16 @@ def lint_shard_inventory_ok (shard : Maybe LintShard) (files : List String)
     | Right actual => list_eq String str_eq actual expected
     end;
 
-def lint_shard_input_error_ok (inventory : Either QualityInputError (List String))
+def lint_local_inventory_ok (part : String) (files : List String) (expected : List String) : Bool :=
+    match lint_local_inventory (Just LintShard (MkLintShard 1 4)) (Just String part)
+        (Right QualityInputError (List String) files) with
+    | Left _ => False
+    | Right actual => list_eq String str_eq actual expected
+    end;
+
+def lint_shard_input_error_ok (subshard : Maybe String) (inventory : Either QualityInputError (List String))
     (expected : QualityInputError) : Bool :=
-    match lint_shard_inventory (Just LintShard (MkLintShard 4 4)) inventory with
+    match lint_local_inventory (Just LintShard (MkLintShard 4 4)) subshard inventory with
     | Right _ => False
     | Left actual => str_eq(quality_input_message actual, quality_input_message expected)
     end;
@@ -814,6 +761,10 @@ def lint_shard_contracts : Bool :=
            "-1/4", "a/4", "1000/4", "1/1000", " 1/4", "1/4 "]
       , lint_shard_inventory_ok (Nothing LintShard) paths paths
       , lint_shard_inventory_ok (Just LintShard (MkLintShard 1 1)) paths paths
+      , lint_local_inventory_ok "1/2" paths ["a", "i"]
+      , lint_local_inventory_ok "2/2" paths ["e"]
+      , lint_local_inventory_ok "4/4" paths (Nil String)
+      , notb(lint_local_inventory_ok "0/4" paths (Nil String))
       , list_eq (List String) (list_eq String str_eq) shards
           [["a", "e", "i"], ["b", "f"], ["c", "g"], ["d", "h"]]
       , eq_nat(length String selected, length String paths)
@@ -821,9 +772,9 @@ def lint_shard_contracts : Bool :=
           eq_nat(count_if String (str_eq path) selected, 1)) paths
       , all Nat (fun (left_size : Nat) => all Nat (fun (right_size : Nat) =>
           leb_nat left_size (S right_size)) sizes) sizes
-      , lint_shard_input_error_ok
+      , lint_shard_input_error_ok (Just String "1/2")
           (Right QualityInputError (List String) ["a"]) QualityNoSources
-      , lint_shard_input_error_ok
+      , lint_shard_input_error_ok (Just String "1/2")
           (Left QualityInputError (List String) (QualityInvalidInput "unselected.ouro"))
           (QualityInvalidInput "unselected.ouro")
       ];
@@ -874,44 +825,33 @@ def run_lint_selftest (argv : List String) : IO Unit :=
       lint_arg_value "--good-root=" "_build/smith/fixtures/lint/good" argv in
     do prim_fs_mkdir out;
        let! listable := prim_fs_listable out;
-       match listable with
-       | False =>
-           do eprintln (concat "LINT_SUITE: FAIL cannot create output directory: " out);
-              exit (S Z)
-       | True =>
-           do match lint_process_contracts with
-              | True => io_unit
-              | False =>
-                  do eprintln "LINT_SUITE: FAIL native process protocol";
-                     exit (S Z)
-              end;
-              println "=== bad (must report) ===";
-              let! bad := lint_selftest_group exe True "bad" bad_root out;
-              println (concat("bad_miss=", of_nat bad));
-              println "=== good (must be clean) ===";
-              let! good := lint_selftest_group exe False "good" good_root out;
-              println (concat("good_fp=", of_nat good));
-              match add bad good with
-              | Z => exit Z
-              | S _ => exit (S Z)
-              end
-       end
+       (if listable then
+         do (if lint_process_contracts then io_unit
+           else
+             do eprintln "LINT_SUITE: FAIL native process protocol";
+                exit (S Z));
+            println "=== bad (must report) ===";
+            let! bad := lint_selftest_group exe True "bad" bad_root out;
+            println (concat("bad_miss=", of_nat bad));
+            println "=== good (must be clean) ===";
+            let! good := lint_selftest_group exe False "good" good_root out;
+            println (concat("good_fp=", of_nat good));
+            match add bad good with
+            | Z => exit Z
+            | S _ => exit (S Z)
+            end
+       else
+         do eprintln (concat "LINT_SUITE: FAIL cannot create output directory: " out);
+            exit (S Z))
 
 def main : IO Unit :=
     do let! argv := prim_argv;
        match tail String argv with
        | Nil => start argv
        | Cons first rest =>
-           match prim_string_eq first "--single-file" with
-           | True => lint_single_file rest
-           | False =>
-               match prim_string_eq first "--batch-files" with
-               | True => lint_batch_files rest
-               | False =>
-                   match prim_string_eq first "--selftest" with
-                   | True => run_lint_selftest argv
-                   | False => start argv
-                   end
-               end
-           end
+           if prim_string_eq first "--single-file" then lint_single_file rest
+           else
+             if prim_string_eq first "--batch-files" then lint_batch_files rest
+             else
+               if prim_string_eq first "--selftest" then run_lint_selftest argv else start argv
        end

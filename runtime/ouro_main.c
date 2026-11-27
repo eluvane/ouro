@@ -1,6 +1,4 @@
-/* ouro_main.c: gate driver for a translation unit emitted by print_c.ouro.
-   Prints one line per export so the C result can be diffed against the JS
-   backend's value for the same export. */
+/* Print one named result per export from the generated C translation unit. */
 #include "ouro_rt.h"
 
 #include <stdio.h>

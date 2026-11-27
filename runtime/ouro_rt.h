@@ -1,7 +1,6 @@
-/* ouro_rt.h: runtime for the Ouro C backend (print_c.ouro output).
-   Value model mirrors the JS backend: constructors are {tag, fields},
-   closures carry a linked environment, variables are static indices.
-   Phase heap can be reset at native compiler seams; cloned phase results move to a permanent heap. */
+/* Runtime for generated C. Constructors carry a tag and fields. Closures
+   carry a linked environment indexed by compiled references. Clone phase
+   results into the permanent heap before resetting the phase heap. */
 #ifndef OURO_RT_H
 #define OURO_RT_H
 
@@ -72,6 +71,7 @@ void ouro_perm_select(int bank);
 void ouro_perm_reset_bank(int bank);
 void *ouro_perm_alloc(unsigned long size);
 ouro_v *ouro_clone_perm(ouro_v *v);
+ouro_v *ouro_clone_perm_with_stack_scratch(ouro_v *v);
 /* Like ouro_clone_perm, but only static nodes are shared. A perm spine
    with phase children is copied instead of returned as-is. */
 ouro_v *ouro_clone_perm_deep(ouro_v *v);
@@ -105,10 +105,11 @@ ouro_v *ouro_ctor(int tag, int n, ouro_v **fields);
 ouro_v *ouro_clos(ouro_v *(*fn)(ouro_env *, ouro_v *), ouro_env *env);
 /* Self-referential closure: the value is pushed onto its own environment. */
 ouro_v *ouro_fix(ouro_v *(*fn)(ouro_env *, ouro_v *), ouro_env *env);
-/* Branch that binds no field. Held unevaluated so a match costs only the
-   branch it takes, matching the JS backend's switch. Forced by ouro_case. */
+/* A branch without fields stays unevaluated until ouro_case selects it. */
 ouro_v *ouro_thunk(ouro_v *(*fn)(ouro_env *, ouro_v *), ouro_env *env);
 ouro_v *ouro_str(const char *s);
+/* Copy and terminate a text prefix of len bytes with no embedded NUL. */
+ouro_v *ouro_str_copy_prefix(const char *s, unsigned long len);
 
 /* Host-side construction of the standard Nat/List layout (Z=0, S=1, Nil=0,
    Cons=1). Lets a C host feed real input into compiled Ouro without any
@@ -118,11 +119,14 @@ ouro_v *ouro_nat(unsigned long n);
 ouro_v *ouro_nat_u64(uint64_t number);
 /* Checked host-size conversion; no truncation of a large or malformed Nat. */
 int ouro_nat_to_ulong(ouro_v *value, unsigned long *out);
+int ouro_nat_to_u64(ouro_v *value, uint64_t *out);
 uint32_t ouro_nat_low32(ouro_v *value);
 ouro_v *ouro_nat_decimal(ouro_v *value);
 ouro_v *ouro_bytes(const unsigned char *b, unsigned long len);
 /* One-cell packed byte string. The lexer matches it as List Nat. */
 ouro_v *ouro_packed(const unsigned char *b, unsigned long len);
+/* Borrow a NUL-terminated suffix of packed bytes. Start must be within the buffer or at its end. */
+ouro_v *ouro_packed_suffix(ouro_v *source, unsigned long start);
 ouro_v *ouro_string_codes(const char *s);
 void ouro_slash_path(char *p);
 void ouro_write_codes(ouro_v *list, FILE *out);
@@ -139,8 +143,10 @@ ouro_v *ouro_get(ouro_env *env, int k);
 
 /* Application for generated code. When f is the newest phase-heap cell it is
    a single-use temporary (an intermediate partial application or a branch
-   closure) and its bytes are handed back before the body runs. Callers must
-   not use f again after ouro_app. */
+   closure) and its bytes are handed back before the body runs. After the
+   body returns, the env spine that produced that closure and a small
+   constructor result may also be compacted onto the caller's bump. Callers
+   must not use f again after ouro_app. */
 ouro_v *ouro_app(ouro_v *f, ouro_v *a);
 /* Application for handwritten hosts: never reclaims, so a closure held in a
    C local or a host cache can be applied any number of times. */
@@ -157,7 +163,7 @@ ouro_v *ouro_err(int code);
    a compiler module without quadratic Peano append. */
 ouro_v *ouro_fast(const char *name);
 
-/* Structural rendering shared with the JS comparator: {t:N,a:[...]}. */
+/* Render constructor N as {t:N,a:[...]}. */
 void ouro_show(ouro_v *v);
 void ouro_show_line(ouro_v *v);
 

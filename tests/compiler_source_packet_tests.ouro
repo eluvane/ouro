@@ -1,0 +1,612 @@
+-- @entry main
+import "../compiler/driver.ouro",
+  "../std/test.ouro";
+import "compiler_test_list_equal.ouro";
+
+def source_packet_fuel : Nat := mul 100 50;
+
+def source_packet_unit (path : String) (source : String) : Pair (List Nat) (List Nat) :=
+  MkPair (List Nat) (List Nat) (prim_string_to_char_codes path) (prim_string_to_char_codes source);
+
+def source_packet_compile (root : String) (dependency : String)
+    : Pair (SourceResult CheckedSourcePacket) InternState :=
+  stitch_checked_units_with_source_packet lex_go_import intern_string driver_parse_file_visibility
+    resolve_imports_with_sources desugar_file rewrite_declarations lower_expr_env2_with_cause
+    compile_program_with_location driver_elaborate_surfaces elaborate check_module
+    preprocess_imports_reg preprocess_records_reg source_packet_fuel
+    (prim_string_to_char_codes "main.ouro")
+    [source_packet_unit "main.ouro" root, source_packet_unit "dep.ouro" dependency];
+
+def source_packet_dependency : String :=
+  "inductive Token : Type := | Hit : Token; def value : Token := Hit;";
+
+-- Transport preserves fixpoint display IDs as well as checked Core equality.
+def source_packet_core_equal (fuel : Nat) (left : CoreTerm) (right : CoreTerm) : Bool :=
+  if let Normalized same := (eqTerm_checked fuel left right : NormalizeResult Bool) then
+    match same with
+      | False => False
+      | True => eqList (encode fuel left) (encode fuel right)
+      end
+  else False;
+
+def source_packet_list_equal (A : Type) (equal : A -> A -> Bool)
+    : List A -> List A -> Bool :=
+  compiler_test_list_equal A equal;
+
+def source_packet_optional_core_equal (fuel : Nat) (left : Maybe CoreTerm)
+    (right : Maybe CoreTerm) : Bool :=
+  match left, right with
+  | Nothing, Nothing => True
+  | Just term, Just other => source_packet_core_equal fuel term other
+  | Nothing, Just _ => False
+  | Just _, Nothing => False
+  end;
+
+def source_packet_param_equal (fuel : Nat) (left : Param) (right : Param) : Bool :=
+  match left, right with | MkParam name typ, MkParam other shape =>
+    andb(eqNat name other, source_packet_core_equal fuel typ shape)
+  end;
+
+def source_packet_ctor_equal (fuel : Nat) (left : Ctor) (right : Ctor) : Bool :=
+  match left, right with | MkCtor name typ, MkCtor other shape =>
+    andb(eqNat name other, source_packet_core_equal fuel typ shape)
+  end;
+
+def source_packet_inductive_equal (fuel : Nat) (left : IndDecl) (right : IndDecl) : Bool :=
+  match left, right with
+  | MkIndDecl name params indices level ctors, MkIndDecl other arguments indexes universe constructors =>
+      andb(eqNat name other,
+        andb(source_packet_list_equal Param (source_packet_param_equal fuel) params arguments,
+          andb(source_packet_list_equal CoreTerm (source_packet_core_equal fuel) indices indexes,
+            andb(eqNat level universe,
+              source_packet_list_equal Ctor (source_packet_ctor_equal fuel) ctors constructors))))
+  end;
+
+def source_packet_abi_value_equal (fuel : Nat) (left : PrimitiveAbiValue)
+    (right : PrimitiveAbiValue) : Bool :=
+  match left, right with
+  | PrimitiveAbiWord word, PrimitiveAbiWord other => primitive_word_equal word other
+  | PrimitiveAbiPointer typ, PrimitiveAbiPointer other => source_packet_core_equal fuel typ other
+  | PrimitiveAbiFunction typ, PrimitiveAbiFunction other => source_packet_core_equal fuel typ other
+  | PrimitiveAbiWord _, PrimitiveAbiPointer _ => False
+  | PrimitiveAbiWord _, PrimitiveAbiFunction _ => False
+  | PrimitiveAbiPointer _, PrimitiveAbiWord _ => False
+  | PrimitiveAbiPointer _, PrimitiveAbiFunction _ => False
+  | PrimitiveAbiFunction _, PrimitiveAbiWord _ => False
+  | PrimitiveAbiFunction _, PrimitiveAbiPointer _ => False
+  end;
+
+def source_packet_abi_equal (fuel : Nat) (left : PrimitiveAbiSignature)
+    (right : PrimitiveAbiSignature) : Bool :=
+  match left, right with
+  | PrimitiveAbiSignatureOf args result, PrimitiveAbiSignatureOf other answer =>
+      andb(source_packet_list_equal PrimitiveAbiValue (source_packet_abi_value_equal fuel) args other,
+        match result, answer with
+        | Nothing, Nothing => True
+        | Just value, Just expected => source_packet_abi_value_equal fuel value expected
+        | Nothing, Just _ => False
+        | Just _, Nothing => False
+        end)
+  end;
+
+def source_packet_binding_equal (fuel : Nat) (left : PrimitiveBinding)
+    (right : PrimitiveBinding) : Bool :=
+  match left, right with
+  | PrimitiveIntrinsicBinding id mode gc specialization, PrimitiveIntrinsicBinding other execution policy expected =>
+      andb(primitive_id_equal id other,
+        andb(primitive_bytes_equal (checked_output_execution mode) (checked_output_execution execution),
+          andb(primitive_bytes_equal (checked_output_gc gc) (checked_output_gc policy),
+            source_packet_optional_core_equal fuel specialization expected)))
+  | PrimitiveExternBinding external, PrimitiveExternBinding supplied =>
+      match external, supplied with
+      | CheckedExternOf target abi dll symbol signature gc, CheckedExternOf other_target other_abi library label expected policy =>
+          match target, other_target with | PrimitiveWindowsX64, PrimitiveWindowsX64 =>
+            match abi, other_abi with | PrimitiveWin64, PrimitiveWin64 =>
+              andb(primitive_bytes_equal dll library,
+                andb(primitive_bytes_equal symbol label,
+                  andb(source_packet_abi_equal fuel signature expected,
+                    primitive_bytes_equal (checked_output_gc gc) (checked_output_gc policy))))
+            end
+          end
+      end
+  | PrimitiveIntrinsicBinding _ _ _ _, PrimitiveExternBinding _ => False
+  | PrimitiveExternBinding _, PrimitiveIntrinsicBinding _ _ _ _ => False
+  end;
+
+def source_packet_role_equal (fuel : Nat) (left : PrimitiveRoleBinding)
+    (right : PrimitiveRoleBinding) : Bool :=
+  match left, right with | PrimitiveRoleOf role shape, PrimitiveRoleOf other expected =>
+    match shape, expected with
+    | PrimitiveInductiveOf name params indices family ctors, PrimitiveInductiveOf id count arity typ constructors =>
+        andb(primitive_role_equal role other,
+          andb(eqNat name id, andb(eqNat params count, andb(eqNat indices arity,
+            andb(source_packet_core_equal fuel family typ,
+              source_packet_list_equal CoreTerm (source_packet_core_equal fuel) ctors constructors)))))
+    end
+  end;
+
+def source_packet_entry_equal (fuel : Nat) (left : Entry) (right : Entry) : Bool :=
+  match left, right with
+  | MkEntry name typ body, MkEntry other shape value =>
+      andb(eqNat name other,
+        andb(source_packet_core_equal fuel typ shape, source_packet_optional_core_equal fuel body value))
+  | MkIndEntry name declaration, MkIndEntry other expected =>
+      andb(eqNat name other, source_packet_inductive_equal fuel declaration expected)
+  | MkBoundEntry name typ binding, MkBoundEntry other shape metadata =>
+      andb(eqNat name other,
+        andb(source_packet_core_equal fuel typ shape, source_packet_binding_equal fuel binding metadata))
+  | MkRoleEntry binding, MkRoleEntry other => source_packet_role_equal fuel binding other
+  | MkEntry _ _ _, MkIndEntry _ _ => False
+  | MkEntry _ _ _, MkBoundEntry _ _ _ => False
+  | MkEntry _ _ _, MkRoleEntry _ => False
+  | MkIndEntry _ _, MkEntry _ _ _ => False
+  | MkIndEntry _ _, MkBoundEntry _ _ _ => False
+  | MkIndEntry _ _, MkRoleEntry _ => False
+  | MkBoundEntry _ _ _, MkEntry _ _ _ => False
+  | MkBoundEntry _ _ _, MkIndEntry _ _ => False
+  | MkBoundEntry _ _ _, MkRoleEntry _ => False
+  | MkRoleEntry _, MkEntry _ _ _ => False
+  | MkRoleEntry _, MkIndEntry _ _ => False
+  | MkRoleEntry _, MkBoundEntry _ _ _ => False
+  end;
+
+def source_packet_complete (packet : CheckedSourcePacket) : Bool :=
+  (fix go (entries : List Entry) (owners : List SourceCheckedOwner) : Bool :=
+    match entries with
+    | Nil => match owners with | Nil => True | Cons _ _ => False end
+    | Cons entry rest => match owners with
+        | Nil => False
+        | Cons owned tail => match owned with | SourceCheckedOwnerOf actual _ =>
+            andb(source_packet_entry_equal source_packet_fuel entry actual,
+              go rest tail)
+          end
+        end
+    end) (checked_program_entries (checked_source_packet_program packet))
+      (checked_source_packet_owners packet);
+
+def source_packet_named_owner (packet : CheckedSourcePacket) (path : String)
+    (local : String) (changed : Bool) : Bool :=
+  let state : InternState := checked_program_intern (checked_source_packet_program packet) in
+  match pipeline_literal_id state (prim_string_to_char_codes path) with
+  | Nothing => False
+  | Just unit => match state with | MkIntern names _ _ _ =>
+      match source_lookup_id names (prim_string_to_char_codes local) with
+      | Nothing => False
+      | Just original_name =>
+          let matches : List SourceCheckedOwner := filter SourceCheckedOwner
+            (fun (row : SourceCheckedOwner) => match row with | SourceCheckedOwnerOf _ origin =>
+              match origin with
+              | Nothing => False
+              | Just location => match location with | MkPair owner original =>
+                  andb(eqNat owner unit, source_slot_equal original (MkPair Nat Nat 0 original_name))
+                end
+              end end) (checked_source_packet_owners packet) in
+          match matches with
+          | Nil => False
+          | Cons row rest => match rest with
+              | Cons _ _ => False
+              | Nil => match row with | SourceCheckedOwnerOf entry _ =>
+                  match source_checked_entry_slot entry with | MkPair kind scoped_name =>
+                    andb(eqNat kind 0,
+                      match changed with
+                      | False => eqNat scoped_name original_name
+                      | True => notb(eqNat scoped_name original_name)
+                      end)
+                  end
+                end
+              end
+          end
+      end
+    end
+  end;
+
+def source_packet_positive (root : String) (dependency : String)
+    (selected : String) (changed : Bool) : Bool :=
+  match source_packet_compile root dependency with | MkPair result _ =>
+    match result with
+    | SourceErr _ => False
+    | SourceOk packet =>
+        andb(source_packet_complete packet,
+          andb(source_packet_named_owner packet "dep.ouro" selected changed,
+            source_packet_named_owner packet "main.ouro" "result" False))
+    end
+  end;
+
+def source_packet_test_decl : Decl := DDef 7 (ESort 1) (ESort 0) 0 [];
+
+def source_packet_test_entry : Entry :=
+  MkEntry 7 (CSort 1) (Just CoreTerm (CSort 0));
+
+def source_packet_test_slot : SourceModuleSlot :=
+  SourceModuleSlotOf 11
+    (MkPair (Pair Nat Nat) (Maybe (Pair Nat Nat))
+      (MkPair Nat Nat 0 7) (Just (Pair Nat Nat) (MkPair Nat Nat 0 4)));
+
+def source_packet_test_sources : List SourceDecl :=
+  [SourceDeclOf (Just Nat 11) source_packet_test_decl];
+
+def source_packet_owner_unknown (slots : List SourceModuleSlot)
+    (sources : List SourceDecl) (decls : List Decl) (entries : List Entry) : Bool :=
+  match source_checked_owners slots sources decls entries with
+  | Nil => False
+  | Cons row rest => match row with | SourceCheckedOwnerOf entry origin =>
+      andb(source_packet_entry_equal source_packet_fuel source_packet_test_entry entry,
+        andb(match origin with | Nothing => True | Just _ => False end,
+          match rest with | Nil => True | Cons _ _ => False end))
+    end
+  end;
+
+def source_packet_owner_aligned : Bool :=
+  match source_checked_owners [source_packet_test_slot] source_packet_test_sources
+      [source_packet_test_decl] [source_packet_test_entry] with
+  | Nil => False
+  | Cons row rest => match row with | SourceCheckedOwnerOf entry origin =>
+      andb(source_packet_entry_equal source_packet_fuel source_packet_test_entry entry,
+        andb(match origin with
+          | Nothing => False
+          | Just location => match location with | MkPair unit original =>
+              andb(eqNat unit 11, source_slot_equal original (MkPair Nat Nat 0 4))
+            end
+          end,
+          match rest with | Nil => True | Cons _ _ => False end))
+    end
+  end;
+
+def source_packet_checked_duplicate : Bool :=
+  let owners : List SourceCheckedOwner := source_checked_owners
+    [source_packet_test_slot] source_packet_test_sources [source_packet_test_decl]
+    [source_packet_test_entry, source_packet_test_entry] in
+  andb(eqNat (length SourceCheckedOwner owners) 2,
+    all SourceCheckedOwner (fun (row : SourceCheckedOwner) => match row with | SourceCheckedOwnerOf entry origin =>
+      andb(source_packet_entry_equal source_packet_fuel source_packet_test_entry entry,
+        match origin with | Nothing => True | Just _ => False end)
+    end) owners);
+
+def source_packet_checked_wide_duplicates : Bool :=
+  let lower : Nat := add (mul (pow_nat 2 32) (pow_nat 2 32)) 6 in
+  let wide : Nat := add lower 1 in
+  let first : Entry := MkEntry wide (CSort 1) (Just CoreTerm (CSort 0)) in
+  let wide_axiom : Entry := MkEntry wide (CSort 1) (Nothing CoreTerm) in
+  let second : Entry := MkEntry (S lower) (CSort 2) (Just CoreTerm (CSort 1)) in
+  let entries : List Entry := [first, source_packet_test_entry, wide_axiom, second] in
+  let decls : List Decl :=
+    [DDef wide (ESort 1) (ESort 0) 0 [], source_packet_test_decl, DAxiom wide (ESort 1)] in
+  let sources : List SourceDecl := map Decl SourceDecl (SourceDeclOf (Just Nat 11)) decls in
+  let slots : List SourceModuleSlot := source_module_slot_relation 11 decls decls in
+  let unknown : Maybe (Pair Nat (Pair Nat Nat)) := Nothing (Pair Nat (Pair Nat Nat)) in
+  let known (kind : Nat) (name : Nat) : Maybe (Pair Nat (Pair Nat Nat)) :=
+    Just (Pair Nat (Pair Nat Nat)) (MkPair Nat (Pair Nat Nat) 11 (MkPair Nat Nat kind name)) in
+  let expected : List SourceCheckedOwner :=
+    [SourceCheckedOwnerOf first unknown,
+     SourceCheckedOwnerOf source_packet_test_entry (known 0 7),
+     SourceCheckedOwnerOf wide_axiom (known 1 wide),
+     SourceCheckedOwnerOf second unknown] in
+  let same (actual : SourceCheckedOwner) (target : SourceCheckedOwner) : Bool :=
+    let (SourceCheckedOwnerOf entry origin) := actual in
+    let (SourceCheckedOwnerOf wanted wanted_origin) := target in
+    andb(source_packet_entry_equal source_packet_fuel entry wanted,
+      match origin, wanted_origin with
+      | Nothing, Nothing => True
+      | Just location, Just wanted_location =>
+          let (MkPair owner slot) := location in
+          let (MkPair wanted_owner wanted_slot) := wanted_location in
+          andb(eqNat owner wanted_owner, source_slot_equal slot wanted_slot)
+      | Nothing, Just _ => False
+      | Just _, Nothing => False
+      end) in
+  source_packet_list_equal SourceCheckedOwner same
+    (source_checked_owners slots sources decls entries) expected;
+
+def source_packet_relation_unknown (before : List Decl) (after : List Decl) : Bool :=
+  let slots : List SourceModuleSlot := source_module_slot_relation 11 before after in
+  andb(eqNat (length SourceModuleSlot slots) (length Decl after),
+    all SourceModuleSlot (fun (row : SourceModuleSlot) => match row with | SourceModuleSlotOf _ relation =>
+      match relation with | MkPair _ original =>
+        match original with | Nothing => True | Just _ => False end
+      end end) slots);
+
+def source_packet_error_projection : Bool :=
+  let failure : SourceFailure := SourceFailureOf (ErrCode 41 7)
+    (MkPair (Maybe SourceFailureOwner) (Maybe LowerRootCause)
+      (Just SourceFailureOwner
+        (SourceFailureOwnerOf (MkPair Nat CompileProgramPhase 7 CompileCorePhase)
+          (MkPair (Maybe Nat) (Maybe (Pair Nat Nat)) (Just Nat 11) (Nothing (Pair Nat Nat)))))
+      (Just LowerRootCause (LowerRootNamedHole 77))) in
+  match checked_source_packet_project (SourceErr CheckedSourcePacket failure) with
+  | SourceOk _ => False
+  | SourceErr current => match current with | SourceFailureOf error metadata =>
+      match error with | ErrCode code detail =>
+        andb(eqNat code 41, andb(eqNat detail 7,
+          match metadata with | MkPair owner cause =>
+            andb(match owner with
+              | Nothing => False
+              | Just located => match located with | SourceFailureOwnerOf declaration origin =>
+                  andb(match declaration with | MkPair name phase =>
+                    andb(eqNat name 7, (if let CompileCorePhase := (phase : CompileProgramPhase) then True else False)) end,
+                    match origin with | MkPair unit span =>
+                      andb(match unit with | Just path => eqNat path 11 | Nothing => False end,
+                        match span with | Nothing => True | Just _ => False end)
+                    end)
+                end
+              end,
+              match cause with
+              | Nothing => False
+              | Just root => match root with
+                  | LowerRootNamedHole name => eqNat name 77
+                  | LowerRootList _ => False
+                  end
+              end)
+          end))
+      end
+    end
+  end;
+
+def source_packet_success_projection : Bool :=
+  let checked : CheckedProgram := CheckedProgramOf empty_intern [source_packet_test_entry]
+    [MkPair Nat CoreTerm 7 (CSort 0)] in
+  match checked_source_packet_project
+      (SourceOk CheckedSourcePacket
+        (CheckedSourcePacketOf checked
+          (MkPair (List SourceModuleSlot) (List SourceCheckedOwner) [source_packet_test_slot]
+            (source_checked_owners [source_packet_test_slot] source_packet_test_sources
+              [source_packet_test_decl] [source_packet_test_entry])))) with
+  | SourceErr _ => False
+  | SourceOk actual => match checked_program_entries actual with
+      | Nil => False
+      | Cons entry rest => if let MkEntry name typ body := (entry : Entry) then
+          andb(eqNat name 7, andb(eqTerm 100 typ (CSort 1),
+            andb(match body with | Nothing => False | Just value => eqTerm 100 value (CSort 0) end,
+              andb(match rest with | Nil => True | Cons _ _ => False end,
+                match checked_program_cores actual with
+                | Nil => False
+                | Cons core tail => match core with | MkPair id term =>
+                    andb(eqNat id 7, andb(eqTerm 100 term (CSort 0),
+                      match tail with | Nil => True | Cons _ _ => False end))
+                  end
+                end))))
+        else False
+      end
+  end;
+
+def source_packet_rejected (code : Nat) (root : String) (dependency : String) : Bool :=
+  let legacy : Pair (SourceResult CheckedProgram) InternState :=
+    compile_checked_units_with_origin source_packet_fuel (prim_string_to_char_codes "main.ouro")
+      [source_packet_unit "main.ouro" root, source_packet_unit "dep.ouro" dependency] in
+  match source_packet_compile root dependency with | MkPair result _ =>
+    match result with
+    | SourceOk _ => False
+    | SourceErr failure => match failure with | SourceFailureOf error _ =>
+        match error with | ErrCode actual detail => match legacy with | MkPair original _ =>
+          match original with
+          | SourceOk _ => False
+          | SourceErr before => match before with | SourceFailureOf previous _ =>
+              match previous with | ErrCode old_code old_detail =>
+                andb(eqNat actual code, andb(eqNat actual old_code, eqNat detail old_detail))
+              end
+            end
+          end
+        end end
+      end
+    end
+  end;
+
+def source_packet_payload_packet (expected : Entry) (actual : Entry) : CheckedSourcePacket :=
+  CheckedSourcePacketOf (CheckedProgramOf empty_intern [expected] [])
+    (MkPair (List SourceModuleSlot) (List SourceCheckedOwner) []
+      [SourceCheckedOwnerOf actual (Nothing (Pair Nat (Pair Nat Nat)))]);
+
+def source_packet_payload_refused (expected : Entry) (actual : Entry) : Bool :=
+  andb(source_slot_equal (source_checked_entry_slot expected) (source_checked_entry_slot actual),
+    notb(source_packet_complete (source_packet_payload_packet expected actual)));
+
+def source_packet_inductive_decl : IndDecl :=
+  MkIndDecl 7 [MkParam 4 (CSort 1), MkParam 5 (CRel 0)] [CRel 0, CRel 1] 1
+    [MkCtor 8 (CRel 0), MkCtor 9 (CRel 1)];
+
+def source_packet_inductive_mutations : List IndDecl :=
+  [ MkIndDecl 8 [MkParam 4 (CSort 1), MkParam 5 (CRel 0)] [CRel 0, CRel 1] 1 [MkCtor 8 (CRel 0), MkCtor 9 (CRel 1)]
+  , MkIndDecl 7 [MkParam 6 (CSort 1), MkParam 5 (CRel 0)] [CRel 0, CRel 1] 1 [MkCtor 8 (CRel 0), MkCtor 9 (CRel 1)]
+  , MkIndDecl 7 [MkParam 4 (CSort 2), MkParam 5 (CRel 0)] [CRel 0, CRel 1] 1 [MkCtor 8 (CRel 0), MkCtor 9 (CRel 1)]
+  , MkIndDecl 7 [MkParam 5 (CRel 0), MkParam 4 (CSort 1)] [CRel 0, CRel 1] 1 [MkCtor 8 (CRel 0), MkCtor 9 (CRel 1)]
+  , MkIndDecl 7 [MkParam 4 (CSort 1)] [CRel 0, CRel 1] 1 [MkCtor 8 (CRel 0), MkCtor 9 (CRel 1)]
+  , MkIndDecl 7 [MkParam 4 (CSort 1), MkParam 5 (CRel 0)] [CRel 2, CRel 1] 1 [MkCtor 8 (CRel 0), MkCtor 9 (CRel 1)]
+  , MkIndDecl 7 [MkParam 4 (CSort 1), MkParam 5 (CRel 0)] [CRel 1, CRel 0] 1 [MkCtor 8 (CRel 0), MkCtor 9 (CRel 1)]
+  , MkIndDecl 7 [MkParam 4 (CSort 1), MkParam 5 (CRel 0)] [CRel 0] 1 [MkCtor 8 (CRel 0), MkCtor 9 (CRel 1)]
+  , MkIndDecl 7 [MkParam 4 (CSort 1), MkParam 5 (CRel 0)] [CRel 0, CRel 1] 2 [MkCtor 8 (CRel 0), MkCtor 9 (CRel 1)]
+  , MkIndDecl 7 [MkParam 4 (CSort 1), MkParam 5 (CRel 0)] [CRel 0, CRel 1] 1 [MkCtor 10 (CRel 0), MkCtor 9 (CRel 1)]
+  , MkIndDecl 7 [MkParam 4 (CSort 1), MkParam 5 (CRel 0)] [CRel 0, CRel 1] 1 [MkCtor 8 (CRel 2), MkCtor 9 (CRel 1)]
+  , MkIndDecl 7 [MkParam 4 (CSort 1), MkParam 5 (CRel 0)] [CRel 0, CRel 1] 1 [MkCtor 9 (CRel 1), MkCtor 8 (CRel 0)]
+  , MkIndDecl 7 [MkParam 4 (CSort 1), MkParam 5 (CRel 0)] [CRel 0, CRel 1] 1 [MkCtor 8 (CRel 0)]
+  ];
+
+def source_packet_intrinsic_entry (id : PrimitiveId) (mode : PrimitiveExecution)
+    (gc : PrimitiveGc) (specialization : Maybe CoreTerm) : Entry :=
+  MkBoundEntry 7 (CSort 1) (PrimitiveIntrinsicBinding id mode gc specialization);
+
+def source_packet_intrinsic : Entry :=
+  source_packet_intrinsic_entry PrimitiveFileReadStatus PrimitiveRuntimeAction PrimitiveNoGc
+    (Just CoreTerm (CSort 0));
+
+def source_packet_intrinsic_mutations : List Entry :=
+  [ MkBoundEntry 7 (CSort 2)
+      (PrimitiveIntrinsicBinding PrimitiveFileReadStatus PrimitiveRuntimeAction PrimitiveNoGc (Just CoreTerm (CSort 0)))
+  , source_packet_intrinsic_entry PrimitiveFileRead PrimitiveRuntimeAction PrimitiveNoGc (Just CoreTerm (CSort 0))
+  , source_packet_intrinsic_entry PrimitiveFileReadStatus PrimitivePureValue PrimitiveNoGc (Just CoreTerm (CSort 0))
+  , source_packet_intrinsic_entry PrimitiveFileReadStatus PrimitiveRuntimeAction PrimitiveMayGc (Just CoreTerm (CSort 0))
+  , source_packet_intrinsic_entry PrimitiveFileReadStatus PrimitiveRuntimeAction PrimitiveNoGc (Just CoreTerm (CSort 1))
+  , source_packet_intrinsic_entry PrimitiveFileReadStatus PrimitiveRuntimeAction PrimitiveNoGc (Nothing CoreTerm)
+  ];
+
+def source_packet_extern_abi : PrimitiveAbiSignature :=
+  PrimitiveAbiSignatureOf
+    [PrimitiveAbiWord PrimitiveWordU32, PrimitiveAbiPointer (CRel 0), PrimitiveAbiFunction (CPi (CRel 0) (CRel 1))]
+    (Just PrimitiveAbiValue (PrimitiveAbiWord PrimitiveWordU32));
+
+def source_packet_extern_entry (dll : List Nat) (symbol : List Nat)
+    (signature : PrimitiveAbiSignature) (gc : PrimitiveGc) : Entry :=
+  MkBoundEntry 7 (CSort 1)
+    (PrimitiveExternBinding (CheckedExternOf PrimitiveWindowsX64 PrimitiveWin64 dll symbol signature gc));
+
+def source_packet_extern : Entry :=
+  source_packet_extern_entry [65, 66] [67, 68] source_packet_extern_abi PrimitiveNoGc;
+
+def source_packet_extern_mutations : List Entry :=
+  [ MkBoundEntry 7 (CSort 2)
+      (PrimitiveExternBinding (CheckedExternOf PrimitiveWindowsX64 PrimitiveWin64 [65, 66] [67, 68] source_packet_extern_abi PrimitiveNoGc))
+  , source_packet_extern_entry [65, 69] [67, 68] source_packet_extern_abi PrimitiveNoGc
+  , source_packet_extern_entry [65, 66] [67, 69] source_packet_extern_abi PrimitiveNoGc
+  , source_packet_extern_entry [65, 66] [67, 68]
+      (PrimitiveAbiSignatureOf
+        [PrimitiveAbiWord PrimitiveWordU64, PrimitiveAbiPointer (CRel 0), PrimitiveAbiFunction (CPi (CRel 0) (CRel 1))]
+        (Just PrimitiveAbiValue (PrimitiveAbiWord PrimitiveWordU32))) PrimitiveNoGc
+  , source_packet_extern_entry [65, 66] [67, 68]
+      (PrimitiveAbiSignatureOf
+        [PrimitiveAbiWord PrimitiveWordU32, PrimitiveAbiPointer (CRel 1), PrimitiveAbiFunction (CPi (CRel 0) (CRel 1))]
+        (Just PrimitiveAbiValue (PrimitiveAbiWord PrimitiveWordU32))) PrimitiveNoGc
+  , source_packet_extern_entry [65, 66] [67, 68]
+      (PrimitiveAbiSignatureOf
+        [PrimitiveAbiWord PrimitiveWordU32, PrimitiveAbiPointer (CRel 0), PrimitiveAbiFunction (CPi (CRel 0) (CRel 2))]
+        (Just PrimitiveAbiValue (PrimitiveAbiWord PrimitiveWordU32))) PrimitiveNoGc
+  , source_packet_extern_entry [65, 66] [67, 68]
+      (PrimitiveAbiSignatureOf
+        [PrimitiveAbiWord PrimitiveWordU32, PrimitiveAbiFunction (CRel 0), PrimitiveAbiFunction (CPi (CRel 0) (CRel 1))]
+        (Just PrimitiveAbiValue (PrimitiveAbiWord PrimitiveWordU32))) PrimitiveNoGc
+  , source_packet_extern_entry [65, 66] [67, 68]
+      (PrimitiveAbiSignatureOf
+        [PrimitiveAbiPointer (CRel 0), PrimitiveAbiWord PrimitiveWordU32, PrimitiveAbiFunction (CPi (CRel 0) (CRel 1))]
+        (Just PrimitiveAbiValue (PrimitiveAbiWord PrimitiveWordU32))) PrimitiveNoGc
+  , source_packet_extern_entry [65, 66] [67, 68]
+      (PrimitiveAbiSignatureOf [PrimitiveAbiWord PrimitiveWordU32, PrimitiveAbiPointer (CRel 0)]
+        (Just PrimitiveAbiValue (PrimitiveAbiWord PrimitiveWordU32))) PrimitiveNoGc
+  , source_packet_extern_entry [65, 66] [67, 68]
+      (PrimitiveAbiSignatureOf
+        [PrimitiveAbiWord PrimitiveWordU32, PrimitiveAbiPointer (CRel 0), PrimitiveAbiFunction (CPi (CRel 0) (CRel 1))]
+        (Nothing PrimitiveAbiValue)) PrimitiveNoGc
+  , source_packet_extern_entry [65, 66] [67, 68]
+      (PrimitiveAbiSignatureOf
+        [PrimitiveAbiWord PrimitiveWordU32, PrimitiveAbiPointer (CRel 0), PrimitiveAbiFunction (CPi (CRel 0) (CRel 1))]
+        (Just PrimitiveAbiValue (PrimitiveAbiWord PrimitiveWordU64))) PrimitiveNoGc
+  , source_packet_extern_entry [65, 66] [67, 68] source_packet_extern_abi PrimitiveMayGc
+  ];
+
+def source_packet_role_entry (role : PrimitiveRole) (params : Nat) (indices : Nat)
+    (family : CoreTerm) (ctors : List CoreTerm) : Entry :=
+  MkRoleEntry (PrimitiveRoleOf role (PrimitiveInductiveOf 7 params indices family ctors));
+
+def source_packet_role : Entry :=
+  source_packet_role_entry PrimitiveListRole 1 1 (CSort 1) [CRel 0, CRel 1];
+
+def source_packet_role_mutations : List Entry :=
+  [ source_packet_role_entry PrimitivePairRole 1 1 (CSort 1) [CRel 0, CRel 1]
+  , source_packet_role_entry PrimitiveListRole 2 1 (CSort 1) [CRel 0, CRel 1]
+  , source_packet_role_entry PrimitiveListRole 1 2 (CSort 1) [CRel 0, CRel 1]
+  , source_packet_role_entry PrimitiveListRole 1 1 (CSort 2) [CRel 0, CRel 1]
+  , source_packet_role_entry PrimitiveListRole 1 1 (CSort 1) [CRel 2, CRel 1]
+  , source_packet_role_entry PrimitiveListRole 1 1 (CSort 1) [CRel 1, CRel 0]
+  , source_packet_role_entry PrimitiveListRole 1 1 (CSort 1) [CRel 0]
+  ];
+
+def source_packet_payloads_preserved : Bool :=
+  let entries : List Entry :=
+    [source_packet_test_entry, MkEntry 7 (CSort 1) (Nothing CoreTerm),
+     MkIndEntry 7 source_packet_inductive_decl, source_packet_intrinsic, source_packet_extern, source_packet_role] in
+  let owners : List SourceCheckedOwner := source_checked_owners [] [] [] entries in
+  source_packet_complete
+    (CheckedSourcePacketOf (CheckedProgramOf empty_intern entries [])
+      (MkPair (List SourceModuleSlot) (List SourceCheckedOwner) [] owners));
+
+def source_packet_laws : List Test :=
+  [ assert_true "plain imports retain original provider unit and slot"
+      (source_packet_positive "import \"dep.ouro\"; def result : Token := value;"
+        source_packet_dependency "value" False)
+  , assert_true "qualified alias retains original provider slot"
+      (source_packet_positive "import \"dep.ouro\" as D; def result : D.Token := D.value;"
+        source_packet_dependency "value" False)
+  , assert_true "selected alias retains original provider slot after renaming"
+      (source_packet_positive "import \"dep.ouro\" as D exposing (Token, value as chosen); def result : Token := chosen;"
+        source_packet_dependency "value" True)
+  , assert_true "private alias closure retains checked hidden body ownership"
+      (source_packet_positive "import \"dep.ouro\" as D; def result : D.Token := D.value;"
+        "inductive Token : Type := | Hit : Token; private def hidden : Token := Hit; def value : Token := hidden;"
+        "hidden" True)
+  , assert_true "aligned checked owner includes original local and actual scoped slot" source_packet_owner_aligned
+  , assert_true "unknown source unit cannot establish ownership"
+      (source_packet_owner_unknown [source_packet_test_slot]
+        [SourceDeclOf (Nothing Nat) source_packet_test_decl]
+        [source_packet_test_decl] [source_packet_test_entry])
+  , assert_true "duplicate checked entries retain complete unknown rows" source_packet_checked_duplicate
+  , assert_true "wide duplicate slots retain both rows and preserve distinct owners"
+      source_packet_checked_wide_duplicates
+  , assert_true "duplicate resolver candidates cannot establish ownership"
+      (source_packet_owner_unknown [source_packet_test_slot, source_packet_test_slot]
+        source_packet_test_sources [source_packet_test_decl] [source_packet_test_entry])
+  , assert_true "misaligned source declaration cannot establish ownership"
+      (source_packet_owner_unknown [source_packet_test_slot]
+        [SourceDeclOf (Just Nat 11) (DDef 8 (ESort 1) (ESort 0) 0 [])]
+        [source_packet_test_decl] [source_packet_test_entry])
+  , assert_true "exhausted origins retain a matching unknown candidate"
+      (source_packet_owner_unknown [source_packet_test_slot] source_packet_test_sources
+        [source_packet_test_decl, source_packet_test_decl] [source_packet_test_entry])
+  , assert_true "extra matching source declaration cannot establish ownership"
+      (source_packet_owner_unknown [source_packet_test_slot]
+        [SourceDeclOf (Just Nat 11) source_packet_test_decl,
+         SourceDeclOf (Just Nat 11) source_packet_test_decl]
+        [source_packet_test_decl] [source_packet_test_entry])
+  , assert_true "extra checked declaration retains an unknown row"
+      (source_packet_owner_unknown [source_packet_test_slot] source_packet_test_sources
+        [] [source_packet_test_entry])
+  , assert_true "forged original declaration kind cannot establish ownership"
+      (source_packet_owner_unknown
+        [SourceModuleSlotOf 11
+          (MkPair (Pair Nat Nat) (Maybe (Pair Nat Nat))
+            (MkPair Nat Nat 0 7) (Just (Pair Nat Nat) (MkPair Nat Nat 1 4)))]
+        source_packet_test_sources [source_packet_test_decl] [source_packet_test_entry])
+  , assert_true "resolver kind mismatch cannot establish local slot"
+      (source_packet_relation_unknown [DAxiom 4 (ESort 1)] [source_packet_test_decl])
+  , assert_true "resolver exhausted declarations preserve all scoped rows"
+      (source_packet_relation_unknown [] [source_packet_test_decl, source_packet_test_decl])
+  , assert_true "resolver extra declaration does not grant a truncated relation"
+      (source_packet_relation_unknown [source_packet_test_decl, source_packet_test_decl] [source_packet_test_decl])
+  , assert_true "checked success projection preserves complete type and core body" source_packet_success_projection
+  , assert_true "failure projection preserves full typed error and metadata" source_packet_error_projection
+  , assert_true "unused imported invalid body still fails before packet success"
+      (source_packet_rejected 41 "import \"dep.ouro\"; def result : Token := Hit;"
+        "inductive Token : Type := | Hit : Token; def hidden : Token := Type;")
+  , assert_true "private alias rejection retains existing unresolved-member code"
+      (source_packet_rejected 95 "import \"dep.ouro\" as D; def result : D.Token := D.hidden;"
+        "inductive Token : Type := | Hit : Token; private def hidden : Token := Hit;")
+  , assert_true "complete owner rows preserve every Entry payload in order" source_packet_payloads_preserved
+  , assert_true "same-slot definition type mutation is rejected"
+      (source_packet_payload_refused source_packet_test_entry
+        (MkEntry 7 (CSort 2) (Just CoreTerm (CSort 0))))
+  , assert_true "same-slot definition body mutation is rejected"
+      (source_packet_payload_refused source_packet_test_entry
+        (MkEntry 7 (CSort 1) (Just CoreTerm (CSort 1))))
+  , assert_true "same-slot axiom type mutation is rejected"
+      (source_packet_payload_refused (MkEntry 7 (CSort 1) (Nothing CoreTerm))
+        (MkEntry 7 (CSort 2) (Nothing CoreTerm)))
+  , assert_true "same-slot inductive descriptor mutations are rejected"
+      (all IndDecl (fun (actual : IndDecl) =>
+        source_packet_payload_refused (MkIndEntry 7 source_packet_inductive_decl) (MkIndEntry 7 actual))
+        source_packet_inductive_mutations)
+  , assert_true "same-slot intrinsic contract mutations are rejected"
+      (all Entry (source_packet_payload_refused source_packet_intrinsic) source_packet_intrinsic_mutations)
+  , assert_true "same-slot extern ABI and byte metadata mutations are rejected"
+      (all Entry (source_packet_payload_refused source_packet_extern) source_packet_extern_mutations)
+  , assert_true "same-slot representation shape mutations are rejected"
+      (all Entry (source_packet_payload_refused source_packet_role) source_packet_role_mutations)
+  , assert_true "complete Entry comparison refuses exhausted Core equality"
+      (notb(source_packet_entry_equal 0 source_packet_test_entry source_packet_test_entry))
+  , assert_true "complete Entry comparison refuses unresolved Core literals"
+      (let malformed : Entry := MkEntry 7 (CStrLit 0 9) (Just CoreTerm (CSort 0)) in
+        notb(source_packet_entry_equal source_packet_fuel malformed malformed))
+  , assert_true "complete Entry comparison retains fixpoint display IDs"
+      (let before : CoreTerm := CFix 4 0 1 (CSort 1) (CSort 0) in
+        let after : CoreTerm := CFix 5 0 1 (CSort 1) (CSort 0) in
+        andb(eqTerm source_packet_fuel before after,
+          source_packet_payload_refused
+            (MkEntry 7 (CSort 1) (Just CoreTerm before))
+            (MkEntry 7 (CSort 1) (Just CoreTerm after))))
+  ];
+
+def main : IO Unit := test_run source_packet_laws;

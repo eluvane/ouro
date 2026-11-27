@@ -6,138 +6,138 @@ Declarations: 23.
 
 ## inductive ConfigError
 
-```
+```ouro
 inductive ConfigError : Type
 ```
 
 ## def Config
 
-```
+```ouro
 def Config : Type
 ```
 
 ## def config_empty
 
-```
+```ouro
 def config_empty : Config
 ```
 
 ## def config_error_code
 
-```
+```ouro
 def config_error_code (e : ConfigError) : String
 ```
 
 ## def config_error_message
 
-```
+```ouro
 def config_error_message (e : ConfigError) : String
 ```
 
 ## def config_line_payload
 
-```
+```ouro
 def config_line_payload (line : String) : Maybe (Pair String String)
 ```
 
 ## def config_insert_line
 
-```
+```ouro
 def config_insert_line (line : String) (cfg : Config) : Config
 ```
 
 ## def config_parse
 
-```
+```ouro
 def config_parse (text : String) : Config
 ```
 
 ## def config_from_string
 
-```
+```ouro
 def config_from_string (text : String) : Config
 ```
 
 ## def config_get
 
-```
+```ouro
 def config_get (cfg : Config) (key : String) : Maybe String
 ```
 
 ## def config_has
 
-```
+```ouro
 def config_has (cfg : Config) (key : String) : Bool
 ```
 
 ## def config_get_or
 
-```
+```ouro
 def config_get_or (cfg : Config) (key : String) (fallback : String) : String
 ```
 
 ## def config_require
 
-```
+```ouro
 def config_require (cfg : Config) (key : String) : Either ConfigError String
 ```
 
 ## def config_get_nat
 
-```
+```ouro
 def config_get_nat (cfg : Config) (key : String) : Either ConfigError Nat
 ```
 
 ## def config_get_nat_or
 
-```
+```ouro
 def config_get_nat_or (cfg : Config) (key : String) (fallback : Nat) : Nat
 ```
 
 ## def config_get_bool
 
-```
+```ouro
 def config_get_bool (cfg : Config) (key : String) : Either ConfigError Bool
 ```
 
 ## def config_get_bool_or
 
-```
+```ouro
 def config_get_bool_or (cfg : Config) (key : String) (fallback : Bool) : Bool
 ```
 
 ## def config_keys
 
-```
+```ouro
 def config_keys (cfg : Config) : List String
 ```
 
 ## def config_has_all
 
-```
+```ouro
 def config_has_all (cfg : Config) (keys : List String) : Bool
 ```
 
 ## def config_render_pair
 
-```
+```ouro
 def config_render_pair (p : Pair String String) : String
 ```
 
 ## def config_render
 
-```
+```ouro
 def config_render (cfg : Config) : String
 ```
 
 ## def config_merge
 
-```
+```ouro
 def config_merge (base : Config) (override : Config) : Config
 ```
 
 ## def config_from_pairs
 
-```
+```ouro
 def config_from_pairs (pairs : List (Pair String String)) : Config
 ```

@@ -43,7 +43,6 @@ from repo_support import bind_relative_path, write_json_atomic
 ROOT = Path(__file__).resolve().parents[1]
 rel = bind_relative_path(ROOT, resolve=True)
 REPORT_KIND = "ouro.bench-suite.v1"
-# Thresholds only after two local runs.
 THRESHOLD_POLICY = (
     "Numeric wall-clock thresholds are not enforced yet; this seed records "
     "host timings only until two local runs exist."
@@ -221,10 +220,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     return 1 if failed else 0
 
 
-# Quality measurement is opt-in; the packaged check/fmt/help seed above keeps
-# its existing report ABI. Prebuild both revisions, then use the SAME corpus,
-# manifest and budgets, changing only --bin-dir and --label. This runner never
-# builds, changes rules, updates expected output or caches diagnostic results.
+# Quality benchmarks use a separate report schema. Compare prebuilt revisions
+# with the same corpus, manifest, and budgets.
 QUALITY_KIND = "ouro.quality-bench.v1"
 
 

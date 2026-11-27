@@ -4,6 +4,8 @@
 import "../tools/quality/source.ouro",
   "../tools/quality/input_error.ouro",
   "../tools/quality/text.ouro",
+  "../std/collections.ouro",
+  "../std/stringx.ouro",
   "../tools/strict/scan.ouro";
 
 def qit_keep (_path : String) : Bool := True;
@@ -82,6 +84,56 @@ def qit_def_spans_shape : Bool :=
             : List (Pair Nat Nat))
           (st_def_spans mixed)));
 
+def qit_def_event (finding : QrFinding) : String :=
+    qt_cat4 (qr_find_code finding) " " (prim_string_of_nat (qr_find_line finding))
+      (qt_cat4 ":" (prim_string_of_nat (qr_find_col finding)) " " (qr_find_witness finding));
+
+def qit_def_scan_events : Bool :=
+    let source : String := foldr String String
+      (fun (line : String) (rest : String) => qt_cat3 line "\r\n" rest) ""
+      ["-- @export edge", "", "-- gap", "",
+       "def edge := match 0 with | Data _ => [] end;",
+       "def private := match 0 with | Data _ => [] end;;",
+       "record Stop : Type :=", "  | Data _ => [];;",
+       "def text := r#\"ignored", "def masked := [];;", "-- @export fake", "\"#;",
+       "def after := match 0 with | Data _ => [] end;",
+       "def values :=", "  -- decoy [99];;", "", "    [0];; -- witness",
+       "def blocked :=", "record End : Type :=", "    [1];;", "def last := [];;"] in
+    let lines : List String := qt_split_lines source in
+    let code : List String := qt_source_code_lines source in
+    let style : List String :=
+      ["OURO-LINT042 6:47 def private := match 0 with | Data _ => [] end;;",
+       "OURO-LINT041 17:5 [0];; -- witness", "OURO-LINT042 17:8 [0];; -- witness",
+       "OURO-LINT042 21:15 def last := [];;", "OURO-LINT041 21:13 def last := [];;"] in
+    -- Scanners prepend findings. Compare their order before reports sort by position.
+    let events : List QrFinding -> List String := fun (findings : List QrFinding) =>
+      map QrFinding String qit_def_event (reverse_lin QrFinding findings) in
+    andb (list_eq String prim_string_eq
+      (Cons String "OURO-LINT040 5:26 def edge := match 0 with | Data _ => [] end;" style)
+      (events (st_scan_defs [] "strict" "events.ouro" lines code [])))
+      (list_eq String prim_string_eq style
+        (events (st_scan_definition_spans False [] "strict" "events.ouro" lines code [])));
+
+def qit_assignment_bytes : Bool :=
+    let nul : String := prim_string_of_char_codes [0] in
+    let before : String := qt_cat3 "def before " nul " := [0];" in
+    let split : String := qt_cat3 "def split :" nul "= [];" in
+    let source : String := qt_cat4 before "\r\n" split "\r\n" in
+    let findings : List QrFinding := st_scan_defs [] "strict" "bytes.ouro"
+      (qt_split_lines source) (qt_source_code_lines source) [] in
+    list_eq String prim_string_eq [prim_string_concat "OURO-LINT041 1:17 " before]
+      (map QrFinding String qit_def_event findings);
+
+def qit_public_marker_boundary : Bool :=
+    let lines : List String :=
+      ["-- @export first", "def first : Nat := 0;", "def second : Nat := 1;"] in
+    andb (st_public_near lines 1) (notb (st_public_near lines 2));
+
+def qit_space_bytes : Bool :=
+    list_eq Nat eq_nat [9, 10, 11, 12, 13, 28, 29, 30, 31, 32]
+      (filter Nat byte_is_space
+        [0, 8, 9, 10, 11, 12, 13, 14, 27, 28, 29, 30, 31, 32, 33, 127, 128, 255]);
+
 def qit_top_form_shape : Bool :=
     all Bool (fun (yes : Bool) => yes)
       [ st_is_top_form "def value : Nat := 0;"
@@ -135,6 +187,29 @@ def qit_crlf_mask_offsets : Bool :=
           end
       end);
 
+def qit_split_line_bytes : Bool :=
+    let same (source : String) (expected : List (List Nat)) : Bool :=
+      list_eq (List Nat) (list_eq Nat eq_nat) expected
+        (map String (List Nat) prim_string_to_char_codes (qt_split_lines source)) in
+    all Bool (fun (yes : Bool) => yes)
+      [ same "" [[]]
+      , same "\na\n" [[], [97], []]
+      , same (prim_string_of_char_codes [195, 169, 13, 10, 10, 255, 13])
+          [[195, 169], [], [255], []]
+      , same (prim_string_of_char_codes [0, 255, 13, 10, 195, 169, 13, 10, 10, 254])
+          [[0, 255], [195, 169], [], [254]]
+      , same (prim_string_of_char_codes [97, 0, 98, 10, 99]) [[97, 0, 98], [99]]
+      , same (prim_string_of_char_codes [97, 10, 0]) [[97], [0]]
+      ];
+
+def qit_long_mask_offsets : Bool :=
+    let payload : String := str_repeat "abc\r\n" 32000 in
+    let blank : String := str_repeat "   \r\n" 32000 in
+    let suffix : String := ";\r\n-- @api real\r\ndef real : Nat := 0;\n" in
+    prim_string_eq
+      (qt_mask_literals (qt_cat4 "def text : String := \"" payload "\"" suffix))
+      (qt_cat4 "def text : String :=  " blank " " suffix);
+
 def qit_multiline_crlf_mask_offsets : Bool :=
     let source : String :=
       "def text : String := \"\"\"\r\n  -- @api fake\r\n  def fake : Nat := 0;\r\n  \"\"\";\r\n-- @api real\r\ndef real : Nat := 0;" in
@@ -150,14 +225,12 @@ def qit_multiline_crlf_mask_offsets : Bool :=
          end));
 
 def qit_check (row : Pair String Bool) : IO Nat :=
-    match row with
-    | MkPair label passed =>
-        match passed with
-        | True => io_pure Nat Z
-        | False =>
-            do eprintln (concat "QUALITY_INPUT_TESTS: FAIL " label);
-               io_pure(Nat, S Z)
-        end
+    let (MkPair label passed) := row in
+    match passed with
+    | True => io_pure Nat Z
+    | False =>
+        do eprintln (concat "QUALITY_INPUT_TESTS: FAIL " label);
+           io_pure Nat (S Z)
     end;
 
 def qit_finish (rows : List (Pair String Bool)) : IO Unit :=
@@ -270,18 +343,21 @@ def qit_run (requested_root : String) : IO Unit :=
              (qit_files([b, quality_child root "./a.ouro"] : List String, stable_aliases))
          , qit_row "raw multiline markers and code are not policy or declarations"
              qit_raw_authority_mask
-         , qit_row "definition spans preserve top-form boundaries and order"
-             qit_def_spans_shape
+         , qit_row "definition boundaries preserve finding order, locations and witnesses"
+             (andb qit_def_spans_shape
+               (andb qit_def_scan_events (andb qit_assignment_bytes qit_public_marker_boundary)))
          , qit_row "top-form keywords retain indentation and word boundaries"
-             qit_top_form_shape
+             (andb qit_space_bytes qit_top_form_shape)
          , qit_row "ordinary multiline markers are not public annotations"
              qit_ordinary_authority_mask
          , qit_row "real annotation and violation after raw close stay visible"
              qit_real_code_after_raw
-         , qit_row "CRLF and comment offsets survive literal masking"
-             qit_crlf_mask_offsets
+         , qit_row "line boundaries preserve source bytes and comment offsets"
+             (andb qit_split_line_bytes qit_crlf_mask_offsets)
          , qit_row "triple literal masks markers and preserves CRLF offsets"
              qit_multiline_crlf_mask_offsets
+         , qit_row "large literal mask preserves bytes across scan chunks"
+             qit_long_mask_offsets
          ]
 
 def main : IO Unit :=

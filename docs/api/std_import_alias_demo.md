@@ -1,17 +1,17 @@
 # std/import_alias_demo.ouro
 
-Import alias demos must stay inside syntax accepted by the packaged frontend.
+Use the alias `Rec` to qualify a type and value and to open names locally.
 
 Declarations: 2.
 
 ## def demo_origin
 
-```
+```ouro
 def demo_origin : Rec.Point
 ```
 
 ## def demo_x
 
-```
+```ouro
 def demo_x : Nat
 ```

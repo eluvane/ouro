@@ -7,6 +7,7 @@ import "managed_files_transfer.ouro",
   "managed_model.ouro",
   "pe_model.ouro",
   "lower_model.ouro",
+  "lower_loop.ouro",
   "../file_check_environment.ouro",
   "../file_check_model.ouro",
   "../primitive_model.ouro",
@@ -19,7 +20,8 @@ import "managed_files_transfer.ouro",
 def managed_file_int_max : MirValue :=
     MirBits(MirUSize, X64Words64(X64Bytes32 255 255 255 127, codegen_zero));
 
-def managed_file_path_complete (compiler : ManagedCompiler) (content : Maybe MirValue) (storage : MirValue)
+def managed_file_path_complete (compiler : ManagedCompiler)
+    (open_file : MirValue -> MirValue -> MirValue -> ManagedFileScope -> ManagedState -> Either NativeLowerError ManagedResult) (storage : MirValue)
     (wide : MirValue) (units : MirValue) (count : MirValue) (scope : ManagedFileScope)
     (state : ManagedState) : Either NativeLowerError ManagedResult :=
     lower_bind ManagedResult ManagedResult (managed_startup_count count state)
@@ -32,11 +34,12 @@ def managed_file_path_complete (compiler : ManagedCompiler) (content : Maybe Mir
                 (fun (located : ManagedResult) => match located with | ManagedResultOf first entered =>
                   lower_bind ManagedResult ManagedResult (managed_binary MirUSize MirAdd first (managed_bits MirUSize 1) entered)
                     (fun (last : ManagedResult) => match last with | ManagedResultOf second final =>
-                      managed_file_open compiler content storage wide units scope
+                      open_file storage wide units scope
                         (managed_emit_all ([MirStoreAt wide first (managed_bits MirU8 0),
                           MirStoreAt wide second (managed_bits MirU8 0)] : List MirInstruction) final) end) end)) end) end);
 
-def managed_file_path_fill (compiler : ManagedCompiler) (content : Maybe MirValue) (storage : MirValue)
+def managed_file_path_fill (compiler : ManagedCompiler)
+    (open_file : MirValue -> MirValue -> MirValue -> ManagedFileScope -> ManagedState -> Either NativeLowerError ManagedResult) (storage : MirValue)
     (source : MirValue) (bytes : MirValue) (units : MirValue) (count : MirValue)
     (wide : MirValue) (scope : ManagedFileScope) (state : ManagedState)
     : Either NativeLowerError ManagedResult :=
@@ -44,9 +47,10 @@ def managed_file_path_fill (compiler : ManagedCompiler) (content : Maybe MirValu
       (managed_file_call compiler ManagedFileToWide ([source, bytes, wide, units, count] : List MirValue) state)
       (fun (filled : ManagedResult) => match filled with | ManagedResultOf status next =>
         lower_bind ManagedState ManagedResult (managed_file_status compiler scope status next)
-          (managed_file_path_complete compiler content storage wide units count scope) end);
+          (managed_file_path_complete compiler open_file storage wide units count scope) end);
 
-def managed_file_path_allocate (compiler : ManagedCompiler) (content : Maybe MirValue) (storage : MirValue)
+def managed_file_path_allocate (compiler : ManagedCompiler)
+    (open_file : MirValue -> MirValue -> MirValue -> ManagedFileScope -> ManagedState -> Either NativeLowerError ManagedResult) (storage : MirValue)
     (source : MirValue) (bytes : MirValue) (count : MirValue) (scope : ManagedFileScope)
     (state : ManagedState) : Either NativeLowerError ManagedResult :=
     lower_bind ManagedResult ManagedResult (managed_startup_count count state)
@@ -61,9 +65,10 @@ def managed_file_path_allocate (compiler : ManagedCompiler) (content : Maybe Mir
                     (managed_binary MirUSize MirMul capacity (managed_bits MirUSize 2) entered)
                     (fun (sized : ManagedResult) => match sized with | ManagedResultOf allocation final =>
                       managed_file_buffer compiler scope allocation
-                        (managed_file_path_fill compiler content storage source bytes units count) final end) end)) end) end);
+                        (managed_file_path_fill compiler open_file storage source bytes units count) final end) end)) end) end);
 
-def managed_file_path_copy (compiler : ManagedCompiler) (content : Maybe MirValue) (storage : MirValue)
+def managed_file_path_copy (compiler : ManagedCompiler)
+    (open_file : MirValue -> MirValue -> MirValue -> ManagedFileScope -> ManagedState -> Either NativeLowerError ManagedResult) (storage : MirValue)
     (path : MirValue) (bytes : MirValue) (count : MirValue) (source : MirValue) (scope : ManagedFileScope)
     (state : ManagedState) : Either NativeLowerError ManagedResult :=
     lower_bind ManagedState ManagedResult
@@ -73,19 +78,44 @@ def managed_file_path_copy (compiler : ManagedCompiler) (content : Maybe MirValu
           ([source, bytes, managed_bits MirRawPtr 0, managed_bits MirUSize 0, count] : List MirValue) copied)
         (fun (queried : ManagedResult) => match queried with | ManagedResultOf status next =>
           lower_bind ManagedState ManagedResult (managed_file_status compiler scope status next)
-            (managed_file_path_allocate compiler content storage source bytes count scope) end));
+            (managed_file_path_allocate compiler open_file storage source bytes count scope) end));
 
-def managed_file_path_storage (compiler : ManagedCompiler) (content : Maybe MirValue)
+def managed_file_path_storage (compiler : ManagedCompiler)
+    (open_file : MirValue -> MirValue -> MirValue -> ManagedFileScope -> ManagedState -> Either NativeLowerError ManagedResult)
     (path : MirValue) (bytes : MirValue) (storage : MirValue) (scope : ManagedFileScope)
     (state : ManagedState) : Either NativeLowerError ManagedResult :=
     lower_bind ManagedResult ManagedResult (managed_startup_pointer storage 16 state)
       (fun (located : ManagedResult) => match located with | ManagedResultOf count next =>
-        managed_file_buffer compiler scope bytes (managed_file_path_copy compiler content storage path bytes count)
+        managed_file_buffer compiler scope bytes (managed_file_path_copy compiler open_file storage path bytes count)
           (managed_emit_all ([MirStore(storage, codegen_disp 0, managed_bits MirUSize 0),
             MirStore(storage, codegen_disp 8, managed_bits MirUSize 0),
             MirStore(storage, codegen_disp 16, managed_bits MirUSize 0)] : List MirInstruction) next) end);
 
-def managed_file_body (compiler : ManagedCompiler) (path : MirValue) (content : Maybe MirValue)
+-- Path bytes must reject NUL before text conversion and recoverable OS calls.
+def managed_file_path_no_nul (compiler : ManagedCompiler) (scope : ManagedFileScope)
+    (path : MirValue) (bytes : MirValue) (state : ManagedState) : Either NativeLowerError ManagedState :=
+    lower_bind (Pair Nat ManagedState) ManagedState (managed_fresh_local MirUSize state)
+      (fun (cell : Pair Nat ManagedState) => match cell with | MkPair index after_cell =>
+        let initialized : ManagedState := managed_emit(MirMove(index, managed_bits MirUSize 0), after_cell) in
+        lower_bind LowerLoopBlocks ManagedState (lower_loop_blocks (managed_flow initialized))
+          (fun (labels : LowerLoopBlocks) => match labels with | LowerLoopAt header body finish flow =>
+            lower_bind ManagedResult ManagedState (managed_compare MirLess (MirUse index) bytes
+              (managed_with_flow(initialized, lower_switch_block header (MirJump header) flow)))
+              (fun (tested : ManagedResult) => match tested with | ManagedResultOf running after_test =>
+                lower_bind ManagedResult ManagedState (managed_binary MirUSize MirAdd (MirUse index) (managed_bits MirUSize 40)
+                  (managed_switch_block body (MirBranch running body finish) after_test))
+                  (fun (located : ManagedResult) => match located with | ManagedResultOf offset next =>
+                    lower_bind ManagedResult ManagedState
+                      (managed_fresh MirU8 (fun (local : Nat) => MirLoadAt local path offset) next)
+                      (fun (loaded : ManagedResult) => match loaded with | ManagedResultOf byte after_load =>
+                        lower_bind ManagedResult ManagedState (managed_compare MirNotEqual byte (managed_bits MirU8 0) after_load)
+                          (fun (compared : ManagedResult) => match compared with | ManagedResultOf nonzero after_compare =>
+                            lower_map ManagedState ManagedState (fun (valid : ManagedState) =>
+                              managed_switch_block finish (MirJump header)
+                                (managed_emit(MirBinaryOp index MirAdd (MirUse index) (managed_bits MirUSize 1), valid)))
+                              (managed_file_require compiler scope nonzero after_compare) end) end) end) end) end) end);
+def managed_file_path_body (compiler : ManagedCompiler) (path : MirValue)
+    (open_file : MirValue -> MirValue -> MirValue -> ManagedFileScope -> ManagedState -> Either NativeLowerError ManagedResult)
     (state : ManagedState) : Either NativeLowerError ManagedResult :=
     let scope : ManagedFileScope := ManagedFileScopeOf([] : List MirValue, Nothing MirValue) in
     lower_bind ManagedResult ManagedResult (managed_string_size compiler path state)
@@ -97,5 +127,11 @@ def managed_file_body (compiler : ManagedCompiler) (path : MirValue) (content : 
                 (managed_compare MirLessEqual bytes managed_file_int_max checked)
                 (fun (bounded : ManagedResult) => match bounded with | ManagedResultOf fits final =>
                   lower_bind ManagedState ManagedResult (managed_file_require compiler scope fits final)
-                    (managed_file_buffer compiler scope (managed_bits MirUSize 24)
-                      (managed_file_path_storage compiler content path bytes)) end)) end) end);
+                    (fun (bounded_path : ManagedState) => lower_bind ManagedState ManagedResult
+                      (managed_file_path_no_nul compiler scope path bytes bounded_path)
+                      (managed_file_buffer compiler scope (managed_bits MirUSize 24)
+                        (managed_file_path_storage compiler open_file path bytes))) end)) end) end);
+
+def managed_file_body (compiler : ManagedCompiler) (path : MirValue) (content : Maybe MirValue)
+    (state : ManagedState) : Either NativeLowerError ManagedResult :=
+    managed_file_path_body compiler path (managed_file_open compiler content) state;

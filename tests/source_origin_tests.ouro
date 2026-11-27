@@ -1,0 +1,382 @@
+-- @entry main
+import "compiler_program_lookup.ouro", "compiler_test_phase.ouro", "../std/test.ouro";
+
+def origin_test_fuel : Nat := 5000;
+
+def origin_test_files (root : String) (dependency : String) : List (Pair (List Nat) (List Nat)) :=
+  [compiler_test_unit "main.ouro" root, compiler_test_unit "dep.ouro" dependency];
+
+def origin_test_compile (root : String) (dependency : String) : SourceOriginCompilation :=
+  compile_checked_units_with_source_origins origin_test_fuel (prim_string_to_char_codes "main.ouro")
+    (origin_test_files root dependency);
+
+def origin_test_envelope (expected : Pair Nat Nat) (generated : Bool)
+    (actual : Maybe OriginalEnvelope) : Bool :=
+  match actual with
+  | Nothing => False
+  | Just envelope => let (OriginalEnvelopeOf span inherited) := envelope in
+    andb(source_slot_equal expected span,
+      match generated with | True => inherited | False => notb inherited end)
+  end;
+
+def origin_test_cover (mapping : OriginalSourceMap) (interval : Pair Nat Nat)
+    (expected : Pair Nat Nat) (generated : Bool) : Bool :=
+  match original_map_cover mapping interval with
+  | Left _ => False
+  | Right envelope => origin_test_envelope expected generated envelope
+  end;
+
+def origin_test_map_error (mapping : OriginalSourceMap) (expected : Nat) : Bool :=
+  match original_map_validate mapping with
+  | Right _ => False
+  | Left error => eqNat expected (match error with
+      | SourceOriginBounds => 1 | SourceOriginCoverage => 2 | SourceOriginCopyWidth => 3
+      | SourceOriginOccurrence => 4 | SourceOriginUnit => 5
+      end)
+  end;
+
+def origin_test_named (compilation : SourceOriginCompilation) (path : String)
+    (local : String) (kind : Nat) (span : Pair Nat Nat) (generated : Bool) : Bool :=
+  let (MkPair result state) := source_origin_compilation_original compilation in
+  match result with
+  | SourceErr _ => False
+  | SourceOk packet => match source_origin_compilation_metadata compilation with
+    | Left _ => False
+    | Right metadata => let (SourceOriginMetadataOf locations entries) := metadata in
+      let (MkPair _ occurrences) := locations in
+      match pipeline_literal_id state (prim_string_to_char_codes path) with
+      | Nothing => False
+      | Just unit => let (MkIntern names _ _ _) := state in
+        match source_lookup_id names (prim_string_to_char_codes local) with
+        | Nothing => False
+        | Just name =>
+            let slot : Pair Nat Nat := MkPair Nat Nat kind name in
+            let owners : List SourceCheckedOwner := filter SourceCheckedOwner
+              (fun (row : SourceCheckedOwner) => let (SourceCheckedOwnerOf _ origin) := row in
+                match origin with
+                | Nothing => False
+                | Just location => let (MkPair owner original) := location in
+                  andb(eqNat unit owner, source_slot_equal slot original)
+                end) (checked_source_packet_owners packet) in
+            andb(eqNat (length Entry (checked_program_entries (checked_source_packet_program packet)))
+                (length (Pair Entry (Maybe OriginalEnvelope)) entries),
+              andb(eqNat (length SourceCheckedOwner owners) 1,
+                origin_test_envelope span generated (source_origin_occurrence unit slot occurrences)))
+        end
+      end
+    end
+  end;
+
+def origin_test_intern_bytes (state : InternState) : List Nat :=
+  let (MkIntern identifiers next strings next_string) := state in
+  let table (values : List (Pair (List Nat) Nat)) : List Nat :=
+    append Nat (checked_output_number (length (Pair (List Nat) Nat) values))
+      (concat_map (Pair (List Nat) Nat) Nat
+        (fun (row : Pair (List Nat) Nat) => let (MkPair bytes ident) := row in
+          append Nat (checked_output_numbers bytes) (checked_output_number ident)) values) in
+  append Nat (checked_output_numbers [next, next_string])
+    (append Nat (table identifiers) (table strings));
+
+def origin_test_same_original (accepted : Bool) (fuel : Nat) (root : String) (dependency : String) : Bool :=
+  let files : List (Pair (List Nat) (List Nat)) := origin_test_files root dependency in
+  let observed : SourceOriginCompilation := compile_checked_units_with_source_origins fuel
+    (prim_string_to_char_codes "main.ouro") files in
+  let (MkPair actual state) := source_origin_compilation_original observed in
+  let (MkPair original before) :=
+    compile_checked_units_with_source_packet fuel (prim_string_to_char_codes "main.ouro") files in
+  andb(source_bytes_equal (origin_test_intern_bytes state) (origin_test_intern_bytes before),
+  match actual with
+  | SourceErr failure => andb(notb accepted, match original with
+    | SourceOk _ => False
+    | SourceErr prior => let (SourceFailureOf error _) := failure in
+      let (SourceFailureOf old _) := prior in
+      let (ErrCode code detail) := error in
+      let (ErrCode old_code old_detail) := old in
+      andb(eqNat code old_code, eqNat detail old_detail)
+    end)
+  | SourceOk packet => andb(accepted, match original with
+    | SourceErr _ => False
+    | SourceOk prior => match checked_program_dump origin_test_fuel (checked_source_packet_program packet) with
+      | CErr _ => False
+      | COk bytes => match checked_program_dump origin_test_fuel (checked_source_packet_program prior) with
+        | CErr _ => False | COk old => source_bytes_equal bytes old
+        end
+      end
+    end)
+  end);
+
+def origin_test_failure (compilation : SourceOriginCompilation) (expected_code : Nat)
+    (path : String) (local : String) (expected : Pair Nat Nat) : Bool :=
+  let (MkPair original before) := source_origin_compilation_original compilation in
+  match original with
+  | SourceOk _ => False
+  | SourceErr prior => match source_origin_compilation_with_spans compilation with
+    | Left _ => False
+    | Right observed => let (MkPair actual state) := observed in
+      andb(source_bytes_equal (origin_test_intern_bytes before) (origin_test_intern_bytes state),
+        match actual with
+        | SourceOk _ => False
+        | SourceErr failure => let (SourceFailureOf old _) := prior in
+          let (SourceFailureOf error metadata) := failure in
+          let (ErrCode old_code old_detail) :=
+            old in
+          let (ErrCode code detail) := error in
+          andb(eqNat code expected_code, andb(eqNat code old_code, andb(eqNat detail old_detail,
+            (let (MkPair owner _) := metadata in
+            match owner with
+            | Nothing => False
+            | Just located => let (SourceFailureOwnerOf declaration location) := located in
+              let (MkPair name _) := declaration in
+              let (MkPair unit span) := location in
+              andb((let (MkIntern names _ _ _) := state in
+                match source_lookup_id names (prim_string_to_char_codes local) with
+                | Nothing => False | Just ident => eqNat name ident end),
+                andb(match unit with
+                  | Nothing => False | Just actual_unit => match pipeline_literal_id state (prim_string_to_char_codes path) with
+                    | Nothing => False | Just wanted => eqNat actual_unit wanted end
+                  end,
+                  match span with | Nothing => False | Just actual_span => source_slot_equal expected actual_span end))
+            end))))
+        end)
+    end
+  end;
+
+def origin_test_corrupt_records (retain : Bool) (path : List Nat) (aliases : ImpReg)
+    (reg : RecReg) (source : List Nat)
+    : Pair (Pair RecReg (Pair ImpReg PrepResult)) (Either SourceOriginError (Maybe OriginalSourceMap)) :=
+  let (MkPair original _) := preprocess_records_reg_with_origin retain path aliases reg source in
+  MkPair (Pair RecReg (Pair ImpReg PrepResult)) (Either SourceOriginError (Maybe OriginalSourceMap)) original
+    (Left SourceOriginError (Maybe OriginalSourceMap) SourceOriginBounds);
+
+def origin_test_bad_metadata : Bool :=
+  let compilation : SourceOriginCompilation :=
+    stitch_checked_units_with_source_origins lex_import_observed intern_string driver_parse_file_occurrences
+      resolve_imports_with_sources desugar_file rewrite_declarations lower_expr_env2_with_cause
+      compile_program_with_location driver_elaborate_surfaces elaborate check_module
+      preprocess_imports_reg origin_test_corrupt_records origin_test_fuel (prim_string_to_char_codes "main.ouro")
+      (origin_test_files "import \"dep.ouro\"; def result : Token := Hit;"
+        "inductive Token : Type := | Hit : Token; def hidden : Token := Type;") in
+  andb((let (MkPair original _) := source_origin_compilation_original compilation in
+    match source_result_comp CheckedSourcePacket original with
+    | COk _ => False | CErr error => match error with | ErrCode code _ => eqNat code 41 end
+    end),
+    andb(match source_origin_compilation_metadata compilation with
+      | Right _ => False | Left error => match error with
+        | SourceOriginBounds => True | SourceOriginCoverage => False | SourceOriginCopyWidth => False
+        | SourceOriginOccurrence => False | SourceOriginUnit => False end
+      end,
+      match source_origin_compilation_with_spans compilation with | Right _ => False | Left _ => True end));
+
+def origin_test_occurrence_refusals : Bool :=
+  let bytes : List Nat := prim_string_to_char_codes "def item : Type := Type;" in
+  let (MkPair result spans) := lex_import_observed origin_test_fuel bytes empty_intern in
+  if let LexOk tokens _ := (result : LexResult) then
+    match driver_parse_file_occurrences origin_test_fuel tokens 0 with
+    | PErr _ => False
+    | POk parsed _ _ => let (MkPair file rows) := parsed in
+      let (MkParsedFile decls _) := file in
+      let shifted : Maybe (List ParsedSourceOccurrence) := match rows with
+        | Nothing => Nothing (List ParsedSourceOccurrence)
+        | Just actual => Just (List ParsedSourceOccurrence)
+            (map ParsedSourceOccurrence ParsedSourceOccurrence
+              (fun (row : ParsedSourceOccurrence) => let (ParsedSourceOccurrenceOf decl position) :=
+                  row in
+                let (MkPair ordinal interval) := position in
+                ParsedSourceOccurrenceOf decl (MkPair Nat (Pair Nat Nat) (S ordinal) interval)) actual)
+        end in
+      andb(match source_origin_capture_rows 11 decls decls spans shifted
+          (Right SourceOriginError (Maybe OriginalSourceMap) (Just OriginalSourceMap (original_identity (length Nat bytes)))) with
+        | Right _ => False | Left error => match error with
+          | SourceOriginOccurrence => True | SourceOriginBounds => False | SourceOriginCoverage => False
+          | SourceOriginCopyWidth => False | SourceOriginUnit => False end
+        end,
+        match source_origin_capture_rows 11 decls decls spans rows
+            (Right SourceOriginError (Maybe OriginalSourceMap) (Nothing OriginalSourceMap)) with
+        | Right _ => False | Left error => match error with
+          | SourceOriginCoverage => True | SourceOriginBounds => False | SourceOriginCopyWidth => False
+          | SourceOriginOccurrence => False | SourceOriginUnit => False end
+        end)
+    end
+  else False;
+
+def origin_test_composition : Bool :=
+  let expanded : OriginalSourceMap := OriginalSourceMapOf (MkPair Nat Nat 10 14)
+    [OriginalRegionOf (MkPair Nat Nat 0 2) (OriginalCopy (MkPair Nat Nat 0 2)),
+     OriginalRegionOf (MkPair Nat Nat 2 10) (OriginalParent (OriginalEnvelopeOf (MkPair Nat Nat 2 6) True)),
+     OriginalRegionOf (MkPair Nat Nat 10 14) (OriginalCopy (MkPair Nat Nat 6 10))] in
+  let rewritten : OriginalSourceMap := OriginalSourceMapOf (MkPair Nat Nat 14 16)
+    [OriginalRegionOf (MkPair Nat Nat 0 2) (OriginalCopy (MkPair Nat Nat 0 2)),
+     OriginalRegionOf (MkPair Nat Nat 2 12) (OriginalParent (OriginalEnvelopeOf (MkPair Nat Nat 2 10) False)),
+     OriginalRegionOf (MkPair Nat Nat 12 16) (OriginalCopy (MkPair Nat Nat 10 14))] in
+  match original_map_compose expanded rewritten with
+  | Left _ => False
+  | Right mapping => andb(origin_test_cover mapping (MkPair Nat Nat 2 12) (MkPair Nat Nat 2 6) True,
+      origin_test_cover mapping (MkPair Nat Nat 12 16) (MkPair Nat Nat 6 10) False)
+  end;
+
+def origin_test_capture : Bool :=
+  let capture : OriginalCapture := original_capture_change (original_capture_start True)
+    [2, 3, 4] [4] [1] [8, 9, 7, 1] True in
+  match original_capture_finish capture [1, 2, 3, 4] [1, 7, 9, 8, 4] with
+  | Left _ => False
+  | Right optional => match optional with
+    | Nothing => False
+    | Just mapping => andb(origin_test_cover mapping (MkPair Nat Nat 1 4) (MkPair Nat Nat 1 3) True,
+        origin_test_cover mapping (MkPair Nat Nat 4 5) (MkPair Nat Nat 3 4) False)
+    end
+  end;
+
+def origin_test_duplicate_unknown : Bool :=
+  let row : OwnedSourceOccurrence := OwnedSourceOccurrenceOf 11
+    (MkPair ParsedSourceOccurrence (Maybe OriginalEnvelope)
+      (ParsedSourceOccurrenceOf (DDef 7 (ESort 1) (ESort 0) 0 [])
+        (MkPair Nat (Pair Nat Nat) 0 (MkPair Nat Nat 0 5)))
+      (Just OriginalEnvelope (OriginalEnvelopeOf (MkPair Nat Nat 3 20) False))) in
+  match source_origin_occurrence 11 (MkPair Nat Nat 0 7) [row, row] with
+  | Nothing => True | Just _ => False
+  end;
+
+def origin_test_error_fields : Bool :=
+  let row : OwnedSourceOccurrence := OwnedSourceOccurrenceOf 11
+    (MkPair ParsedSourceOccurrence (Maybe OriginalEnvelope)
+      (ParsedSourceOccurrenceOf (DDef 7 (ESort 1) (ESort 0) 0 [])
+        (MkPair Nat (Pair Nat Nat) 0 (MkPair Nat Nat 0 5)))
+      (Just OriginalEnvelope (OriginalEnvelopeOf (MkPair Nat Nat 3 20) False))) in
+  let slots : List SourceModuleSlot :=
+    [SourceModuleSlotOf 11 (MkPair (Pair Nat Nat) (Maybe (Pair Nat Nat))
+      (MkPair Nat Nat 0 7) (Just (Pair Nat Nat) (MkPair Nat Nat 0 7)))] in
+  let original : SourceFailure := SourceFailureOf (ErrCode 2 17)
+    (MkPair (Maybe SourceFailureOwner) (Maybe LowerRootCause)
+      (Just SourceFailureOwner (SourceFailureOwnerOf (MkPair Nat CompileProgramPhase 7 CompileSurfacePhase)
+        (MkPair (Maybe Nat) (Maybe (Pair Nat Nat)) (Just Nat 11) (Nothing (Pair Nat Nat)))))
+      (Just LowerRootCause (LowerRootNamedHole 77))) in
+  let projected : SourceFailure := source_origin_failure_with_span original
+    (SourceOriginMetadataOf (MkPair (List SourceModuleSlot) (List OwnedSourceOccurrence) slots [row]) []) in
+  let (SourceFailureOf error metadata) := projected in
+  let (ErrCode code detail) := error in
+  andb(eqNat code 2, andb(eqNat detail 17,
+    (let (MkPair owner cause) := metadata in
+    andb(match cause with
+      | Nothing => False | Just actual => match actual with
+        | LowerRootNamedHole name => eqNat name 77 | LowerRootList _ => False end
+      end,
+      match owner with
+      | Nothing => False | Just located => let (SourceFailureOwnerOf declaration location) := located in
+        let (MkPair name phase) := declaration in
+        let (MkPair unit span) := location in
+        andb(eqNat name 7, andb(eqNat (compiler_test_compile_phase_nat phase) 3,
+          andb(match unit with | Nothing => False | Just ident => eqNat ident 11 end,
+            match span with | Nothing => False | Just actual => source_slot_equal actual (MkPair Nat Nat 3 20) end)))
+      end))));
+
+def origin_test_record : String :=
+  "inductive Token : Type := | Hit : Token; record Box : Type where value : Token; end; def box : Box := { value := Hit }; def chosen : Token := box.value;";
+
+def origin_test_private_record : String :=
+  "inductive Token : Type := | Hit : Token; private record Box : Type where value : Token; end;";
+
+def origin_test_laws : List Test :=
+  [ assert_true "empty original input has a valid empty identity map"
+      (match original_map_validate (original_identity 0) with | Left _ => False | Right _ => True end)
+  , assert_true "copied interval keeps exact half-open original bytes"
+      (origin_test_cover (original_identity 10) (MkPair Nat Nat 2 8) (MkPair Nat Nat 2 8) False)
+  , assert_true "replacement boundaries retain generated parent and copied tail" origin_test_capture
+  , assert_true "record expansion and body rewrite compose actual parent origin" origin_test_composition
+  , assert_true "out-of-input origin refuses metadata"
+      (origin_test_map_error (OriginalSourceMapOf (MkPair Nat Nat 4 4)
+        [OriginalRegionOf (MkPair Nat Nat 0 4) (OriginalCopy (MkPair Nat Nat 1 5))]) 1)
+  , assert_true "uncovered output refuses metadata"
+      (origin_test_map_error (OriginalSourceMapOf (MkPair Nat Nat 4 4)
+        [OriginalRegionOf (MkPair Nat Nat 1 4) (OriginalCopy (MkPair Nat Nat 1 4))]) 2)
+  , assert_true "copy width mismatch refuses metadata"
+      (origin_test_map_error (OriginalSourceMapOf (MkPair Nat Nat 4 4)
+        [OriginalRegionOf (MkPair Nat Nat 0 4) (OriginalCopy (MkPair Nat Nat 0 3))]) 3)
+  , assert_true "backwards original regions refuse metadata"
+      (origin_test_map_error (OriginalSourceMapOf (MkPair Nat Nat 4 2)
+        [OriginalRegionOf (MkPair Nat Nat 0 1) (OriginalCopy (MkPair Nat Nat 2 3)),
+         OriginalRegionOf (MkPair Nat Nat 1 2) (OriginalCopy (MkPair Nat Nat 0 1))]) 1)
+  , assert_true "valid unknown region stays unknown"
+      (match original_map_cover (OriginalSourceMapOf (MkPair Nat Nat 4 4)
+          [OriginalRegionOf (MkPair Nat Nat 0 4) OriginalUnknown]) (MkPair Nat Nat 0 4) with
+       | Left _ => False | Right envelope => match envelope with | Nothing => True | Just _ => False end end)
+  , assert_true "noncontiguous original cover does not invent an envelope"
+      (match original_map_cover (OriginalSourceMapOf (MkPair Nat Nat 5 2)
+          [OriginalRegionOf (MkPair Nat Nat 0 1) (OriginalCopy (MkPair Nat Nat 0 1)),
+           OriginalRegionOf (MkPair Nat Nat 1 2) (OriginalCopy (MkPair Nat Nat 4 5))]) (MkPair Nat Nat 0 2) with
+       | Left _ => False | Right envelope => match envelope with | Nothing => True | Just _ => False end end)
+  , assert_true "inconsistent intermediate length refuses composition"
+      (match original_map_compose (original_identity 3) (original_identity 4) with | Right _ => False | Left _ => True end)
+  , assert_true "disabled capture does not materialize metadata"
+      (match original_capture_finish (original_capture_start False) [1, 2] [1, 2] with
+       | Left _ => False | Right optional => match optional with | Nothing => True | Just _ => False end end)
+  , assert_true "captured ordinal and required map mismatches refuse typed metadata" origin_test_occurrence_refusals
+  , assert_true "only comma import rows may share one parser interval"
+      (andb(source_origin_occurrence_follows
+          (Just (Pair Nat (Pair Nat Nat)) (MkPair Nat (Pair Nat Nat) 4 (MkPair Nat Nat 0 7))) 4 (MkPair Nat Nat 0 7),
+        notb(source_origin_occurrence_follows
+          (Just (Pair Nat (Pair Nat Nat)) (MkPair Nat (Pair Nat Nat) 0 (MkPair Nat Nat 0 7))) 0 (MkPair Nat Nat 0 7))))
+  , assert_true "duplicate occurrence owners remain unknown" origin_test_duplicate_unknown
+  , assert_true "span projection retains original detail phase unit and named-hole identity" origin_test_error_fields
+  , assert_true "origin files must match actual ordered source paths"
+      (let (MkPair optional _) :=
+          pipeline_origin_file True (prim_string_to_char_codes "main.ouro")
+            [MkPair (List Nat) (Either SourceOriginError (Maybe OriginalSourceMap))
+              (prim_string_to_char_codes "other.ouro")
+              (Right SourceOriginError (Maybe OriginalSourceMap) (Just OriginalSourceMap (original_identity 4)))] in
+        match optional with | Right _ => False | Left error => match error with
+        | SourceOriginUnit => True | SourceOriginBounds => False | SourceOriginCoverage => False
+        | SourceOriginCopyWidth => False | SourceOriginOccurrence => False end end)
+  , assert_true "UTF8 comment and CRLF preserve original declaration byte bounds"
+      (origin_test_named (origin_test_compile "--😀\r\naxiom A : Type;\ndef keep (x : A) : A := x;" "")
+        "main.ouro" "keep" 0 (MkPair Nat Nat 24 50) False)
+  , assert_true "private declaration keeps actual visibility prefix in envelope"
+      (origin_test_named (origin_test_compile "import \"dep.ouro\" as D; def result : D.Token := D.value;"
+          "inductive Token : Type := | Hit : Token; private def hidden : Token := Hit; def value : Token := hidden;")
+        "dep.ouro" "hidden" 0 (MkPair Nat Nat 41 75) False)
+  , assert_true "selected import uses provider original local occurrence"
+      (origin_test_named (origin_test_compile
+          "import \"dep.ouro\" as D exposing (Token, value as chosen); def result : Token := chosen;"
+          "inductive Token : Type := | Hit : Token; def value : Token := Hit;")
+        "dep.ouro" "value" 0 (MkPair Nat Nat 41 66) False)
+  , assert_true "actual comma-import parser group retains both occurrence rows"
+      (origin_test_named
+        (compile_checked_units_with_source_origins origin_test_fuel (prim_string_to_char_codes "main.ouro")
+          [compiler_test_unit "main.ouro" "import \"dep.ouro\", \"empty.ouro\"; def result : Token := Hit;",
+           compiler_test_unit "dep.ouro" "inductive Token : Type := | Hit : Token;",
+           compiler_test_unit "empty.ouro" ""])
+        "dep.ouro" "Token" 2 (MkPair Nat Nat 0 40) False)
+  , assert_true "generated record accessor retains actual whole record parent"
+      (origin_test_named (origin_test_compile origin_test_record "") "main.ouro" "Box_value" 0 (MkPair Nat Nat 41 84) True)
+  , assert_true "rewritten projection keeps whole original definition envelope"
+      (origin_test_named (origin_test_compile origin_test_record "") "main.ouro" "chosen" 0 (MkPair Nat Nat 120 152) False)
+  , assert_true "unused imported invalid body is checked with its original envelope"
+      (origin_test_failure (origin_test_compile "import \"dep.ouro\"; def result : Token := Hit;"
+          "inductive Token : Type := | Hit : Token; def hidden : Token := Type;")
+        41 "dep.ouro" "hidden" (MkPair Nat Nat 41 68))
+  , assert_true "malformed metadata cannot replace complete imported-body checking failure" origin_test_bad_metadata
+  , assert_true "plain and origin factories preserve complete checked dump and intern order"
+      (origin_test_same_original True origin_test_fuel "--😀\r\naxiom A : Type;\ndef keep (x : A) : A := x;" "")
+  , assert_true "record expansion preserves legacy checked dump and intern order"
+      (origin_test_same_original True origin_test_fuel origin_test_record "")
+  , assert_true "malformed parser input retains legacy error and intern order"
+      (origin_test_same_original False origin_test_fuel "def broken : Type := ;" "")
+  , assert_true "malformed literal retains legacy error and intern order"
+      (origin_test_same_original False origin_test_fuel "def broken : Type := \"unterminated" "")
+  , assert_true "zero and low fuel retain legacy failure and intern order"
+      (all Nat (fun (fuel : Nat) => origin_test_same_original False fuel
+        "axiom A : Type; def keep (x : A) : A := x;" "") [0, 1, 2, 7])
+  , assert_true "private record type retains whole visibility-prefixed original parent"
+      (origin_test_named (origin_test_compile origin_test_private_record "")
+        "main.ouro" "Box" 2 (MkPair Nat Nat 41 92) True)
+  , assert_true "private record accessor retains whole visibility-prefixed original parent"
+      (origin_test_named (origin_test_compile origin_test_private_record "")
+        "main.ouro" "Box_value" 0 (MkPair Nat Nat 41 92) True)
+  , assert_true "private record parent retains intervening UTF8 comment and CRLF"
+      (origin_test_named (origin_test_compile
+          "inductive Token : Type := | Hit : Token; private --😀\r\nrecord Box : Type where value : Token; end;" "")
+        "main.ouro" "Box_value" 0 (MkPair Nat Nat 41 100) True)
+  , assert_true "private record origin preserves legacy checked dump and intern order"
+      (origin_test_same_original True origin_test_fuel origin_test_private_record "")
+  ];
+
+def main : IO Unit := test_run origin_test_laws;

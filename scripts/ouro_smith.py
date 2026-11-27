@@ -93,13 +93,19 @@ def new_report(args, seeds, command):
     return report
 
 
-def surface_tools(args, out, report):
+def surface_tools(args, out, report, *, compiler_only=False):
     from ourosmith.provenance import binary_state
 
     try:
-        overrides, evidence = prepare_tools(out / "build", compiler_for(args))
-        report.sections["surface_toolchain"] = evidence
-        report.sections["provenance"]["binaries"].update(binary_state(overrides.values()))
+        compiler = compiler_for(args)
+        if compiler_only:
+            overrides = {"ouro1": compiler}
+            binaries = {compiler.relative_to(ROOT).as_posix(): args.compiler_digest}
+        else:
+            overrides, evidence = prepare_tools(out / "build", compiler)
+            report.sections["surface_toolchain"] = evidence
+            binaries = binary_state(overrides.values())
+        report.sections["provenance"]["binaries"].update(binaries)
     except (OSError, ValueError) as error:
         report.skip("surface:tools", str(error))
         return None
@@ -111,6 +117,7 @@ def cmd_run(args: argparse.Namespace) -> int:
     started = time.perf_counter()
     out = Path(args.out) if args.out else ROOT / "_build/smith" / args.profile
     out.mkdir(parents=True, exist_ok=True)
+    (out / "report.json").unlink(missing_ok=True)
     seeds = seeds_for(args)
     profile = PROFILES[args.profile]
     report = new_report(args, seeds, f"python scripts/ouro_smith.py run --profile {args.profile}")
@@ -203,15 +210,15 @@ def finish_report(report: Report, out: Path, started: float, *, show: int) -> in
 
 def cmd_inventory(args: argparse.Namespace) -> int:
     inv = source_inventory()
-    current = code_strategies()
-    if args.write:
+    current = code_strategies() if args.write else None
+    if current is not None:
         write_strategies(current)
         print(f"{PREFIX}: wrote {STRATEGIES_PATH.relative_to(ROOT)}")
     committed = load_strategies()
     problems: list[str] = []
     if committed is None:
         problems.append(f"{STRATEGIES_PATH.relative_to(ROOT)} is missing (run inventory --write)")
-        committed = current
+        committed = code_strategies() if current is None else current
     else:
         problems.extend(stale(committed))
     coverage = None
@@ -342,10 +349,13 @@ def cmd_replay(args: argparse.Namespace) -> int:
 
         started = time.perf_counter()
         report = new_report(args, [args.seed], "surface replay")
-        overrides = surface_tools(args, out, report)
+        # This generated recipe checks and emits directly through the selected compiler.
+        compiler_only = args.finding is None and args.case == f"surface-{args.seed}-runtime_io"
+        overrides = surface_tools(args, out, report, compiler_only=compiler_only)
         if overrides is not None:
             runner = SurfaceRunner(report, out / "surface", [args.seed], depth=args.depth or profile["depth"],
-                                   timeout=args.timeout, memory_mb=args.memory_mb, shrink_budget=0, overrides=overrides)
+                                   timeout=args.timeout, memory_mb=args.memory_mb, shrink_budget=0, overrides=overrides,
+                                   bound_tools_only=compiler_only)
             if finding is None and args.case is None:
                 runner.run()
             else:
@@ -428,6 +438,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     prepare.add_argument("--group", required=True, choices=GROUPS)
     prepare.add_argument("--seed", type=int, default=1)
     prepare.add_argument("--out", default=str(ROOT / "_build/smith/fixtures"))
+    prepare.add_argument("--stable", action="store_true", help="reuse verified runtime or test fixture paths")
     from ourosmith.native_inputs import run as prepare_run
 
     prepare.set_defaults(func=prepare_run)

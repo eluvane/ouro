@@ -1,16 +1,11 @@
 -- Recognition laws use compiler-checked source and closed, rechecked Core.
 import "native_small_nat_fixtures.ouro",
   "../compiler/native/managed_nat_small_shapes.ouro",
+  "../compiler/native/managed_nat_mul_shapes.ouro",
   "../compiler/driver.ouro",
   "../std/io.ouro",
   "compiler_program_lookup.ouro",
   "native_nat_test_support.ouro";
-
--- Runtime helper ids are unused by the recognizer. The checked environment
--- is the source program's environment, exactly as in managed source lowering.
-def small_nat_test_compiler (program : CheckedProgram) : ManagedCompiler :=
-    ManagedCompilerOf program ([] : List Nat) 0 0 0 0 0 0 ([] : List LowerContract)
-      (check_environment_from_entries (checked_program_entries program));
 
 def small_nat_test_fuel : Nat := mul 100 160;
 
@@ -24,13 +19,20 @@ def small_nat_operation_code (result : Either NativeLowerError (Maybe ManagedNat
         | Just selected => match selected with
             | ManagedNatSmallMultiply => 1 | ManagedNatSmallDivide => 2 | ManagedNatSmallRemainder => 3 end end end;
 
+def small_nat_mul_agrees (compiler : ManagedCompiler) (fuel : Nat) (id : Nat)
+    (annotation : CoreTerm) (body : CoreTerm) (expected : Nat) : Bool :=
+    match managed_nat_mul_recognize compiler fuel id annotation body with
+    | Left _ => False
+    | Right selected => match eqNat expected 1 with | True => selected | False => notb selected end end;
+
 def small_nat_source_case (source : String) (expectations : List (Pair String Nat)) : Bool :=
     match compile_checked_source(small_nat_test_fuel, prim_string_to_char_codes source) with
     | CErr _ => False
     | COk program => all (Pair String Nat) (fun (expectation : Pair String Nat) => match expectation with
         | MkPair name expected => nat_test_with_body small_nat_test_fuel program name (fun (id : Nat) (annotation : CoreTerm) (body : CoreTerm) =>
-            eqNat expected (small_nat_operation_code
-              (managed_small_nat_recognize (small_nat_test_compiler program) small_nat_test_fuel id annotation body))) end) expectations end;
+            andb (eqNat expected (small_nat_operation_code
+              (managed_small_nat_recognize (nat_test_compiler program) small_nat_test_fuel id annotation body)))
+              (small_nat_mul_agrees (nat_test_compiler program) small_nat_test_fuel id annotation body expected)) end) expectations end;
 
 -- Change only fixpoint metadata, including the local div/mod loops.
 def small_nat_change_fix : Nat -> Nat -> CoreTerm -> CoreTerm :=
@@ -54,27 +56,34 @@ def small_nat_fix_case (name : String) (mode : Nat) (expected : Nat) : Bool :=
     match compile_checked_source(small_nat_test_fuel, prim_string_to_char_codes small_nat_fixture_canonical) with
     | CErr _ => False
     | COk program => nat_test_with_body small_nat_test_fuel program name (fun (id : Nat) (annotation : CoreTerm) (body : CoreTerm) =>
-        eqNat expected (small_nat_operation_code (managed_small_nat_recognize (small_nat_test_compiler program)
-          small_nat_test_fuel id annotation (small_nat_change_fix 200 mode body)))) end;
+        let changed : CoreTerm := small_nat_change_fix 200 mode body in
+        andb (eqNat expected (small_nat_operation_code (managed_small_nat_recognize (nat_test_compiler program)
+          small_nat_test_fuel id annotation changed)))
+          (small_nat_mul_agrees (nat_test_compiler program) small_nat_test_fuel id annotation changed expected)) end;
 
 def small_nat_annotation_rejected : Bool :=
     match compile_checked_source(small_nat_test_fuel, prim_string_to_char_codes small_nat_fixture_canonical) with
     | CErr _ => False
     | COk program => nat_test_with_body small_nat_test_fuel program "mul" (fun (id : Nat) (_ : CoreTerm) (body : CoreTerm) =>
-        eqNat 0 (small_nat_operation_code (managed_small_nat_recognize (small_nat_test_compiler program)
-          small_nat_test_fuel id (CSort 0) body))) end;
+        andb (eqNat 0 (small_nat_operation_code (managed_small_nat_recognize (nat_test_compiler program)
+          small_nat_test_fuel id (CSort 0) body)))
+          (small_nat_mul_agrees (nat_test_compiler program) small_nat_test_fuel id (CSort 0) body 0)) end;
 
 def small_nat_fuel_rejected : Bool :=
     match compile_checked_source(small_nat_test_fuel, prim_string_to_char_codes small_nat_fixture_canonical) with
     | CErr _ => False
     | COk program => nat_test_with_body small_nat_test_fuel program "mul" (fun (id : Nat) (annotation : CoreTerm) (body : CoreTerm) =>
-        match managed_small_nat_recognize (small_nat_test_compiler program) 0 id annotation body with
-        | Right _ => False | Left error => match error with
-            | LowerResourceExhausted => True | LowerDeclarationFailure _ _ _ => False
-            | LowerMetadataMismatch _ => False | LowerBodyMismatch _ => False | LowerUnsupportedType _ => False
-            | LowerUnsupportedTerm _ => False | LowerUnsupportedPrimitive _ => False | LowerUnknownGlobal _ => False
-            | LowerUnboundLocal _ => False | LowerInvalidCall _ => False | LowerEffectMismatch => False
-            | LowerInvalidEntry _ => False | LowerMirFailure _ => False | LowerBackendFailure _ => False end end) end;
+        match managed_small_nat_recognize (nat_test_compiler program) 0 id annotation body with
+        | Right _ => False
+        | Left error => if let LowerResourceExhausted := (error : NativeLowerError) then True else False end) end;
+
+def small_nat_mul_fuel_rejected : Bool :=
+    match compile_checked_source(small_nat_test_fuel, prim_string_to_char_codes small_nat_fixture_canonical) with
+    | CErr _ => False
+    | COk program => nat_test_with_body small_nat_test_fuel program "mul" (fun (id : Nat) (annotation : CoreTerm) (body : CoreTerm) =>
+        match managed_nat_mul_recognize (nat_test_compiler program) 0 id annotation body with
+        | Right _ => False
+        | Left error => if let LowerResourceExhausted := (error : NativeLowerError) then True else False end) end;
 
 def main : IO Unit := nat_test_run
     [assert_true "small Nat checked source canonical"
@@ -134,4 +143,5 @@ def main : IO Unit := nat_test_run
      assert_true "mod_nat display name ignored"
        (small_nat_fix_case "mod_nat" 2 3),
      assert_true "root annotation mismatch" small_nat_annotation_rejected,
-     assert_true "exact comparison exhaustion propagates" small_nat_fuel_rejected];
+     assert_true "exact comparison exhaustion propagates" small_nat_fuel_rejected,
+     assert_true "mul-only resource exhaustion propagates" small_nat_mul_fuel_rejected];

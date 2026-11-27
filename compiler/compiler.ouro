@@ -1,5 +1,8 @@
 -- @entry compile_pipeline
 -- @export compile_program; @doc docs/tcb.md
+-- @export compile_program_with_owner; @doc docs/tcb.md
+-- @export compile_program_with_location; @doc docs/tcb.md
+-- @export compile_program_result; @doc docs/tcb.md
 -- @export extract_program; @doc docs/tcb.md
 -- @export compile_program_extract; @doc docs/tcb.md
 -- @export compile_core_extract_one; @doc docs/tcb.md
@@ -9,6 +12,7 @@
 import "../std/data.ouro",
   "core.ouro",
   "pipeline_abi.ouro";
+import "file_check_environment.ouro", "source_name_index.ouro";
 
 def fuel32 : Nat := add(add ten ten, add(12, ten));
 
@@ -42,55 +46,59 @@ def case_info_has_future_global (ci : CaseInfo) (future : List Nat) : Bool :=
     | MkCaseInfo ind _ _ => bound_name ind future
     end;
 
-def surface_has_future_global : Nat -> Surface -> List Nat -> Bool :=
-  fix surface_has_future_global (fuel : Nat) (s : Surface) (future : List Nat) : Bool :=
-    match fuel with
-    | Z => False
-    | S fuel' =>
-        match s with
-        | SVar _ => False
-        | SSort _ => False
-        | SPi _ dom cod =>
-            orb (surface_has_future_global fuel' dom future)
-              (surface_has_future_global fuel' cod future)
-        | SLam _ ann body =>
-            orb (surface_has_future_global fuel' ann future)
-              (surface_has_future_global fuel' body future)
-        | SApp f a =>
-            orb (surface_has_future_global fuel' f future)
-              (surface_has_future_global fuel' a future)
-        | SLet _ v ty body =>
-            orb (surface_has_future_global fuel' v future)
-              (orb (surface_has_future_global fuel' ty future)
-                (surface_has_future_global fuel' body future))
-        | SConst n => bound_name n future
-        | SInd n => bound_name n future
-        | SConstruct i _ _ => bound_name i future
-        | SCase ci p scrut bs =>
-            orb (case_info_has_future_global ci future)
-              (orb (surface_has_future_global fuel' p future)
-                (orb (surface_has_future_global fuel' scrut future)
-                  ((fix go (xs : List Surface) : Bool :=
-                      match xs with
-                      | Nil => False
-                      | Cons b xs' =>
-                          orb(surface_has_future_global fuel' b future, go xs')
-                      end) bs)))
-        | SFix _ _ _ ty body =>
-            orb (surface_has_future_global fuel' ty future)
-              (surface_has_future_global fuel' body future)
-        | SHole _ => False
-        | SEffectRow ty => surface_has_future_global fuel' ty future
-        | SPerform op args =>
-            orb (bound_name op future)
-              ((fix go (xs : List Surface) : Bool :=
-                  match xs with
-                  | Nil => False
-                  | Cons a xs' =>
-                      orb(surface_has_future_global fuel' a future, go xs')
-                  end) args)
-        | SStr _ ty => bound_name ty future
-        end
+-- Both preflight paths visit the same global-bearing fields at the same depth.
+def surface_global_references : Nat -> Surface -> EntryIndex :=
+  fun (initial_fuel : Nat) (root_surface : Surface) =>
+      (fix visit (fuel : Nat) (surface : Surface) (index : EntryIndex) : EntryIndex :=
+        match fuel with
+        | Z => index
+        | S next =>
+            match surface with
+            | SVar _ => index
+            | SSort _ => index
+            | SPi _ domain codomain => visit next codomain (visit next domain index)
+            | SLam _ annotation body => visit next body (visit next annotation index)
+            | SApp function argument => visit next argument (visit next function index)
+            | SLet _ value typ body => visit next body (visit next typ (visit next value index))
+            | SConst name => entry_index_insert name EntryIndexReserved index
+            | SInd name => entry_index_insert name EntryIndexReserved index
+            | SConstruct family _ _ => entry_index_insert family EntryIndexReserved index
+            | SCase info predicate scrutinee branches =>
+                let family_index : EntryIndex := match info with
+                  | MkCaseInfo family _ _ => entry_index_insert family EntryIndexReserved index
+                  end in
+                let branch_index : EntryIndex := visit next scrutinee (visit next predicate family_index) in
+                (fix scan (pending : List Surface) (known : EntryIndex) : EntryIndex :=
+                  match pending with
+                  | Nil => known
+                  | Cons branch rest => scan rest (visit next branch known)
+                  end) branches branch_index
+            | SFix _ _ _ typ body => visit next body (visit next typ index)
+            | SHole _ => index
+            | SEffectRow typ => visit next typ index
+            | SPerform operation arguments =>
+                (fix scan (pending : List Surface) (known : EntryIndex) : EntryIndex :=
+                  match pending with
+                  | Nil => known
+                  | Cons argument rest => scan rest (visit next argument known)
+                  end) arguments (entry_index_insert operation EntryIndexReserved index)
+            | SStr _ typ => entry_index_insert typ EntryIndexReserved index
+            end
+        end) initial_fuel root_surface EntryIndexEmpty;
+
+def surface_has_future_global (fuel : Nat) (surface : Surface) (future : List Nat) : Bool :=
+    let references : EntryIndex := surface_global_references fuel surface in
+    match references with
+    | EntryIndexEmpty => False
+    | EntryIndexNode _ _ _ _ _ =>
+        (fix find (remaining : List Nat) : Bool :=
+          match remaining with
+          | Nil => False
+          | Cons name rest => match entry_index_lookup name references with
+              | Just _ => True
+              | Nothing => find rest
+              end
+          end) future
     end;
 
 -- Totality sentinel (public paths reject unsupported first).
@@ -234,15 +242,26 @@ def wf_core : Nat -> CoreTerm -> Bool :=
 
 def check_core (t : CoreTerm) : Bool := wf_core fuel32 t;
 
-def compile_and_check (s : Surface) (ctx : List Nat) : CompResult CoreTerm :=
+def compile_stage_check (s : Surface) (ctx : List Nat)
+    : Either (Pair CompileProgramPhase CompError) CoreTerm :=
     match surface_supported fuel32 s ctx with
-    | False => CErr(CoreTerm, ErrCode(S (S Z), Z))
+    | False => Left (Pair CompileProgramPhase CompError) CoreTerm
+        (MkPair CompileProgramPhase CompError CompileSurfacePhase (ErrCode(S (S Z), Z)))
     | True =>
         let t : CoreTerm := compile_surface s ctx in
         match check_core t with
-        | True => COk CoreTerm t
-        | False => CErr(CoreTerm, ErrCode(S (S Z), S Z))
+        | True => Right (Pair CompileProgramPhase CompError) CoreTerm t
+        | False => Left (Pair CompileProgramPhase CompError) CoreTerm
+            (MkPair CompileProgramPhase CompError CompileCorePhase (ErrCode(S (S Z), S Z)))
         end
+    end;
+
+def compile_and_check (s : Surface) (ctx : List Nat) : CompResult CoreTerm :=
+    match compile_stage_check s ctx with
+    | Left failed => match failed with
+      | MkPair _ error => CErr CoreTerm error
+      end
+    | Right core => COk CoreTerm core
     end;
 
 def extract_tag (t : CoreTerm) : Nat :=
@@ -319,40 +338,150 @@ def pipeline_ok_stages (p : Nat) (d : Nat) (l : Nat) (c : Nat) (e : Nat) : Nat :
 
 def extract_apps (t : CoreTerm) : Nat := count_apps fuel32 t;
 
-def compile_program (xs : List (Pair Nat Surface)) : CompResult (List (Pair Nat CoreTerm)) :=
-  ((((fix go (items : List (Pair Nat Surface)) (future : List Nat)
-        (ctx : List Nat) (seen : List Nat)
-      : CompResult (List (Pair Nat CoreTerm)) :=
-      match items with
-      | Nil => COk(List (Pair Nat CoreTerm), Nil (Pair Nat CoreTerm))
-      | Cons p rest =>
-          match p with
-          | MkPair name surface =>
-              match future with
-              | Nil => CErr(List (Pair Nat CoreTerm), ErrCode(3, name))
-              | Cons _ future_rest =>
-                  match bound_name name seen with
-                  | True => CErr(List (Pair Nat CoreTerm), ErrCode(3, name))
-                  | False =>
-                      match surface_has_future_global fuel32 surface future_rest with
-                      | True => CErr(List (Pair Nat CoreTerm), ErrCode(3, name))
-                      | False =>
-                          match compile_pipeline surface ctx with
-                          | CErr e => CErr(List (Pair Nat CoreTerm), e)
-                          | COk core =>
-                              match go(rest, future_rest, Cons Nat name ctx, Cons Nat name seen) with
-                              | CErr e => CErr(List (Pair Nat CoreTerm), e)
-                              | COk cores =>
-                                  COk (List (Pair Nat CoreTerm))
-                                    (Cons (Pair Nat CoreTerm)
-                                      (MkPair Nat CoreTerm name core) cores)
-                              end
-                          end
-                      end
-                  end
-              end
+def compile_program_item_with (duplicate : Nat -> List Nat -> Bool)
+    (future_global : Surface -> List Nat -> Bool)
+    (name : Nat) (surface : Surface) (future : List Nat)
+    (ctx : List Nat) (seen : List Nat)
+    : Either (Pair CompileProgramPhase CompError) (Pair (List Nat) CoreTerm) :=
+  let refuse (phase : CompileProgramPhase)
+      : Either (Pair CompileProgramPhase CompError) (Pair (List Nat) CoreTerm) :=
+    Left (Pair CompileProgramPhase CompError) (Pair (List Nat) CoreTerm)
+      (MkPair CompileProgramPhase CompError phase (ErrCode 3 name)) in
+  match future with
+  | Nil => refuse CompileFutureSlotPhase
+  | Cons _ future_rest =>
+      match duplicate name seen with
+      | True => refuse CompileDuplicatePhase
+      | False =>
+          match future_global surface future_rest with
+          | True => refuse CompileFutureGlobalPhase
+          | False => match compile_stage_check surface ctx with
+            | Left failed => Left (Pair CompileProgramPhase CompError) (Pair (List Nat) CoreTerm) failed
+            | Right core => Right (Pair CompileProgramPhase CompError) (Pair (List Nat) CoreTerm)
+                (MkPair (List Nat) CoreTerm future_rest core)
+            end
           end
-      end) xs) (surface_names xs)) (Nil Nat)) (Nil Nat);
+      end
+  end;
+
+def compile_program_item_pure : Nat -> Surface -> List Nat -> List Nat -> List Nat ->
+    Either (Pair CompileProgramPhase CompError) (Pair (List Nat) CoreTerm) :=
+  compile_program_item_with bound_name (surface_has_future_global fuel32);
+
+def compile_program_walk
+    (compile_item : Nat -> Nat -> Surface -> List Nat -> List Nat -> List Nat ->
+      Either (Pair CompileProgramPhase CompError) (Pair (List Nat) CoreTerm))
+    (xs : List (Pair Nat Surface)) (names : List Nat) : CompileProgramLocatedResult :=
+  (fix go (items : List (Pair Nat Surface)) (future : List Nat)
+      (ctx : List Nat) (seen : List Nat) (ordinal : Nat)
+      : CompileProgramLocatedResult :=
+    match items with
+    | Nil => CompileProgramLocatedOk (Nil (Pair Nat CoreTerm))
+    | Cons pair rest => match pair with
+      | MkPair name surface =>
+          let failure (phase : CompileProgramPhase) (error : CompError)
+              : CompileProgramLocatedResult :=
+            CompileProgramLocatedErr
+              (CompileProgramLocationOf (MkPair Nat CompileProgramPhase name phase) ordinal) error in
+          match compile_item ordinal name surface future ctx seen with
+          | Left failed => match failed with
+            | MkPair phase error => failure phase error
+            end
+          | Right compiled => match compiled with
+            | MkPair future_rest core =>
+                match go rest future_rest (Cons Nat name ctx) (Cons Nat name seen) (S ordinal) with
+                | CompileProgramLocatedErr owner error => CompileProgramLocatedErr owner error
+                | CompileProgramLocatedOk cores =>
+                    CompileProgramLocatedOk
+                      (Cons (Pair Nat CoreTerm) (MkPair Nat CoreTerm name core) cores)
+                end
+            end
+          end
+      end
+    end) xs names (Nil Nat) (Nil Nat) Z;
+
+def compile_program_with_location_with
+    (compile_item : Nat -> Surface -> List Nat -> List Nat -> List Nat ->
+      Either (Pair CompileProgramPhase CompError) (Pair (List Nat) CoreTerm))
+    (xs : List (Pair Nat Surface)) : CompileProgramLocatedResult :=
+  compile_program_walk (fun (_ : Nat) => compile_item) xs (surface_names xs);
+
+-- Insertion keeps the first value. Insert on descent for the first position
+-- and on return for the last position.
+def compile_name_positions (names : List Nat) : Pair SourceNameIndex SourceNameIndex :=
+  (fix collect (remaining : List Nat) (ordinal : Nat) (first : SourceNameIndex)
+      : Pair SourceNameIndex SourceNameIndex :=
+    match remaining with
+    | Nil => MkPair SourceNameIndex SourceNameIndex first SourceNameIndexEmpty
+    | Cons name rest =>
+        let key : List Nat := [name] in
+        match collect rest (add ordinal 1) (source_name_index_insert key ordinal first) with
+        | MkPair firsts last => MkPair SourceNameIndex SourceNameIndex firsts
+            (source_name_index_insert key ordinal last)
+        end
+    end) names Z SourceNameIndexEmpty;
+
+def compile_name_seen (first : SourceNameIndex) (ordinal : Nat) (name : Nat) : Bool :=
+    match source_name_index_lookup ([name] : List Nat) first with
+    | Nothing => False
+    | Just position => compiler_lt_nat position ordinal
+    end;
+
+def compile_future_reference (last : SourceNameIndex) (ordinal : Nat) (surface : Surface) : Bool :=
+    (fix find (references : EntryIndex) : Bool :=
+      match references with
+      | EntryIndexEmpty => False
+      | EntryIndexNode _ name _ left right =>
+          let later : Bool :=
+            match source_name_index_lookup ([name] : List Nat) last with
+            | Nothing => False
+            | Just position => compiler_lt_nat ordinal position
+            end in
+          match later with
+          | True => True
+          | False => match find left with | True => True | False => find right end
+          end
+      end) (surface_global_references fuel32 surface);
+
+def compile_program_with_location_indexed_with
+    (scope_item :
+      (Nat -> Surface -> List Nat -> List Nat -> List Nat ->
+        Either (Pair CompileProgramPhase CompError) (Pair (List Nat) CoreTerm)) ->
+      Nat -> Surface -> List Nat -> List Nat -> List Nat ->
+        Either (Pair CompileProgramPhase CompError) (Pair (List Nat) CoreTerm))
+    (xs : List (Pair Nat Surface)) : CompileProgramLocatedResult :=
+    let names : List Nat := surface_names xs in
+    match compile_name_positions names with
+    | MkPair first last =>
+        compile_program_walk
+          (fun (ordinal : Nat) => scope_item (compile_program_item_with
+            (fun (name : Nat) (_ : List Nat) => compile_name_seen first ordinal name)
+            (fun (surface : Surface) (_ : List Nat) => compile_future_reference last ordinal surface)))
+          xs names
+    end;
+
+def compile_program_with_location (xs : List (Pair Nat Surface)) : CompileProgramLocatedResult :=
+    compile_program_with_location_indexed_with
+      (fun (item : Nat -> Surface -> List Nat -> List Nat -> List Nat ->
+        Either (Pair CompileProgramPhase CompError) (Pair (List Nat) CoreTerm)) => item) xs;
+
+def compile_program_with_owner (xs : List (Pair Nat Surface)) : CompileProgramResult :=
+  match compile_program_with_location xs with
+  | CompileProgramLocatedErr location error => match location with
+    | CompileProgramLocationOf owner _ => CompileProgramErr owner error
+    end
+  | CompileProgramLocatedOk cores => CompileProgramOk cores
+  end;
+
+def compile_program_result (result : CompileProgramResult)
+    : CompResult (List (Pair Nat CoreTerm)) :=
+    match result with
+    | CompileProgramErr _ error => CErr (List (Pair Nat CoreTerm)) error
+    | CompileProgramOk cores => COk (List (Pair Nat CoreTerm)) cores
+    end;
+
+def compile_program (xs : List (Pair Nat Surface)) : CompResult (List (Pair Nat CoreTerm)) :=
+    compile_program_result (compile_program_with_owner xs);
 
 def compile_core_extract : List (Pair Nat CoreTerm) -> List (Pair Nat Nat) :=
   fix compile_core_extract (xs : List (Pair Nat CoreTerm))

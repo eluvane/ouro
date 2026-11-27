@@ -3,6 +3,7 @@
 -- No failed frontend stage can be replaced by a textual approximation.
 
 import "structural_frontend.ouro",
+  "../../compiler/lexer_intern.ouro",
   "intern_surface.ouro",
   "session_policy.ouro",
   "semantic_origins.ouro",
@@ -11,21 +12,21 @@ import "structural_frontend.ouro",
   "../../compiler/parser_parse.ouro",
   "../../compiler/semantic_scope.ouro",
   "../../compiler/import_resolve.ouro",
+  "../../compiler/import_paths.ouro",
   "../../compiler/module_registry.ouro",
+  "../../compiler/source_text.ouro",
   "../../compiler/canonical_hash.ouro",
+  "../../std/natx.ouro",
   "../quality/source.ouro",
   "../quality/input_error.ouro";
+import "../../compiler/file_check_environment.ouro" as FileIndex;
 
 def cm_pool_text (pool : List (Pair (List Nat) Nat)) (id : Nat) : String :=
     (fix go (xs : List (Pair (List Nat) Nat)) : String :=
       match xs with
       | Nil => ""
-      | Cons p rest => match p with
-        | MkPair bytes key => match eq_nat id key with
-          | True => prim_string_of_char_codes bytes
-          | False => go rest
-          end
-        end
+      | Cons p rest => let (MkPair bytes key) := p in
+        if eq_nat id key then prim_string_of_char_codes bytes else go rest
       end) pool;
 
 def cm_name (intern : InternState) (id : Nat) : String :=
@@ -35,65 +36,46 @@ def cm_string (intern : InternState) (id : Nat) : String :=
     match intern with | MkIntern _ _ strings _ => cm_pool_text strings id end;
 
 -- Import IDs become canonical identities in the same shared string pool.
-def cm_canon_imports (path : String) : List Decl -> InternState
-    -> Pair (List Decl) InternState :=
-  let path_codes : List Nat := prim_string_to_char_codes path in
-  fix go (decls : List Decl) (intern : InternState)
-      : Pair (List Decl) InternState :=
-    match decls with
-    | Nil => MkPair(List Decl, InternState, Nil Decl, intern)
-    | Cons decl rest =>
-        let transformed : Pair Decl InternState := match decl with
-          | DImport spelling =>
-              match load_intern_string intern (load_canon_path path_codes
-              (prim_string_to_char_codes (cm_string intern spelling))) with
-            | MkPair canonical updated => MkPair Decl InternState (DImport canonical) updated
-            end
-          | DDef _ _ _ _ _ => MkPair Decl InternState decl intern
-          | DAxiom _ _ => MkPair Decl InternState decl intern
-          | DInductive _ _ _ _ _ => MkPair Decl InternState decl intern
-          | DEffect _ _ _ => MkPair Decl InternState decl intern
-          | DIntrinsic _ _ _ _ => MkPair Decl InternState decl intern
-          | DExtern _ _ _ => MkPair Decl InternState decl intern
-          | DRepresentation _ _ => MkPair Decl InternState decl intern
-          end in
-        match transformed with
-        | MkPair head updated => match go rest updated with
-          | MkPair tail_decls final => MkPair (List Decl) InternState
-              (Cons Decl head tail_decls) final
-          end
-        end
-    end;
+def cm_canon_imports (path : String) : List Decl -> LexerIntern
+    -> Pair (List Decl) LexerIntern :=
+  let base : List Nat := prim_string_to_char_codes path in
+  fun (decls : List Decl) (intern : LexerIntern) =>
+    canonicalize_import_declarations LexerIntern base lexer_intern_string
+      (fun (state : LexerIntern) (id : Nat) =>
+        prim_string_to_char_codes (cm_string (lexer_intern_state state) id)) intern decls;
 
 def cm_import_ids (decls : List Decl) : List Nat :=
-    concat_map Decl Nat (fun (decl : Decl) => match decl with
-      | DImport id => [id]
-      | DDef _ _ _ _ _ => Nil Nat
-      | DAxiom _ _ => Nil Nat
-      | DInductive _ _ _ _ _ => Nil Nat
-      | DEffect _ _ _ => Nil Nat
-      | DIntrinsic _ _ _ _ => Nil Nat
-      | DExtern _ _ _ => Nil Nat
-      | DRepresentation _ _ => Nil Nat
-      end) decls;
-
--- Validate only the import projection with the compiler-owned resolver. Its
--- normal compilation API also flattens every local declaration into one list;
--- semantic units already retain indexed declarations and never use that list.
--- Passing imports alone preserves missing-module/cycle errors without repeatedly
--- copying the growing declaration accumulator on every module completion.
-def cm_graph_units (units : List SrcUnit) : List SrcUnit :=
-    map SrcUnit SrcUnit (fun (unit : SrcUnit) => match unit with
-      | MkSrcUnit name _ => mk_src_unit name
-          (map(Nat, Decl, fun (id : Nat) => DImport id,
-            cm_import_ids (src_unit_decls unit))) []
-      end) units;
+    concat_map Decl Nat
+      (fun (decl : Decl) => if let DImport id := (decl : Decl) then [id] else Nil Nat) decls;
 
 inductive CmResolvedImports : Type :=
   | CmResolvedImportsOf : List ModuleAliasUnit -> List ModuleMember -> CmResolvedImports;
 
 def cm_empty_resolved_imports : CmResolvedImports :=
     CmResolvedImportsOf (Nil ModuleAliasUnit) (Nil ModuleMember);
+
+private def cm_qualified_members (entry : Nat) (aliases : List ModuleAliasUnit)
+    (symbols : List ScDecl) (units : List SrcUnit) : List ModuleMember :=
+    let targets : List Nat := map (Pair (List Nat) Nat) Nat
+      (fun (binding : Pair (List Nat) Nat) =>
+        let (MkPair _ target) := binding in target)
+      (module_aliases_for entry aliases) in
+    match targets with
+    | Nil => Nil ModuleMember
+    | Cons _ _ =>
+        (fix collect (remaining : List ScDecl) : List ModuleMember :=
+          match remaining with
+          | Nil => Nil ModuleMember
+          | Cons decl rest =>
+              let owner : Nat := sc_decl_module decl in
+              if memNat owner targets then
+                let name : Nat := sc_decl_name decl in
+                Cons ModuleMember
+                  (MkModuleMember owner name name (notb (module_is_private owner name units)))
+                  (collect rest)
+              else collect rest
+          end) symbols
+    end;
 
 inductive ClippySemanticUnit : Type :=
   | CmUnit : InternState -> Nat -> String -> List SrcUnit -> List ScDecl -> ScIndex -> List Decl -> Nat -> List CsOriginFact -> CmResolvedImports -> ClippySemanticUnit;
@@ -133,22 +115,21 @@ def cm_global_name (unit : ClippySemanticUnit) (name : Nat) : Maybe Nat :=
     match module_split_marker atom with
     | Nothing => Just Nat name
     | Just _ =>
-        match cm_resolved_imports unit with
-        | CmResolvedImportsOf aliases members =>
-          match module_field_decision (cm_units unit) (Nil ModuleExports)
-                aliases st (cm_entry unit) atom members False with
-            | ModuleAbsent => Nothing Nat
-            | ModuleAmbiguous => Nothing Nat
-            | ModuleFound resolved => Just Nat resolved
-          end
+        let (CmResolvedImportsOf aliases members) := cm_resolved_imports unit in
+        match module_field_decision (cm_units unit) (Nil ModuleExports)
+              aliases st (cm_entry unit) atom members False with
+          | ModuleAbsent => Nothing Nat
+          | ModuleAmbiguous => Nothing Nat
+          | ModuleFound resolved => Just Nat resolved
         end
     end;
 
 -- Executable visibility is relative to its source owner. Typed signatures keep
 -- the full declaration index, including a public alias's private target type.
 def cm_decl_visible (owner : Nat) (decl : ScDecl) (units : List SrcUnit) : Bool :=
-    orb (eq_nat(owner, sc_decl_module decl))
-      (notb (module_is_private (sc_decl_module decl) (sc_decl_name decl) units));
+    let target : Nat := sc_decl_module decl in
+    if eq_nat owner target then True
+    else notb (module_is_private target (sc_decl_name decl) units);
 
 def cm_global_decl (unit : ClippySemanticUnit) (name : Nat) : Maybe ScDecl :=
     match cm_global_name unit name with
@@ -163,7 +144,7 @@ def cm_import_stubs (ids : List Nat) : List Decl :=
 -- domains are the bulk of a compiler cone and are not read after harvest.
 def cm_compact_fuel : Nat := mul 64 64;
 
-def cm_compact_type : Nat -> Expr -> Expr :=
+private def cm_compact_signature (keep_result : Bool) : Nat -> Expr -> Expr :=
   fix go (fuel : Nat) (term : Expr) : Expr :=
     match fuel with
     | Z => ESort 0
@@ -173,10 +154,12 @@ def cm_compact_type : Nat -> Expr -> Expr :=
       | ESpan _ _ inner => go left inner
       | EOpen _ inner => go left inner
       | EAscribe value _ => go left value
-      | EEffectRow result _ => EEffectRow (go left result) (Nil Nat)
-      | EApp head arg => EApp (go left head) (go left arg)
-      | EVar name => EVar name
-      | EHole hole => EHole hole
+      | EEffectRow result _ =>
+          let compact : Expr := go left result in
+          if keep_result then EEffectRow compact (Nil Nat) else compact
+      | EApp head arg => if keep_result then EApp (go left head) (go left arg) else ESort 0
+      | EVar name => if keep_result then EVar name else ESort 0
+      | EHole hole => if keep_result then EHole hole else ESort 0
       | ESort level => ESort level
       | ENat _ => ESort 0
       | ERange _ _ _ => ESort 0
@@ -203,73 +186,27 @@ def cm_compact_type : Nat -> Expr -> Expr :=
       end
     end;
 
+def cm_compact_type : Nat -> Expr -> Expr :=
+    cm_compact_signature True;
+
+private def cm_is_sort_zero (term : Expr) : Bool :=
+    if let ESort level := (term : Expr) then eq_nat level 0 else False;
+
+private def cm_compact_pi_matches (term : Expr) (result_matches : Expr -> Bool) : Bool :=
+    if let EPi name domain result := (term : Expr) then
+      andb (eq_nat name 1)
+        (andb (cm_is_sort_zero domain)
+          (andb (result_matches result) (eq_nat (sc_pi_arity term) 1)))
+    else False;
+
 def cm_compact_contracts : Bool :=
     let sample : Expr := EPi 1 (EVar 9) (EVar 2) in
-    let compact : Expr := cm_compact_type cm_compact_fuel sample in
-    match compact with
-    | EPi name domain result =>
-        andb (eq_nat name 1)
-          (andb (match domain with | ESort level => eq_nat level 0 | EVar _ => False
-            | EHole _ => False | ENat _ => False | EApp _ _ => False | ELam _ _ _ => False
-            | EPi _ _ _ => False | ELet _ _ _ _ => False | EAscribe _ _ => False
-            | EMatch _ _ => False | EFix _ _ _ _ => False | EEffectRow _ _ => False
-            | EPerform _ _ => False | EDo _ => False | EHandle _ _ => False
-            | EBranch _ _ _ => False | ENoBranch => False | EBinder _ _ _ => False
-            | ENoBinder => False | EMultiMatch _ _ => False | EStr _ => False
-            | EDoBind _ _ => False | EList _ => False | EListSpread _ _ => False
-            | ESpan _ _ _ => False | EFallible _ _ _ _ => False | EOpen _ _ => False
-            | ENamedCall _ _ => False | ERange _ _ _ => False | EIf _ _ _ => False
-            | EIfLet _ _ _ _ => False | ECoalesce _ _ => False end)
-            (andb (match result with | EVar result_name => eq_nat result_name 2 | ESort _ => False
-              | EHole _ => False | ENat _ => False | EApp _ _ => False | ELam _ _ _ => False
-              | EPi _ _ _ => False | ELet _ _ _ _ => False | EAscribe _ _ => False
-              | EMatch _ _ => False | EFix _ _ _ _ => False | EEffectRow _ _ => False
-              | EPerform _ _ => False | EDo _ => False | EHandle _ _ => False
-              | EBranch _ _ _ => False | ENoBranch => False | EBinder _ _ _ => False
-              | ENoBinder => False | EMultiMatch _ _ => False | EStr _ => False
-              | EDoBind _ _ => False | EList _ => False | EListSpread _ _ => False
-              | ESpan _ _ _ => False | EFallible _ _ _ _ => False | EOpen _ _ => False
-              | ENamedCall _ _ => False | ERange _ _ _ => False | EIf _ _ _ => False
-              | EIfLet _ _ _ _ => False | ECoalesce _ _ => False end)
-              (eq_nat (sc_pi_arity compact) 1)))
-    | EVar _ => False
-    | EHole _ => False
-    | ESort _ => False
-    | ENat _ => False
-    | EApp _ _ => False
-    | ELam _ _ _ => False
-    | ELet _ _ _ _ => False
-    | EAscribe _ _ => False
-    | EMatch _ _ => False
-    | EFix _ _ _ _ => False
-    | EEffectRow _ _ => False
-    | EPerform _ _ => False
-    | EDo _ => False
-    | EHandle _ _ => False
-    | EBranch _ _ _ => False
-    | ENoBranch => False
-    | EBinder _ _ _ => False
-    | ENoBinder => False
-    | EMultiMatch _ _ => False
-    | EStr _ => False
-    | EDoBind _ _ => False
-    | EList _ => False
-    | EListSpread _ _ => False
-    | ESpan _ _ _ => False
-    | EFallible _ _ _ _ => False
-    | EOpen _ _ => False
-    | ENamedCall _ _ => False
-    | ERange _ _ _ => False
-    | EIf _ _ _ => False
-    | EIfLet _ _ _ _ => False
-    | ECoalesce _ _ => False
-    end;
+    cm_compact_pi_matches (cm_compact_type cm_compact_fuel sample)
+      (fun (result : Expr) => if let EVar name := (result : Expr) then eq_nat name 2 else False);
 
 def cm_strip_symbol (item : ScDecl) : ScDecl :=
-    match item with
-    | ScDeclOf name owner kind parent signature _ prim =>
-        ScDeclOf name owner kind parent (cm_compact_type cm_compact_fuel signature) (Nothing Expr) prim
-    end;
+    let (ScDeclOf name owner kind parent signature _ prim) := item in
+    ScDeclOf name owner kind parent (cm_compact_type cm_compact_fuel signature) (Nothing Expr) prim;
 
 -- Non-std imports keep the Pi spine and a validated nullary constructor's parent.
 -- Other result spines push one lint root over the 8 GiB cap. Checked
@@ -282,116 +219,17 @@ def cm_arity_path_contracts : Bool :=
       (notb (cm_keep_result_spine "compiler/lexer.ouro"));
 
 def cm_compact_arity : Nat -> Expr -> Expr :=
-  fix go (fuel : Nat) (term : Expr) : Expr :=
-    match fuel with
-    | Z => ESort 0
-    | S left => match term with
-      | EPi name _ rest => EPi name (ESort 0) (go left rest)
-      | ELam name _ body => ELam name (Nothing Expr) (go left body)
-      | ESpan _ _ inner => go left inner
-      | EOpen _ inner => go left inner
-      | EAscribe inner _ => go left inner
-      | EEffectRow inner _ => go left inner
-      | EVar _ => ESort 0
-      | EHole _ => ESort 0
-      | ESort level => ESort level
-      | ENat _ => ESort 0
-      | ERange _ _ _ => ESort 0
-      | EApp _ _ => ESort 0
-      | ELet _ _ _ _ => ESort 0
-      | EMatch _ _ => ESort 0
-      | EFix _ _ _ _ => ESort 0
-      | EPerform _ _ => ESort 0
-      | EDo _ => ESort 0
-      | EHandle _ _ => ESort 0
-      | EBranch _ _ _ => ESort 0
-      | ENoBranch => ESort 0
-      | EBinder _ _ _ => ESort 0
-      | ENoBinder => ESort 0
-      | EMultiMatch _ _ => ESort 0
-      | EStr _ => ESort 0
-      | EDoBind _ _ => ESort 0
-      | EList _ => ESort 0
-      | EListSpread _ _ => ESort 0
-      | EFallible _ _ _ _ => ESort 0
-      | ENamedCall _ _ => ESort 0
-      | EIf _ _ _ => ESort 0
-      | EIfLet _ _ _ _ => ESort 0
-      | ECoalesce _ _ => ESort 0
-      end
-    end;
+    cm_compact_signature False;
 
 def cm_strip_arity (item : ScDecl) : ScDecl :=
-    match item with
-    | ScDeclOf name owner kind parent signature _ prim =>
-        ScDeclOf name owner kind parent
-          (match cg_s_nullary_constructor_parent item with
-           | True => EVar parent
-           | False => cm_compact_arity cm_compact_fuel signature
-           end) (Nothing Expr) prim
-    end;
+    let (ScDeclOf name owner kind parent signature _ prim) := item in
+    ScDeclOf name owner kind parent
+      (if cg_s_nullary_constructor_parent item then EVar parent
+        else cm_compact_arity cm_compact_fuel signature) (Nothing Expr) prim;
 
 def cm_compiler_arity_contracts : Bool :=
     let sample : Expr := EPi 1 (EVar 9) (EApp (EVar 4) (EVar 5)) in
-    let compact : Expr := cm_compact_arity cm_compact_fuel sample in
-    match compact with
-    | EPi name domain result =>
-        andb (eq_nat name 1)
-          (andb (match domain with | ESort level => eq_nat level 0 | EVar _ => False
-            | EHole _ => False | ENat _ => False | EApp _ _ => False | ELam _ _ _ => False
-            | EPi _ _ _ => False | ELet _ _ _ _ => False | EAscribe _ _ => False
-            | EMatch _ _ => False | EFix _ _ _ _ => False | EEffectRow _ _ => False
-            | EPerform _ _ => False | EDo _ => False | EHandle _ _ => False
-            | EBranch _ _ _ => False | ENoBranch => False | EBinder _ _ _ => False
-            | ENoBinder => False | EMultiMatch _ _ => False | EStr _ => False
-            | EDoBind _ _ => False | EList _ => False | EListSpread _ _ => False
-            | ESpan _ _ _ => False | EFallible _ _ _ _ => False | EOpen _ _ => False
-            | ENamedCall _ _ => False | ERange _ _ _ => False | EIf _ _ _ => False
-            | EIfLet _ _ _ _ => False | ECoalesce _ _ => False end)
-            (andb (match result with | ESort level => eq_nat level 0 | EVar _ => False
-              | EHole _ => False | ENat _ => False | EApp _ _ => False | ELam _ _ _ => False
-              | EPi _ _ _ => False | ELet _ _ _ _ => False | EAscribe _ _ => False
-              | EMatch _ _ => False | EFix _ _ _ _ => False | EEffectRow _ _ => False
-              | EPerform _ _ => False | EDo _ => False | EHandle _ _ => False
-              | EBranch _ _ _ => False | ENoBranch => False | EBinder _ _ _ => False
-              | ENoBinder => False | EMultiMatch _ _ => False | EStr _ => False
-              | EDoBind _ _ => False | EList _ => False | EListSpread _ _ => False
-              | ESpan _ _ _ => False | EFallible _ _ _ _ => False | EOpen _ _ => False
-              | ENamedCall _ _ => False | ERange _ _ _ => False | EIf _ _ _ => False
-              | EIfLet _ _ _ _ => False | ECoalesce _ _ => False end)
-              (eq_nat (sc_pi_arity compact) 1)))
-    | EVar _ => False
-    | EHole _ => False
-    | ESort _ => False
-    | ENat _ => False
-    | EApp _ _ => False
-    | ELam _ _ _ => False
-    | ELet _ _ _ _ => False
-    | EAscribe _ _ => False
-    | EMatch _ _ => False
-    | EFix _ _ _ _ => False
-    | EEffectRow _ _ => False
-    | EPerform _ _ => False
-    | EDo _ => False
-    | EHandle _ _ => False
-    | EBranch _ _ _ => False
-    | ENoBranch => False
-    | EBinder _ _ _ => False
-    | ENoBinder => False
-    | EMultiMatch _ _ => False
-    | EStr _ => False
-    | EDoBind _ _ => False
-    | EList _ => False
-    | EListSpread _ _ => False
-    | ESpan _ _ _ => False
-    | EFallible _ _ _ _ => False
-    | EOpen _ _ => False
-    | ENamedCall _ _ => False
-    | ERange _ _ _ => False
-    | EIf _ _ _ => False
-    | EIfLet _ _ _ _ => False
-    | ECoalesce _ _ => False
-    end;
+    cm_compact_pi_matches (cm_compact_arity cm_compact_fuel sample) cm_is_sort_zero;
 
 def cm_import_symbols (decls : List ScDecl) : List ScDecl :=
     map ScDecl ScDecl cm_strip_symbol decls;
@@ -411,24 +249,26 @@ inductive CmHarvest : Type :=
 -- Finish one parsed file. Imports keep signatures and compact origins; the
 -- selected file keeps bodies. This helper is unwrapped. The host arena seam wraps
 -- cm_load_file below so leave() drops imported function graphs.
+def cm_after_parse_indexed (path : String) (module_id : Nat) (keep_bodies : Bool)
+    (file : ParsedFile) (intern : LexerIntern) : Pair CmHarvest LexerIntern :=
+    let (MkPair canonical updated) := cm_canon_imports path (cm_parsed_decls file) intern in
+    let flat : InternState := lexer_intern_state updated in
+    let imports : List Nat := cm_import_ids canonical in
+    let raw : List ScDecl := sc_declarations module_id canonical in
+    let harvest : CmHarvest := if keep_bodies then
+        MkHarvest flat raw imports (MkParsedFile canonical (cm_parsed_private file)) []
+      else
+        MkHarvest flat
+          (if cm_keep_result_spine path then cm_import_symbols raw else cm_import_arity raw) imports
+          (MkParsedFile (cm_import_stubs imports) (cm_parsed_private file))
+          (cs_capture_origins raw) in
+    MkPair CmHarvest LexerIntern harvest updated;
+
 def cm_after_parse (path : String) (module_id : Nat) (keep_bodies : Bool)
     (file : ParsedFile) (intern : InternState) : CmHarvest :=
-    match cm_canon_imports path (cm_parsed_decls file) intern with
-    | MkPair canonical updated =>
-        let imports : List Nat := cm_import_ids canonical in
-        let raw : List ScDecl := sc_declarations module_id canonical in
-        match keep_bodies with
-        | True => MkHarvest updated raw imports
-            (MkParsedFile canonical (cm_parsed_private file)) []
-        | False => MkHarvest updated
-            (match cm_keep_result_spine path with
-             | True => cm_import_symbols raw
-             | False => cm_import_arity raw
-             end) imports
-            (MkParsedFile (cm_import_stubs imports) (cm_parsed_private file))
-            (cs_capture_origins raw)
-        end
-    end;
+    let (MkPair harvest _) :=
+      cm_after_parse_indexed path module_id keep_bodies file (lexer_intern_from intern) in
+    harvest;
 
 -- Dependency identity includes the frontend mode, canonical path, length and
 -- exact-byte hash. Immutable dependency bytes verify equality even on a hash
@@ -450,64 +290,43 @@ def cm_cache0 : CmParseCache :=
     MkCmParseCache (Nil CmCachedFile);
 
 def cm_cache_reset (cache : CmParseCache) : CmParseCache :=
-    match cache with
-    | MkCmParseCache _ => cm_cache0
-    end;
+    let (MkCmParseCache _) := cache in
+    cm_cache0;
 
 def cm_content_hash (src : String) : List Nat :=
     canonical_hash_bytes (canonical_hash_codes (prim_string_to_char_codes src));
 
 def cm_hash_eq (left : List Nat) (right : List Nat) : Bool :=
-    (fix go (xs : List Nat) (ys : List Nat) : Bool :=
-      match xs with
-      | Nil => match ys with | Nil => True | Cons _ _ => False end
-      | Cons x xr => match ys with
-        | Nil => False
-        | Cons y yr => match eq_nat x y with
-          | False => False
-          | True => go xr yr
-          end
-        end
-      end) left right;
+    eq_nat_list left right;
 
 def cm_cache_row_ok (row : CmCachedFile) : Bool :=
-    match row with
-    | MkCmCachedFile canonical _ hash _ _ =>
-        andb (ltb_nat(0, prim_string_length canonical))
-          (eq_nat(length Nat hash, 8))
-    end;
+    let (MkCmCachedFile canonical _ hash _ _) := row in
+    andb (ltb_nat(0, prim_string_length canonical))
+      (eq_nat(length Nat hash, 8));
 
 def cm_cache_identity (canonical : String) : String :=
     prim_string_concat "ouro.clippy.harvest.v3/compiler-parser/signatures-origins:" canonical;
 
 def cm_cache_get (cache : CmParseCache) (canonical : String) : Maybe CmCachedFile :=
+    let identity : String := cm_cache_identity canonical in
     (fix go (rows : List CmCachedFile) : Maybe CmCachedFile :=
       match rows with
       | Nil => Nothing CmCachedFile
-      | Cons row rest => match row with
-        | MkCmCachedFile key _ _ _ _ => match prim_string_eq(key, cm_cache_identity canonical) with
-          | True => Just CmCachedFile row
-          | False => go rest
-          end
-        end
+      | Cons row rest => let (MkCmCachedFile key _ _ _ _) := row in
+        if prim_string_eq(key, identity) then Just CmCachedFile row else go rest
       end) (match cache with | MkCmParseCache rows => rows end);
 
 def cm_cache_lookup (cache : CmParseCache) (canonical : String) (src : String)
     : CmCacheLookup :=
     match cm_cache_get cache canonical with
     | Nothing => CmCacheMiss
-    | Just row => match cm_cache_row_ok row with
-      | False => CmCacheStale
-      | True => match row with
-        | MkCmCachedFile _ stored_len stored_hash stored_source harvest =>
-            match andb (eq_nat(stored_len, prim_string_length src))
-                (andb (cm_hash_eq(stored_hash, cm_content_hash src))
-                  (prim_string_eq stored_source src)) with
-            | True => CmCacheHit harvest
-            | False => CmCacheStale
-            end
-        end
-      end
+    | Just row => if cm_cache_row_ok row then
+        let (MkCmCachedFile _ stored_len stored_hash stored_source harvest) := row in
+        if andb (eq_nat(stored_len, prim_string_length src)) (prim_string_eq stored_source src) then
+          if cm_hash_eq(stored_hash, cm_content_hash src) then CmCacheHit harvest
+          else CmCacheStale
+        else CmCacheStale
+      else CmCacheStale
     end;
 
 -- Cached facts never retain historical intern spines or imported bodies.
@@ -515,26 +334,24 @@ def cm_cache_lookup (cache : CmParseCache) (canonical : String) (src : String)
 -- cloning it into the cache. The current session's intern table is attached
 -- again on a cache hit.
 def cm_cache_harvest (harvest : CmHarvest) : CmHarvest :=
-    match harvest with
-    | MkHarvest _ symbols imports file origins => MkHarvest empty_intern
-        symbols imports
-        (MkParsedFile (cm_import_stubs imports) (cm_parsed_private file)) origins
-    end;
+    let (MkHarvest _ symbols imports file origins) := harvest in
+    MkHarvest empty_intern
+      symbols imports
+      (MkParsedFile (cm_import_stubs imports) (cm_parsed_private file)) origins;
 
 def cm_cache_bytes (cache : CmParseCache) : Nat :=
     (fix go (rows : List CmCachedFile) : Nat :=
       match rows with
       | Nil => 0
-      | Cons row rest => match row with
-        | MkCmCachedFile _ size _ _ _ => add(size, go rest)
-        end
+      | Cons row rest => let (MkCmCachedFile _ size _ _ _) := row in
+        add(size, go rest)
       end) (match cache with | MkCmParseCache rows => rows end);
 
 def cm_cache_without (canonical : String) (rows : List CmCachedFile)
     : List CmCachedFile :=
-    filter CmCachedFile (fun (row : CmCachedFile) => match row with
-      | MkCmCachedFile key _ _ _ _ => notb (prim_string_eq(key, cm_cache_identity canonical))
-      end) rows;
+    let identity : String := cm_cache_identity canonical in
+    filter CmCachedFile (fun (row : CmCachedFile) => let (MkCmCachedFile key _ _ _ _) := row in
+      notb (prim_string_eq(key, identity))) rows;
 
 def cm_cache_trim : Nat -> Nat -> List CmCachedFile -> List CmCachedFile :=
   fix go (slots : Nat) (bytes : Nat) (rows : List CmCachedFile)
@@ -543,29 +360,23 @@ def cm_cache_trim : Nat -> Nat -> List CmCachedFile -> List CmCachedFile :=
     | Z => Nil CmCachedFile
     | S remaining => match rows with
       | Nil => Nil CmCachedFile
-      | Cons row rest => match row with
-        | MkCmCachedFile _ size _ _ _ => match leb_nat size bytes with
-          | False => go remaining bytes rest
-          | True => Cons CmCachedFile row (go remaining (sub bytes size) rest)
-          end
-        end
+      | Cons row rest => let (MkCmCachedFile _ size _ _ _) := row in
+        if leb_nat size bytes then Cons CmCachedFile row (go remaining (sub bytes size) rest)
+        else go remaining bytes rest
       end
     end;
 
 def cm_cache_put (cache : CmParseCache) (canonical : String) (src : String)
     (harvest : CmHarvest) : CmParseCache :=
-    match cache with
-    | MkCmParseCache rows =>
-        let current : List CmCachedFile := cm_cache_without canonical rows in
-        let size : Nat := prim_string_length src in
-        match leb_nat size cg_session_cache_bytes with
-        | False => MkCmParseCache current
-        | True => MkCmParseCache (cm_cache_trim cg_session_cache_rows
-            cg_session_cache_bytes (Cons CmCachedFile
-              (MkCmCachedFile (cm_cache_identity canonical) size (cm_content_hash src) src
-                (cm_cache_harvest harvest)) current))
-        end
-    end;
+    let (MkCmParseCache rows) := cache in
+    let current : List CmCachedFile := cm_cache_without canonical rows in
+    let size : Nat := prim_string_length src in
+    if leb_nat size cg_session_cache_bytes then
+      MkCmParseCache (cm_cache_trim cg_session_cache_rows
+        cg_session_cache_bytes (Cons CmCachedFile
+          (MkCmCachedFile (cm_cache_identity canonical) size (cm_content_hash src) src
+            (cm_cache_harvest harvest)) current))
+    else MkCmParseCache current;
 
 def cm_cache_contracts : Bool :=
     let src : String := "def n : Nat := Z;" in
@@ -576,78 +387,71 @@ def cm_cache_contracts : Bool :=
         MkParsedFile (Nil Decl) (Nil Nat), Nil CsOriginFact) in
     let cache : CmParseCache :=
       cm_cache_put cm_cache0 canonical src harvest in
-    let hit : Bool := match cm_cache_lookup cache canonical src with
-      | CmCacheHit _ => True
-      | CmCacheMiss => False
-      | CmCacheStale => False
-      end in
-    let miss : Bool := match cm_cache_lookup cm_cache0 canonical src with
-      | CmCacheMiss => True
-      | CmCacheHit _ => False
-      | CmCacheStale => False
-      end in
-    let stale : Bool := match cm_cache_lookup cache canonical other with
-      | CmCacheStale => True
-      | CmCacheHit _ => False
-      | CmCacheMiss => False
-      end in
-    let reset : Bool := match cm_cache_lookup (cm_cache_reset cache) canonical src with
-      | CmCacheMiss => True
-      | CmCacheHit _ => False
-      | CmCacheStale => False
-      end in
+    let hit : Bool := if let CmCacheHit _ := (cm_cache_lookup cache canonical src : CmCacheLookup) then
+        True
+      else False in
+    let miss : Bool := if let CmCacheMiss := (cm_cache_lookup cm_cache0 canonical src : CmCacheLookup) then
+        True
+      else False in
+    let stale : Bool := if let CmCacheStale := (cm_cache_lookup cache canonical other : CmCacheLookup) then
+        True
+      else False in
+    let reset : Bool := if let CmCacheMiss :=
+        (cm_cache_lookup (cm_cache_reset cache) canonical src : CmCacheLookup) then
+        True
+      else False in
     andb(hit, andb(miss, andb stale reset));
 
 -- Native-tool build metadata scopes this two-argument import harvest.
 -- Type-alias following on imports stays unknown.
-def cm_load_file (req : Pair String String) (intern : InternState)
-    : Either QualityInputError CmHarvest :=
-    match req with
-    | MkPair path source =>
-        match cm_parse_import source intern with
-        | Left error => Left QualityInputError CmHarvest error
-        | Right parsed => match parsed with
-          | MkPair file metadata => match metadata with
-            | MkPair lexed _ => match load_intern_string lexed
-                (prim_string_to_char_codes path) with
-              | MkPair module_id updated =>
-                  Right QualityInputError CmHarvest
-                    (cm_after_parse path module_id False file updated)
-              end
-            end
-          end
-        end
+def cm_load_file (req : Pair String String) (intern : LexerIntern)
+    : Either QualityInputError (Pair CmHarvest LexerIntern) :=
+    let (MkPair path source) := req in
+    match cm_parse_indexed False source intern with
+    | Left error => Left QualityInputError (Pair CmHarvest LexerIntern) error
+    | Right parsed => let (MkPair file metadata) := parsed in
+      let (MkPair lexed _) := metadata in
+      let (MkPair module_id updated) :=
+        lexer_intern_string lexed
+          (prim_string_to_char_codes path) in
+      Right QualityInputError (Pair CmHarvest LexerIntern)
+        (cm_after_parse_indexed path module_id False file updated)
     end;
 
-def cm_load_file_cached (req : Pair String String) (intern : InternState)
+def cm_load_file_cached (req : Pair String String) (intern : LexerIntern)
+    (cache : CmParseCache) : Either QualityInputError (Pair CmHarvest (Pair LexerIntern CmParseCache)) :=
+    let (MkPair path source) := req in
+    if let CmCacheHit harvest := (cm_cache_lookup cache path source : CmCacheLookup) then
+      let (MkHarvest _ symbols imports decls origins) := harvest in
+      Right QualityInputError (Pair CmHarvest (Pair LexerIntern CmParseCache))
+        (MkPair CmHarvest (Pair LexerIntern CmParseCache)
+          (MkHarvest (lexer_intern_state intern) symbols imports decls origins)
+          (MkPair LexerIntern CmParseCache intern cache))
+    else
+      match cm_load_file req intern with
+      | Left error => Left QualityInputError (Pair CmHarvest (Pair LexerIntern CmParseCache)) error
+      | Right loaded => let (MkPair harvest updated) := loaded in
+          Right QualityInputError (Pair CmHarvest (Pair LexerIntern CmParseCache))
+            (MkPair CmHarvest (Pair LexerIntern CmParseCache) harvest
+              (MkPair LexerIntern CmParseCache updated (cm_cache_put cache path source harvest)))
+      end;
+
+def cm_load_file_flat (req : Pair String String) (intern : InternState)
+    : Either QualityInputError CmHarvest :=
+    match cm_load_file req (lexer_intern_from intern) with
+    | Left error => Left QualityInputError CmHarvest error
+    | Right loaded => let (MkPair harvest _) := loaded in
+      Right QualityInputError CmHarvest harvest
+    end;
+
+def cm_load_file_cached_flat (req : Pair String String) (intern : InternState)
     (cache : CmParseCache) : Either QualityInputError (Pair CmHarvest CmParseCache) :=
-    match req with
-    | MkPair path source =>
-        match cm_cache_lookup cache path source with
-        | CmCacheHit harvest =>
-            match harvest with
-            | MkHarvest _ symbols imports decls origins =>
-                Right QualityInputError (Pair CmHarvest CmParseCache)
-                  (MkPair CmHarvest CmParseCache
-                    (MkHarvest intern symbols imports decls origins) cache)
-            end
-        | CmCacheMiss =>
-            match cm_load_file req intern with
-            | Left error => Left QualityInputError (Pair CmHarvest CmParseCache) error
-            | Right harvest =>
-                Right QualityInputError (Pair CmHarvest CmParseCache)
-                  (MkPair CmHarvest CmParseCache harvest
-                    (cm_cache_put cache path source harvest))
-            end
-        | CmCacheStale =>
-            match cm_load_file req intern with
-            | Left error => Left QualityInputError (Pair CmHarvest CmParseCache) error
-            | Right harvest =>
-                Right QualityInputError (Pair CmHarvest CmParseCache)
-                  (MkPair CmHarvest CmParseCache harvest
-                    (cm_cache_put cache path source harvest))
-            end
-        end
+    match cm_load_file_cached req (lexer_intern_from intern) cache with
+    | Left error => Left QualityInputError (Pair CmHarvest CmParseCache) error
+    | Right loaded => let (MkPair harvest state) := loaded in
+      let (MkPair _ next_cache) := state in
+      Right QualityInputError (Pair CmHarvest CmParseCache)
+        (MkPair CmHarvest CmParseCache harvest next_cache)
     end;
 
 -- The selected root and compiler imports keep signatures, including multi-hop
@@ -660,10 +464,7 @@ def cm_path_in (path : String) (rows : List String) : Bool :=
       match rest with
       | Nil => False
       | Cons row more =>
-          match prim_string_eq path row with
-          | True => True
-          | False => go more
-          end
+          if prim_string_eq path row then True else go more
       end) rows;
 
 def cm_keep_import_paths : List String :=
@@ -746,21 +547,19 @@ def cm_skip_exact_paths : List String :=
     ];
 
 def cm_skip_import_path (path : String) : Bool :=
-    match cm_keep_import_path path with
-    | True => False
-    | False =>
-        orb (prim_string_starts path "runtime/platform/")
-          (orb (cm_path_in path cm_skip_exact_paths)
-            (orb (cm_skip_analyze_family path)
-              (cm_skip_impl_path path)))
-    end;
+    if cm_keep_import_path path then False
+    else
+      orb (prim_string_starts path "runtime/platform/")
+        (orb (cm_path_in path cm_skip_exact_paths)
+          (orb (cm_skip_analyze_family path)
+            (cm_skip_impl_path path)));
 
 def cm_skip_import_for (entry : String) (path : String) : Bool :=
-    match andb (prim_string_starts entry "runtime/")
-        (prim_string_starts path "runtime/platform/") with
-    | True => False
-    | False => cm_skip_import_path path
-    end;
+    if
+      andb (prim_string_starts entry "runtime/")
+        (prim_string_starts path "runtime/platform/") then
+      False
+    else cm_skip_import_path path;
 
 def cm_import_bound_contracts : Bool :=
     andb (cm_skip_import_path "runtime/platform/windows_fs.ouro")
@@ -770,24 +569,43 @@ def cm_import_bound_contracts : Bool :=
             (notb (cm_skip_import_for "runtime/managed.ouro"
               "runtime/platform/windows_x64.ouro")))));
 
+-- Canonical path IDs stay stable as this load extends the intern table.
+-- The count includes skipped stubs, which do not spend the read budget.
+private def CmLoadedFiles : Type := Pair FileIndex.EntryIndex Nat;
+
+private def cm_no_loaded_files : CmLoadedFiles :=
+    MkPair FileIndex.EntryIndex Nat FileIndex.EntryIndexEmpty Z;
+
+private def cm_mark_loaded_file (id : Nat) (files : CmLoadedFiles) : CmLoadedFiles :=
+    let (MkPair index count) := files in
+    MkPair FileIndex.EntryIndex Nat (FileIndex.entry_index_insert id FileIndex.EntryIndexReserved index) (add count 1);
+
 -- Paths are repository-relative compiler canonical paths. The caller anchors
 -- disk reads to an already resolved repository root. Source text is retained
 -- only for the selected file, to give the reporting process that SAME snapshot.
-def cm_load_pending (root : String) (entry : Nat) : Nat -> Nat -> List Nat -> List Nat
-    -> InternState -> List SrcUnit -> List ScDecl -> String -> List Decl
+private def cm_load_pending_indexed (root : String) (entry : Nat) (canonical_entry : Maybe String)
+    : Nat -> Nat -> List Nat -> CmLoadedFiles
+    -> LexerIntern -> List SrcUnit -> List ScDecl -> String -> List Decl
     -> CmParseCache -> List Nat -> List CsOriginFact -> ImpReg
     -> IO (Either QualityInputError
         (Pair ClippySemanticUnit (Pair InternState CmParseCache))) :=
-  fix go (fuel : Nat) (file_budget : Nat) (pending : List Nat) (loaded : List Nat)
-      (intern : InternState) (units : List SrcUnit) (symbols : List ScDecl)
+  let entry_path (intern : InternState) : String :=
+    match canonical_entry with
+    | Just path => path
+    | Nothing => cm_string intern entry
+    end in
+  fix go (fuel : Nat) (file_budget : Nat) (pending : List Nat) (loaded : CmLoadedFiles)
+    (indexed : LexerIntern) (units : List SrcUnit) (symbols : List ScDecl)
       (source : String) (root_decls : List Decl) (cache : CmParseCache)
       (keep : List Nat) (origins : List CsOriginFact) (root_aliases : ImpReg)
       : IO (Either QualityInputError
         (Pair ClippySemanticUnit (Pair InternState CmParseCache))) :=
+    let intern : InternState := lexer_intern_state indexed in
+    let (MkPair file_index file_count) := loaded in
     match pending with
     | Nil => io_pure (Either QualityInputError
         (Pair(ClippySemanticUnit, Pair InternState CmParseCache)))
-        (match resolve_imports_fuel cm_import_graph_fuel (cm_graph_units units) entry with
+        (match resolve_import_paths_fuel cm_import_graph_fuel units entry with
          | RErr code detail => Left QualityInputError
              (Pair(ClippySemanticUnit, Pair InternState CmParseCache))
              (QualityInvalidInput (prim_string_concat "compiler import graph failed: "
@@ -799,7 +617,7 @@ def cm_load_pending (root : String) (entry : Nat) : Nat -> Nat -> List Nat -> Li
                (Pair(ClippySemanticUnit, Pair InternState CmParseCache))
                (QualityInvalidInput (sc_error_message error))
             | Right index =>
-                let path : List Nat := prim_string_to_char_codes(cm_string intern entry) in
+                let path : List Nat := prim_string_to_char_codes (entry_path intern) in
                 let files : List (Pair (List Nat) ImpReg) :=
                   [MkPair (List Nat) ImpReg path root_aliases] in
                 match module_alias_units intern files with
@@ -810,17 +628,12 @@ def cm_load_pending (root : String) (entry : Nat) : Nat -> Nat -> List Nat -> Li
                       (prim_string_concat (prim_string_of_nat code)
                         (prim_string_concat(" at ", prim_string_of_nat detail)))))
                 | ROk aliases =>
-                    let members : List ModuleMember := map ScDecl ModuleMember
-                      (fun (decl : ScDecl) => MkModuleMember
-                        (sc_decl_module decl) (sc_decl_name decl)
-                        (sc_decl_name decl)
-                        (notb (module_is_private (sc_decl_module decl)
-                          (sc_decl_name decl) units))) symbols in
+                    let members : List ModuleMember := cm_qualified_members entry aliases symbols units in
                     Right QualityInputError
                       (Pair(ClippySemanticUnit, Pair InternState CmParseCache))
                       (MkPair ClippySemanticUnit (Pair InternState CmParseCache)
                         (CmUnit intern entry source units symbols index root_decls
-                          (length Nat loaded) origins
+                          file_count origins
                           (CmResolvedImportsOf aliases members))
                         (MkPair InternState CmParseCache intern cache))
                 end
@@ -831,93 +644,101 @@ def cm_load_pending (root : String) (entry : Nat) : Nat -> Nat -> List Nat -> Li
           (Pair(ClippySemanticUnit, Pair InternState CmParseCache)))
           (Left QualityInputError (Pair(ClippySemanticUnit, Pair InternState CmParseCache))
             (QualityInvalidInput "semantic source queue traversal exhausted"))
-      | S remaining => match elem Nat eq_nat id loaded with
-      | True => go remaining file_budget rest loaded intern units symbols
-          source root_decls cache keep origins root_aliases
-      | False => match file_budget with
-        | Z => io_pure (Either QualityInputError
-            (Pair(ClippySemanticUnit, Pair InternState CmParseCache)))
-            (Left QualityInputError (Pair(ClippySemanticUnit, Pair InternState CmParseCache))
-              (QualityInvalidInput "semantic source inventory exhausted"))
-        | S files_remaining =>
-            let path : String := cm_string intern id in
-            match andb (notb (eq_nat id entry))
-                (andb (cm_skip_import_for (cm_string intern entry) path)
-                  (notb (elem Nat eq_nat id keep))) with
-            | True =>
-                go remaining file_budget rest (Cons Nat id loaded) intern
+      | S remaining => match FileIndex.entry_index_lookup id file_index with
+        | Just _ =>
+          go remaining file_budget rest loaded indexed units symbols
+            source root_decls cache keep origins root_aliases
+        | Nothing =>
+          match file_budget with
+          | Z => io_pure (Either QualityInputError
+              (Pair(ClippySemanticUnit, Pair InternState CmParseCache)))
+              (Left QualityInputError (Pair(ClippySemanticUnit, Pair InternState CmParseCache))
+                (QualityInvalidInput "semantic source inventory exhausted"))
+          | S files_remaining =>
+              let path : String := cm_string intern id in
+              if
+                andb (notb (eq_nat id entry))
+                  (andb (cm_skip_import_for (entry_path intern) path)
+                    (notb (elem Nat eq_nat id keep))) then
+                go remaining file_budget rest (cm_mark_loaded_file id loaded) indexed
                   (Cons SrcUnit (mk_src_unit id (Nil Decl) (Nil Nat)) units)
                   symbols source root_decls cache keep origins root_aliases
-            | False =>
-            do let! input := quality_read_file (quality_child root path);
-               match input with
-               | Left error => io_pure (Either QualityInputError
-                   (Pair(ClippySemanticUnit, Pair InternState CmParseCache)))
-                   (Left QualityInputError (Pair(ClippySemanticUnit, Pair InternState CmParseCache)) error)
-               | Right text =>
-                   match eq_nat id entry with
-                   | True => match cm_parse_with_aliases text intern with
-                     | Left error => io_pure (Either QualityInputError
-                         (Pair(ClippySemanticUnit, Pair InternState CmParseCache)))
-                         (Left QualityInputError (Pair(ClippySemanticUnit, Pair InternState CmParseCache))
-                           (QualityInvalidInput (prim_string_concat path
-                             (prim_string_concat(": ", quality_input_message error)))))
-                     | Right parsed => match parsed with
-                       | MkPair decls metadata => match metadata with
-                         | MkPair lexed aliases => match cm_after_parse path id True decls lexed with
-                           | MkHarvest updated file_symbols imports file _ =>
-                               go remaining files_remaining
-                                 (append Nat imports rest) (Cons Nat id loaded)
-                                 updated (Cons SrcUnit (mk_src_unit id (cm_import_stubs imports) (cm_parsed_private file)) units)
-                                 (append ScDecl file_symbols symbols)
-                                 text (cm_parsed_decls file) cache imports origins aliases
-                           end
-                         end
-                       end
-                     end
-                   | False => match cm_load_file_cached (MkPair String String path text) intern cache with
-                     | Left error => io_pure (Either QualityInputError
-                         (Pair(ClippySemanticUnit, Pair InternState CmParseCache)))
-                         (Left QualityInputError (Pair(ClippySemanticUnit, Pair InternState CmParseCache))
-                           (QualityInvalidInput (prim_string_concat path
-                             (prim_string_concat(": ", quality_input_message error)))))
-                     | Right loaded_file => match loaded_file with
-                       | MkPair harvested next_cache => match harvested with
-                         | MkHarvest updated file_symbols imports file captured =>
-                             go remaining files_remaining
-                               (append Nat imports rest) (Cons Nat id loaded)
-                               updated (Cons SrcUnit (mk_src_unit id (cm_import_stubs imports) (cm_parsed_private file)) units)
-                               (append ScDecl file_symbols symbols)
-                               source root_decls next_cache keep
-                               (append CsOriginFact captured origins) root_aliases
-                         end
-                       end
-                     end
-                   end
-               end
-            end
+              else
+                match! quality_read_file (quality_child root path) with
+                | Left error => io_pure (Either QualityInputError
+                    (Pair(ClippySemanticUnit, Pair InternState CmParseCache)))
+                    (Left QualityInputError (Pair(ClippySemanticUnit, Pair InternState CmParseCache)) error)
+                | Right text =>
+                    if eq_nat id entry then
+                      match cm_parse_indexed True text indexed with
+                      | Left error => io_pure (Either QualityInputError
+                          (Pair(ClippySemanticUnit, Pair InternState CmParseCache)))
+                          (Left QualityInputError (Pair(ClippySemanticUnit, Pair InternState CmParseCache))
+                            (QualityInvalidInput (prim_string_concat path
+                              (prim_string_concat(": ", quality_input_message error)))))
+                      | Right parsed => let (MkPair decls metadata) := parsed in
+                        let (MkPair lexed aliases) := metadata in
+                        let (MkPair harvest updated) :=
+                          cm_after_parse_indexed path id True decls lexed in
+                        let (MkHarvest _ file_symbols imports file _) := harvest in
+                        go remaining files_remaining
+                          (append Nat imports rest) (cm_mark_loaded_file id loaded)
+                          updated (Cons SrcUnit (mk_src_unit id (cm_import_stubs imports) (cm_parsed_private file)) units)
+                          (append ScDecl file_symbols symbols)
+                          text (cm_parsed_decls file) cache imports origins aliases
+                      end
+                    else
+                      match cm_load_file_cached (MkPair String String path text) indexed cache with
+                      | Left error => io_pure (Either QualityInputError
+                          (Pair(ClippySemanticUnit, Pair InternState CmParseCache)))
+                          (Left QualityInputError (Pair(ClippySemanticUnit, Pair InternState CmParseCache))
+                            (QualityInvalidInput (prim_string_concat path
+                              (prim_string_concat(": ", quality_input_message error)))))
+                      | Right loaded_file => let (MkPair harvested next) := loaded_file in
+                        let (MkPair updated next_cache) := next in
+                        let (MkHarvest _ file_symbols imports file captured) :=
+                          harvested in
+                        go remaining files_remaining
+                          (append Nat imports rest) (cm_mark_loaded_file id loaded)
+                          updated (Cons SrcUnit (mk_src_unit id (cm_import_stubs imports) (cm_parsed_private file)) units)
+                          (append ScDecl file_symbols symbols)
+                          source root_decls next_cache keep
+                          (append CsOriginFact captured origins) root_aliases
+                      end
+                end
+          end
         end
       end
-      end
     end;
+
+def cm_load_pending (root : String) (entry : Nat) (fuel : Nat) (file_budget : Nat)
+    (pending : List Nat) (loaded : List Nat)
+    : LexerIntern -> List SrcUnit -> List ScDecl -> String -> List Decl
+    -> CmParseCache -> List Nat -> List CsOriginFact -> ImpReg
+    -> IO (Either QualityInputError (Pair ClippySemanticUnit (Pair InternState CmParseCache))) :=
+    let files : CmLoadedFiles := foldl Nat CmLoadedFiles
+      (fun (state : CmLoadedFiles) (id : Nat) => cm_mark_loaded_file id state)
+      cm_no_loaded_files loaded in
+    cm_load_pending_indexed root entry (Nothing String) fuel file_budget pending files;
 
 def cm_load_cached (root : String) (relative : String) (intern : InternState)
     (cache : CmParseCache)
     : IO (Either QualityInputError
         (Pair ClippySemanticUnit (Pair InternState CmParseCache))) :=
-    match load_intern_string intern (load_canon_path (Nil Nat)
-        (prim_string_to_char_codes relative)) with
-    | MkPair entry next => cm_load_pending root entry cm_load_queue_fuel cm_file_budget
-        ([entry] : List Nat) (Nil Nat) next (Nil SrcUnit) (Nil ScDecl) "" (Nil Decl) cache
-         (Nil Nat) (Nil CsOriginFact) empty_imp_reg
-    end;
+    -- Keep derived indexes in this root's arena, outside the retained session state.
+    let canonical : List Nat := load_canon_path (Nil Nat) (prim_string_to_char_codes relative) in
+    let (MkPair entry next) := lexer_intern_string (lexer_intern_from intern) canonical in
+    -- The path remains valid while import parsing adds strings to the intern table.
+    cm_load_pending_indexed root entry (Just String (prim_string_of_char_codes canonical))
+      cm_load_queue_fuel cm_file_budget ([entry] : List Nat) cm_no_loaded_files
+      next (Nil SrcUnit) (Nil ScDecl) "" (Nil Decl) cache
+       (Nil Nat) (Nil CsOriginFact) empty_imp_reg;
 
 def cm_load (root : String) (relative : String) : IO (Either QualityInputError ClippySemanticUnit) :=
     do let! loaded := cm_load_cached root relative empty_intern cm_cache0;
        io_pure (Either QualityInputError ClippySemanticUnit)
          (match loaded with
           | Left error => Left QualityInputError ClippySemanticUnit error
-          | Right pair => match pair with
-            | MkPair unit _ => Right QualityInputError ClippySemanticUnit unit
-            end
+          | Right pair => let (MkPair unit _) := pair in
+            Right QualityInputError ClippySemanticUnit unit
           end)

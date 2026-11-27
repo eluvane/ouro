@@ -48,7 +48,12 @@ EXTERNAL = {
     "CheckReductionFailure": "compiler_result_tests", "CheckResourceLimit": "compiler_result_tests",
     "CheckUnsupported": "compiler_module_tests", "CheckCancelled": "compiler_module_tests",
     "CheckInternalFailure": "compiler_module_tests", "CheckPrimitiveFailure": "compiler_primitive_binding_tests",
+    "PrimitiveFileReadStatus": "compiler_file_read_status_binding_tests",
     "PrimitiveProcessBounded": "compiler_process_bounded_registry_tests",
+    "PrimitiveProcessBoundedAt": "compiler_process_bounded_registry_tests",
+}
+EXTERNAL_SUITES = {
+    "PrimitiveManagedAllocatedRequestedBytes": "scripts/frontend_host_suite.py",
 }
 for _name in """PrimitiveU8Type PrimitiveU32Type PrimitiveU64Type PrimitiveI32Type PrimitiveUSizeType
 PrimitiveRawPtrType PrimitiveRuntimeType PrimitiveRawFnType PrimitiveWordOperation PrimitiveWordConversion
@@ -72,17 +77,20 @@ def constructors(path, name):
 
 
 def source_inventory():
-    model = "compiler/file_check_model.ouro"
-    return {
-        "term_constructors": constructors("compiler/core.ouro", "CoreTerm"),
-        "type_faults": constructors(model, "CheckTypeFault"),
-        "core_faults": constructors(model, "CheckCoreFault"),
-        "failure_kinds": constructors(model, "CheckFailure"),
-        "declaration_kinds": constructors(model, "FileItem"),
-        "primitives": constructors("compiler/primitive_model.ouro", "PrimitiveId"),
-        "string_operations": constructors("compiler/primitive_model.ouro", "PrimitiveStringOp"),
-        "surface": surface_inventory.inventory(),
+    terms = constructors("compiler/core.ouro", "CoreTerm")
+    model = surface_inventory.constructor_reader("compiler/file_check_model.ouro")
+    rows = {
+        "term_constructors": terms,
+        "type_faults": model("CheckTypeFault"),
+        "core_faults": model("CheckCoreFault"),
+        "failure_kinds": model("CheckFailure"),
+        "declaration_kinds": model("FileItem"),
     }
+    primitives = surface_inventory.constructor_reader("compiler/primitive_model.ouro")
+    rows["primitives"] = primitives("PrimitiveId")
+    rows["string_operations"] = primitives("PrimitiveStringOp")
+    rows["surface"] = surface_inventory.inventory()
+    return rows
 
 
 def generator_features():
@@ -101,7 +109,10 @@ def code_strategies():
         "failure_kinds": ["CheckTypeFailure", "CheckMalformedCore"],
         "primitives": {"PrimitiveStringType": ["domain:11"], "PrimitiveStringOperation": list(STRING_PROPERTIES.values())},
         "string_operations": STRING_PROPERTIES,
-        "external_owners": {name: "tests/" + owner + ".ouro" for name, owner in sorted(EXTERNAL.items())},
+        "external_owners": {
+            **{name: "tests/" + owner + ".ouro" for name, owner in sorted(EXTERNAL.items())},
+            **EXTERNAL_SUITES,
+        },
     }, "surface": surface_inventory.strategies()}}
 
 
@@ -132,7 +143,8 @@ def compare(inventory, strategies, *, coverage=None):
     external = kernel.get("external_owners", {})
     features = set(kernel.get("generator_features", []))
     for name, path in external.items():
-        if path != "tests/" + EXTERNAL.get(name, "UNMAPPED") + ".ouro" or not (ROOT / path).is_file():
+        expected = EXTERNAL_SUITES.get(name, "tests/" + EXTERNAL.get(name, "UNMAPPED") + ".ouro")
+        if path != expected or not (ROOT / path).is_file():
             problems.append(f"external canonical owner is missing or changed for {name}")
     domains = {
         "term_constructors": kernel.get("term_tag_features", {}),

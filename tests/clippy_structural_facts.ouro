@@ -4,15 +4,10 @@
 import "../tools/clippy/structural_rules.ouro",
   "../std/io.ouro",
   "../tools/quality/source.ouro";
+import "compiler_test_list_equal.ouro";
 
 def cs_test_codes : List String -> List String -> Bool :=
-  fix go (xs : List String) (ys : List String) : Bool :=
-    match xs, ys with
-    | Nil, Nil => True
-    | Nil, Cons _ _ => False
-    | Cons _ _, Nil => False
-    | Cons x more, Cons y rest => andb(prim_string_eq x y, go more rest)
-    end;
+  compiler_test_list_equal String prim_string_eq;
 
 def cs_test_fail (label : String) (message : String) : List String :=
     [prim_string_concat(label, prim_string_concat ": " message)];
@@ -38,39 +33,37 @@ def cs_expect (field : String) : List String :=
     end;
 
 def cs_found (proofs : List CgSProof) : List String :=
-    map CgSProof String (fun (proof : CgSProof) => match proof with
-      | MkCgSProof code _ _ _ _ => code
-      end) proofs;
+    map CgSProof String (fun (proof : CgSProof) => let (MkCgSProof code _ _ _ _) := proof in code) proofs;
 
 def cs_test_source (label : String) (mode : String) (source : String)
     (wanted : List String) : List String :=
     match cg_s_frontend source with
-    | Left error => match prim_string_eq mode "frontend-error" with
-      | True => []
-      | False => cs_test_fail label
+    | Left error => if prim_string_eq mode "frontend-error" then []
+      else
+        cs_test_fail label
           (prim_string_concat "unexpected frontend failure: "
             (quality_input_message error))
-      end
-    | Right unit => match prim_string_eq mode "facts" with
-      | False => cs_test_fail label
-          "frontend unexpectedly accepted the error fixture or invalid fixture kind"
-      | True => match cg_s_proofs unit with
+    | Right unit => if prim_string_eq mode "facts" then
+        match cg_s_proofs unit with
         | Left error => cs_test_fail label
             (prim_string_concat "proof construction failed: "
               (quality_input_message error))
         | Right proofs =>
             let found : List String := cs_found proofs in
-            match cs_test_codes (quality_sort String prim_string_le wanted)
-                (quality_sort String prim_string_le found) with
-            | True => []
-            | False => cs_test_fail label
+            if
+              cs_test_codes (quality_sort String prim_string_le wanted)
+                (quality_sort String prim_string_le found) then
+              []
+            else
+              cs_test_fail label
                 (prim_string_concat "expected ["
                   (prim_string_concat (cs_join wanted)
                     (prim_string_concat "] but found ["
                       (prim_string_concat(cs_join found, "]")))))
-            end
         end
-      end
+      else
+        cs_test_fail label
+          "frontend unexpectedly accepted the error fixture or invalid fixture kind"
     end;
 
 def cs_nonempty (s : String) : Bool :=
@@ -89,13 +82,12 @@ def cs_test_budget : Bool :=
 
 def cs_test_scopes : Bool :=
     let catalog : CgSCatalog := MkCgSCatalog [] [] in
-    match cg_s_bind 7 (Nothing Nat) [] (MkCgSState 1 0 (Nil CgSFact)
-      (Nothing (Pair Nat Nat)) (Nil (Pair(Nat, Pair Nat Nat)))) with
-    | MkPair outer first => match cg_s_bind 7 (Nothing Nat) outer first with
-      | MkPair inner _ => notb (cg_s_maybe_equal
-          (cg_s_atom catalog outer (EVar 7)) (cg_s_atom catalog inner (EVar 7)))
-      end
-    end;
+    let (MkPair outer first) :=
+      cg_s_bind 7 (Nothing Nat) [] (MkCgSState 1 0 (Nil CgSFact)
+      (Nothing (Pair Nat Nat)) (Nil (Pair(Nat, Pair Nat Nat)))) in
+    let (MkPair inner _) := cg_s_bind 7 (Nothing Nat) outer first in
+    notb (cg_s_maybe_equal
+      (cg_s_atom catalog outer (EVar 7)) (cg_s_atom catalog inner (EVar 7)));
 
 def cs_test_bad_spine : Bool :=
     let catalog : CgSCatalog := MkCgSCatalog [MkPair Nat (List Nat) 1 [2, 3]]
@@ -125,37 +117,91 @@ def cs_test_let_span : Bool :=
         | Nil => False
         | Cons proof rest => match rest with
           | Cons _ _ => False
-          | Nil => match proof with
-            | MkCgSProof code _ _ range _ => match prim_string_eq code "OURO-CLIPPY-REDUNDANT-001" with
-              | False => False
-              | True => match range with
-                | Nothing => False
-                | Just bounds => match bounds with
-                  | MkPair start end_at => prim_string_eq
-                      (prim_string_slice source start (sub end_at start))
-                      "let local := value in local"
-                  end
-                end
+          | Nil => let (MkCgSProof code _ _ range _) := proof in
+            if prim_string_eq code "OURO-CLIPPY-REDUNDANT-001" then
+              match range with
+              | Nothing => False
+              | Just bounds => let (MkPair start end_at) := bounds in
+                prim_string_eq
+                  (prim_string_slice source start (sub end_at start))
+                  "let local := value in local"
               end
-            end
+            else False
           end
+        end
+      end
+    end;
+
+def cs_test_rewritten_proof_order : Bool :=
+    let source : String := prim_string_concat
+      "inductive Flag : Type := | On : Flag | Off : Flag;\n"
+      (prim_string_concat "record Box : Type where item : Flag; end;\n"
+        (prim_string_concat "def keep (x : Box) : Box := let local := x in local;\n"
+          "def choose (f : Flag) (x : Box) : Box := match f with | On => x | Off => x end;")) in
+    match cg_s_frontend source with
+    | Left _ => False
+    | Right unit => match cg_s_proofs unit with
+      | Left _ => False
+      | Right proofs => andb
+          (cs_test_codes (cs_found proofs) ["OURO-CLIPPY-REDUNDANT-001", "OURO-CLIPPY-REDUNDANT-004"])
+          (all CgSProof (fun (proof : CgSProof) => let (MkCgSProof _ _ _ range _) := proof in
+            match range with | Nothing => True | Just _ => False end) proofs)
+      end
+    end;
+
+def cs_test_first_proof_error : Bool :=
+    let ignored : CgSFact := CgSLet 11 1 12 1 True True in
+    let no_spans : Unit -> Maybe CgSSourceSpans := fun (_ : Unit) => Nothing CgSSourceSpans in
+    let clean : CgSState := MkCgSState 4 1 [ignored] (Nothing (Pair Nat Nat)) [] in
+    let mixed : CgSState := MkCgSState 4 3
+      [CgSLet 51 3 52 3 False True, CgSLet 41 2 42 2 False True, ignored]
+      (Nothing (Pair Nat Nat)) [] in
+    match cg_s_proofs_with_spans empty_intern clean no_spans with
+    | Left _ => False
+    | Right proofs => match proofs with
+      | Cons _ _ => False
+      | Nil => match cg_s_proofs_with_spans empty_intern mixed no_spans with
+        | Left error => prim_string_eq (quality_input_message error)
+            "missing or unsafe quality input: missing compiler-interned name in structural evidence: 41"
+        | Right _ => False
+        end
+      end
+    end;
+
+def cs_test_interned_evidence : Bool :=
+    let intern : InternState := MkIntern
+      [MkPair (List Nat) Nat (prim_string_to_char_codes "café") 10,
+       MkPair (List Nat) Nat (prim_string_to_char_codes "shadow") 10,
+       MkPair (List Nat) Nat (prim_string_to_char_codes "雪") 11,
+       MkPair (List Nat) Nat (prim_string_to_char_codes "unused") 12] 13 [] 0 in
+    let fact : CgSFact := CgSLet 10 1 11 2 False True in
+    let state : CgSState := MkCgSState 3 1 [fact] (Nothing (Pair Nat Nat)) [] in
+    match cg_s_evidence (cg_s_names intern) fact with
+    | Left _ => False
+    | Right expected => match cg_s_proofs_with_spans intern state
+        (fun (_ : Unit) => Nothing CgSSourceSpans) with
+      | Left _ => False
+      | Right proofs => match proofs with
+        | Nil => False
+        | Cons proof rest => let (MkCgSProof _ owner _ _ evidence) := proof in
+          andb (nullb CgSProof rest)
+            (andb (prim_string_eq owner "café") (prim_string_eq evidence expected))
         end
       end
     end;
 
 def cs_test_invariants : List String :=
     concat_map (Pair String Bool) String
-      (fun (test : Pair String Bool) => match test with
-        | MkPair label passed => match passed with
-          | True => []
-          | False => cs_test_fail label "native invariant failed"
-          end
-        end)
+      (fun (test : Pair String Bool) => let (MkPair label passed) := test in
+        if passed then [] else cs_test_fail label "native invariant failed")
       [MkPair String Bool "fact-budget" cs_test_budget,
        MkPair String Bool "distinct-binder-identity" cs_test_scopes,
        MkPair String Bool "invalid-branch-spine" cs_test_bad_spine,
        MkPair String Bool "effect-is-not-an-atom" cs_test_effect_atom,
-       MkPair String Bool "let-expression-span" cs_test_let_span];
+       MkPair String Bool "let-expression-span" cs_test_let_span,
+       MkPair String Bool "rewritten-proof-order" cs_test_rewritten_proof_order,
+       MkPair String Bool "first-proof-error" cs_test_first_proof_error,
+       MkPair String Bool "interned-evidence-keeps-first-name-and-exact-bytes" cs_test_interned_evidence];
 
 def cs_test_print : List String -> IO Unit :=
   fix go (errors : List String) : IO Unit :=
@@ -199,12 +245,10 @@ def cs_test_rows (root : String) : List String -> List String
   fix go (xs : List String) (acc : List String) : IO (List String) :=
     match xs with
     | Nil => io_pure(List String, acc)
-    | Cons raw rest => match cs_nonempty raw with
-      | False => go rest acc
-      | True =>
-          do let! more := cs_test_row root raw;
-             go(rest, append String acc more)
-      end
+    | Cons raw rest => if cs_nonempty raw then
+        do let! more := cs_test_row root raw;
+           go(rest, append String acc more)
+      else go rest acc
     end;
 
 def cs_test_run (root : String) : IO Unit :=

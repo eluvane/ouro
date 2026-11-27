@@ -1,6 +1,6 @@
 #!/usr/bin/env sh
-# Compatibility launcher; Ouro owns repository fixtures and this wrapper adds
-# explicit host-bound delegation/rebuild probes that cannot run inside Ouro yet.
+# Ouro runs the repository fixtures. This launcher also tests shell delegation,
+# report validation, and stale binary rejection after failed rebuilds.
 set -eu
 ulimit -s unlimited 2>/dev/null || true
 ROOT=$(CDPATH='' cd "$(dirname "$0")/.." && pwd)
@@ -33,8 +33,7 @@ MSYS2_ENV_CONV_EXCL="${MSYS2_ENV_CONV_EXCL:+$MSYS2_ENV_CONV_EXCL;}OURO_NATIVE_RE
 export PYTHON OURO_NATIVE_REPO_CI_DISPLAY_OUT MSYS2_ENV_CONV_EXCL
 
 FIXTURES=$("$PYTHON" scripts/ouro_smith.py prepare --group manifest --out "$OUT/inputs")
-# The runtime arena lives for one process. Keep all sections mandatory while
-# releasing each section's accumulated reports before starting the next one.
+# Each process releases its arena before the next required section starts.
 for section in fixtures docs project ci wrappers policy manifest; do
 	"$BIN" "--root=$ROOT" "--out=$NATIVE_OUT" "--fixtures=$FIXTURES" "$@" "--section=$section"
 done
@@ -101,6 +100,30 @@ class NativeGateCompatTests(unittest.TestCase):
                 native_out=self.native_out,
             )
 
+    def run_report(self, data: object, *, native_returncode: int = 0):
+        def fake_run(*_args, **_kwargs):
+            self.write_report(data)
+            return SimpleNamespace(returncode=native_returncode)
+
+        return self.run_gate(fake_run)
+
+    def run_report_text(self, text: str, *, native_returncode: int = 0):
+        def fake_run(*_args, **_kwargs):
+            self.report.parent.mkdir(parents=True, exist_ok=True)
+            self.report.write_text(text + "\n", encoding="utf-8")
+            return SimpleNamespace(returncode=native_returncode)
+
+        return self.run_gate(fake_run)
+
+    def assert_rejected_report(self, data: object, *, native_returncode: int = 0):
+        outcome = self.run_report(data, native_returncode=native_returncode)
+        self.assertEqual(outcome.returncode, native_returncode if native_returncode else 1)
+        self.assertEqual(outcome.native_returncode, native_returncode)
+        self.assertFalse(outcome.report_valid)
+        self.assertFalse(outcome.report["pass"])
+        self.assertIsNotNone(outcome.error)
+        return outcome
+
     def test_valid_native_report_passes(self) -> None:
         def fake_run(*_args, **_kwargs):
             self.write_report(self.valid_report())
@@ -120,6 +143,160 @@ class NativeGateCompatTests(unittest.TestCase):
         self.assertEqual(outcome.returncode, 1)
         self.assertTrue(outcome.report_valid)
         self.assertFalse(outcome.report["pass"])
+
+    def test_metrics_nonblocking_and_extra_fields_remain_valid(self) -> None:
+        report = self.valid_report()
+        report["gates"][0]["name"] = ""
+        report["gates"][0]["blocking"] = False
+        report["gates"][0]["metrics"] = [
+            {"name": "rows", "value": "2", "unit": "files"},
+            {"name": "", "value": ""},
+        ]
+        report["gates"][0]["extension"] = {"source": "fixture"}
+        report["extension"] = "metadata"
+        outcome = self.run_report(report)
+        self.assertEqual(outcome.returncode, 0)
+        self.assertTrue(outcome.report_valid)
+        self.assertEqual(outcome.report, report)
+        self.assertIsNone(outcome.error)
+
+    def test_mixed_failed_report_preserves_nonzero_status_and_issue_order(self) -> None:
+        report = self.valid_report(passed=False)
+        issues = [{"reason": "first failure", "path": "first"},
+                  {"reason": "second failure", "path": "second"}]
+        report["gates"][0]["blocking"] = False
+        report["gates"][0]["issues"] = issues
+        report["gates"].insert(0, self.valid_report()["gates"][0])
+        report["issues"] = issues
+        outcome = self.run_report(report, native_returncode=259)
+        self.assertEqual(outcome.returncode, 259)
+        self.assertEqual(outcome.native_returncode, 259)
+        self.assertTrue(outcome.report_valid)
+        self.assertEqual(outcome.report, report)
+        self.assertIsNone(outcome.error)
+
+    def test_nonobject_gate_rows_are_rejected(self) -> None:
+        for gate in (None, True, 1, "gate", [], {}):
+            with self.subTest(gate=gate):
+                report = self.valid_report()
+                report["gates"] = [gate]
+                self.assert_rejected_report(report)
+
+    def test_missing_gate_fields_are_rejected(self) -> None:
+        for field in ("name", "status", "blocking", "metrics", "issues"):
+            with self.subTest(field=field):
+                report = self.valid_report()
+                del report["gates"][0][field]
+                self.assert_rejected_report(report)
+
+    def test_untyped_gate_fields_are_rejected(self) -> None:
+        cases = {
+            "name": (None, True, 1, [], {}),
+            "status": (None, True, 1, [], {}),
+            "blocking": (None, 0, 1, "true", [], {}),
+            "metrics": (None, True, 1, "metrics", {}),
+            "issues": (None, True, 1, "issues", {}),
+        }
+        for field, values in cases.items():
+            for value in values:
+                with self.subTest(field=field, value=value):
+                    report = self.valid_report()
+                    report["gates"][0][field] = value
+                    self.assert_rejected_report(report)
+
+    def test_nonpassing_gate_status_cannot_hide_under_success(self) -> None:
+        for status in ("fail", "skip", "unavailable", "PASS"):
+            with self.subTest(status=status):
+                report = self.valid_report()
+                report["gates"][0]["status"] = status
+                self.assert_rejected_report(report)
+
+    def test_later_failed_or_null_gate_cannot_hide_under_success(self) -> None:
+        for gate in (None, self.valid_report(passed=False)["gates"][0]):
+            with self.subTest(gate=gate):
+                report = self.valid_report()
+                report["gates"].append(gate)
+                self.assert_rejected_report(report)
+
+    def test_gate_status_must_match_its_issues(self) -> None:
+        for passed, status, native_returncode in ((True, "pass", 0), (False, "pass", 9)):
+            with self.subTest(passed=passed):
+                report = self.valid_report(passed=passed)
+                report["gates"][0]["status"] = status
+                if passed:
+                    report["gates"][0]["issues"] = self.valid_report(passed=False)["issues"]
+                outcome = self.assert_rejected_report(report, native_returncode=native_returncode)
+                self.assertIn("status does not match", outcome.error or "")
+
+    def test_failed_summary_requires_a_failed_gate(self) -> None:
+        report = self.valid_report()
+        report["pass"] = False
+        outcome = self.assert_rejected_report(report, native_returncode=9)
+        self.assertIn("pass field does not match", outcome.error or "")
+
+    def test_summary_issues_must_match_gate_issues(self) -> None:
+        for issues in ([], [{"reason": "different failure", "path": "fixture"}]):
+            with self.subTest(issues=issues):
+                report = self.valid_report(passed=False)
+                report["issues"] = issues
+                outcome = self.assert_rejected_report(report, native_returncode=9)
+                self.assertIn("issues do not match", outcome.error or "")
+        report = self.valid_report(passed=False)
+        report["gates"][0]["issues"].append({"reason": "second failure", "path": "second"})
+        report["issues"] = list(reversed(report["gates"][0]["issues"]))
+        self.assert_rejected_report(report, native_returncode=9)
+        report = self.valid_report()
+        report["issues"] = self.valid_report(passed=False)["issues"]
+        self.assert_rejected_report(report)
+
+    def test_malformed_metric_rows_are_rejected(self) -> None:
+        metrics = (None, True, 1, "metric", [], {}, {"name": "rows"},
+                   {"value": "1"}, {"name": None, "value": "1"},
+                   {"name": "rows", "value": 1})
+        for metric in metrics:
+            with self.subTest(metric=metric):
+                report = self.valid_report()
+                report["gates"][0]["metrics"] = [metric]
+                self.assert_rejected_report(report)
+
+    def test_malformed_issue_rows_are_rejected(self) -> None:
+        issues = (None, True, 1, "issue", [], {}, {"reason": "failure"},
+                  {"path": "fixture"}, {"reason": False, "path": "fixture"},
+                  {"reason": "failure", "path": 1})
+        for issue in issues:
+            with self.subTest(issue=issue):
+                report = self.valid_report(passed=False)
+                report["gates"][0]["issues"] = [issue]
+                report["issues"] = [issue]
+                self.assert_rejected_report(report, native_returncode=9)
+
+    def test_contract_markers_and_boolean_pass_remain_required(self) -> None:
+        fields = {"kind": "ouro.ci-gate-report.v1", "version": "2", "profile": "docs",
+                  "execution_backend": "python", "execution_mode": "subprocess", "pass": 1}
+        for field, value in fields.items():
+            with self.subTest(field=field):
+                report = self.valid_report()
+                report[field] = value
+                self.assert_rejected_report(report)
+
+    def test_duplicate_json_keys_are_rejected(self) -> None:
+        report = self.valid_report()
+        report["gates"][0]["metrics"] = [{"name": "rows", "value": "1"}]
+        success = json.dumps(report)
+        failure = json.dumps(self.valid_report(passed=False))
+        cases = ((0, success.replace('"pass": true', '"pass": false, "pass": true')),
+                 (0, success.replace('"status": "pass"', '"status": "fail", "status": "pass"')),
+                 (0, success.replace('"value": "1"', '"value": 1, "value": "1"')),
+                 (9, failure.replace('"reason": "fixture failed"',
+                                     '"reason": null, "reason": "fixture failed"')))
+        for native_returncode, text in cases:
+            with self.subTest(native_returncode=native_returncode, text=text):
+                outcome = self.run_report_text(text, native_returncode=native_returncode)
+                self.assertEqual(outcome.returncode, native_returncode if native_returncode else 1)
+                self.assertEqual(outcome.native_returncode, native_returncode)
+                self.assertFalse(outcome.report_valid)
+                self.assertFalse(outcome.report["pass"])
+                self.assertIn("duplicate native report key", outcome.error or "")
 
     def test_missing_report_after_success_is_blocking(self) -> None:
         outcome = self.run_gate(lambda *_args, **_kwargs: SimpleNamespace(returncode=0))

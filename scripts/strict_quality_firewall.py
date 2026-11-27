@@ -117,7 +117,9 @@ def scan_source(path: Path, text: str, registry: dict[str, dict[str, Any]], prof
     payload = json.loads(result.stdout)
     if not isinstance(payload, list):
         raise ValueError("native strict scan did not return a JSON array")
-    return [_finding_from_json(item) for item in payload if isinstance(item, dict)]
+    if any(not isinstance(item, dict) for item in payload):
+        raise ValueError("native strict scan returned a non-object finding")
+    return [_finding_from_json(item) for item in payload]
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
@@ -150,7 +152,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     )
     sys.stdout.write(result.stdout)
     sys.stderr.write(result.stderr)
-    if result.returncode is None:
+    if result.returncode is None or (result.returncode == 0 and not result.ok):
         return 1
     return int(result.returncode)
 

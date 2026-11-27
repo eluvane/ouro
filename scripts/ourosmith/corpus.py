@@ -200,7 +200,8 @@ def run_corpus(report, program, *, timeout_s=20, directory=CORPUS_DIR, only=None
         return
     for case in selected:
         config = read_recipe(case.data["recipe"])
-        laws, failure = CoreRunner(config, report, smith_program, timeout_s=timeout_s).evaluate(config, config.seeds[0])
+        runner = CoreRunner(config, report, smith_program, timeout_s=timeout_s)
+        laws, failure = runner.evaluate(config, config.seeds[0], label=f"recipes/case-{case.name}/attempt-1")
         summary.cases += 1
         if failure is not None:
             report.add(Finding(LAYER, failure.prop, failure.classification, config.seeds[0], report.profile,

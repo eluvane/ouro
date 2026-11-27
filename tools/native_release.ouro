@@ -1,0 +1,177 @@
+import "native_release_model.ouro", "../std/collections.ouro", "../std/fs_bounded.ouro",
+  "../std/fs_create.ouro", "../std/fs_walk.ouro", "../std/pathx.ouro", "../std/process.ouro";
+
+inductive NativeReleaseCaptured : Type :=
+  | NativeReleaseCapturedOf : NativeReleaseInput -> String -> NativeReleaseCaptured;
+
+inductive NativeReleaseStageError : Type :=
+  | ReleasePlanFailure : NativeReleasePlanError -> NativeReleaseStageError
+  | ReleaseReadFailure : String -> String -> FsBoundedReadError -> NativeReleaseStageError
+  | ReleaseCreateFailure : FsCreateDirError -> NativeReleaseStageError
+  | ReleaseWriteFailure : String -> FsError -> NativeReleaseStageError
+  | ReleaseSourceChanged : String -> NativeReleaseStageError
+  | ReleaseOutputChanged : String -> NativeReleaseStageError
+  | ReleaseOutputResolveFailed : NativeReleaseStageError
+  | ReleaseOutputInventoryFailure : FsWalkResult -> NativeReleaseStageError
+  | ReleaseOutputInventoryChanged : NativeReleaseStageError;
+
+inductive NativeReleaseStageFailure : Type :=
+  | NativeReleaseStageFailureOf : Bool -> NativeReleaseStageError -> NativeReleaseStageFailure;
+
+def native_release_stage_failure_created (failure : NativeReleaseStageFailure) : Bool :=
+    match failure with | NativeReleaseStageFailureOf created _ => created end;
+
+def native_release_stage_error_code (error : NativeReleaseStageError) : String :=
+    match error with
+    | ReleasePlanFailure cause => native_release_plan_error_code cause
+    | ReleaseReadFailure phase _ _ => str_concat "release_read_" phase
+    | ReleaseCreateFailure _ => "release_create"
+    | ReleaseWriteFailure _ _ => "release_write"
+    | ReleaseSourceChanged _ => "release_source_changed"
+    | ReleaseOutputChanged _ => "release_output_changed"
+    | ReleaseOutputResolveFailed => "release_output_resolve"
+    | ReleaseOutputInventoryFailure _ => "release_output_inventory"
+    | ReleaseOutputInventoryChanged => "release_output_inventory_changed"
+    end;
+
+def native_release_owned_result (created : Bool) (result : Either NativeReleaseStageError Unit)
+    : Either NativeReleaseStageFailure Unit :=
+    match result with
+    | Left cause => Left NativeReleaseStageFailure Unit (NativeReleaseStageFailureOf created cause)
+    | Right _ => Right NativeReleaseStageFailure Unit MkUnit
+    end;
+
+def native_release_capture (read : Nat -> String -> IO (Either FsBoundedReadError String))
+    : List NativeReleaseInput -> IO (Either NativeReleaseStageError (List NativeReleaseCaptured)) :=
+  fix capture (inputs : List NativeReleaseInput)
+      : IO (Either NativeReleaseStageError (List NativeReleaseCaptured)) :=
+    match inputs with
+    | Nil => io_pure(Either NativeReleaseStageError (List NativeReleaseCaptured),
+        Right NativeReleaseStageError (List NativeReleaseCaptured) ([] : List NativeReleaseCaptured))
+    | Cons input rest => let (NativeReleaseInputOf name source bytes _) := input in
+      match! read bytes source with
+      | Left cause => io_pure(Either NativeReleaseStageError (List NativeReleaseCaptured),
+          Left NativeReleaseStageError (List NativeReleaseCaptured) (ReleaseReadFailure "source" name cause))
+      | Right content => match native_release_content_checked input content with
+        | Left cause => io_pure(Either NativeReleaseStageError (List NativeReleaseCaptured),
+            Left NativeReleaseStageError (List NativeReleaseCaptured) (ReleasePlanFailure cause))
+        | Right _ => do let! tail := capture rest;
+                        io_pure(Either NativeReleaseStageError (List NativeReleaseCaptured),
+                          match tail with
+                          | Left cause => Left NativeReleaseStageError (List NativeReleaseCaptured) cause
+                          | Right files => Right NativeReleaseStageError (List NativeReleaseCaptured)
+                              (Cons NativeReleaseCaptured (NativeReleaseCapturedOf input content) files)
+                          end)
+        end
+      end
+    end;
+
+def native_release_write_all (write : String -> String -> IO (Either FsError Unit)) (output : String)
+    : List NativeReleaseCaptured -> IO (Either NativeReleaseStageError Unit) :=
+  fix stage (files : List NativeReleaseCaptured) : IO (Either NativeReleaseStageError Unit) :=
+    match files with
+    | Nil => io_pure(Either NativeReleaseStageError Unit, Right NativeReleaseStageError Unit MkUnit)
+    | Cons file rest => let (NativeReleaseCapturedOf input content) := file in
+      let name : String := native_release_name input in
+      match! write (fs_child output name) content with
+      | Left cause => io_pure(Either NativeReleaseStageError Unit,
+          Left NativeReleaseStageError Unit (ReleaseWriteFailure name cause))
+      | Right _ => stage rest
+      end
+    end;
+
+def native_release_verify_all (read : Nat -> String -> IO (Either FsBoundedReadError String))
+    (sources : Bool) (output : String)
+    : List NativeReleaseCaptured -> IO (Either NativeReleaseStageError Unit) :=
+  fix verify (files : List NativeReleaseCaptured) : IO (Either NativeReleaseStageError Unit) :=
+    match files with
+    | Nil => io_pure(Either NativeReleaseStageError Unit, Right NativeReleaseStageError Unit MkUnit)
+    | Cons file rest => let (NativeReleaseCapturedOf input content) := file in
+      let (NativeReleaseInputOf name source bytes _) := input in
+      let phase : String := if sources then "source" else "output" in
+      let path : String := if sources then source else fs_child output name in
+      match! read bytes path with
+      | Left cause => io_pure(Either NativeReleaseStageError Unit,
+          Left NativeReleaseStageError Unit (ReleaseReadFailure phase name cause))
+      | Right actual => if prim_string_eq content actual then verify rest
+        else
+          io_pure(Either NativeReleaseStageError Unit,
+            Left NativeReleaseStageError Unit
+              (if sources then ReleaseSourceChanged name else ReleaseOutputChanged name))
+      end
+    end;
+
+-- Exact enumeration rejects extra files and names collapsed by OS path aliases.
+def native_release_output_inventory (output : String) (files : List NativeReleaseCaptured)
+    (walked : FsWalkResult) : Either NativeReleaseStageError Unit :=
+    match walked with
+    | FsWalkComplete paths =>
+        let expected : List String := map NativeReleaseCaptured String
+          (fun (file : NativeReleaseCaptured) => let (NativeReleaseCapturedOf input _) := file in
+            fs_child output (native_release_name input)) files in
+        if list_eq String str_eq expected (sort_insert String prim_string_le paths) then
+          Right NativeReleaseStageError Unit MkUnit
+        else Left NativeReleaseStageError Unit ReleaseOutputInventoryChanged
+    | FsWalkTruncated _ => Left NativeReleaseStageError Unit (ReleaseOutputInventoryFailure walked)
+    | FsWalkUnreadable _ => Left NativeReleaseStageError Unit (ReleaseOutputInventoryFailure walked)
+    | FsWalkUnsafe _ => Left NativeReleaseStageError Unit (ReleaseOutputInventoryFailure walked)
+    end;
+
+def native_release_populate_with
+    (read : Nat -> String -> IO (Either FsBoundedReadError String))
+    (write : String -> String -> IO (Either FsError Unit)) (walk : String -> IO FsWalkResult)
+    (output : String) (files : List NativeReleaseCaptured) : IO (Either NativeReleaseStageError Unit) :=
+    match! native_release_write_all write output files with
+    | Left cause => io_pure(Either NativeReleaseStageError Unit, Left NativeReleaseStageError Unit cause)
+    | Right _ => match! native_release_verify_all read False output files with
+      | Left cause => io_pure(Either NativeReleaseStageError Unit, Left NativeReleaseStageError Unit cause)
+      | Right _ => match! native_release_verify_all read True output files with
+        | Left cause => io_pure(Either NativeReleaseStageError Unit, Left NativeReleaseStageError Unit cause)
+        | Right _ => do let! walked := walk output;
+                        io_pure(Either NativeReleaseStageError Unit,
+                          native_release_output_inventory output files walked)
+        end
+      end
+    end;
+
+-- The caller controls source files and parents throughout this operation.
+-- Failures retain a created root; this helper neither publishes nor rolls back.
+def native_release_prepare_with
+    (read : Nat -> String -> IO (Either FsBoundedReadError String))
+    (write : String -> String -> IO (Either FsError Unit))
+    (create : String -> IO (Either FsCreateDirError Unit)) (resolve : String -> IO String)
+    (walk : String -> IO FsWalkResult) (budget : Nat) (required : List String)
+    (inputs : List NativeReleaseInput) (output : String) : IO (Either NativeReleaseStageFailure Unit) :=
+    match native_release_plan_checked budget required inputs with
+    | Left cause => io_pure(Either NativeReleaseStageFailure Unit,
+        native_release_owned_result False (Left NativeReleaseStageError Unit (ReleasePlanFailure cause)))
+    | Right _ => if
+        andb (process_directory_valid output)
+          (native_release_segment_valid (path_basename output)) then
+        match! native_release_capture read inputs with
+        | Left cause => io_pure(Either NativeReleaseStageFailure Unit,
+            native_release_owned_result False (Left NativeReleaseStageError Unit cause))
+        | Right files => match! create output with
+          | Left cause => io_pure(Either NativeReleaseStageFailure Unit,
+              native_release_owned_result (fs_create_dir_error_created cause)
+                (Left NativeReleaseStageError Unit (ReleaseCreateFailure cause)))
+          | Right _ => do let! canonical := resolve output;
+                          if process_directory_valid canonical then
+                            do let! staged := native_release_populate_with read write walk canonical files;
+                                       io_pure(Either NativeReleaseStageFailure Unit,
+                                         native_release_owned_result True staged)
+                          else
+                            io_pure(Either NativeReleaseStageFailure Unit,
+                              native_release_owned_result True
+                                (Left NativeReleaseStageError Unit ReleaseOutputResolveFailed))
+          end
+        end
+      else
+        io_pure(Either NativeReleaseStageFailure Unit,
+          native_release_owned_result False (Left NativeReleaseStageError Unit ReleaseOutputResolveFailed))
+    end;
+
+def native_release_prepare (budget : Nat) (required : List String) (inputs : List NativeReleaseInput)
+    (output : String) : IO (Either NativeReleaseStageFailure Unit) :=
+    native_release_prepare_with fs_read_bounded_checked fs_write_checked fs_create_dir_exclusive_checked
+      prim_fs_realpath fs_walk_checked budget required inputs output;

@@ -5,6 +5,7 @@
 import "rules.ouro",
   "basic_rules.ouro",
   "proof.ouro",
+  "../../std/collections.ouro",
   "../fmt_pipeline.ouro",
   "../quality/diagnostic.ouro";
 
@@ -27,12 +28,10 @@ def fx_fixpoint_with (round : String -> Pair String (List FxEdit)) : Nat -> Stri
     match fuel with
     | Z => MkFxOutcome src applied
     | S fuel2 =>
-        match round src with
-        | MkPair out edits =>
-            match edits with
-            | Nil => MkFxOutcome src applied
-            | Cons _ _ => go fuel2 out (append FxEdit applied edits)
-            end
+        let (MkPair out edits) := round src in
+        match edits with
+        | Nil => MkFxOutcome src applied
+        | Cons _ _ => go fuel2 out (append FxEdit applied edits)
         end
     end;
 
@@ -48,20 +47,30 @@ def fx_rounds : Nat := 8;
 def fx_check_syntax_edit (edit : FxEdit) : Bool :=
     elem String str_eq (fx_edit_rule edit) [fx_rule_dup_import, fx_rule_do_bind, fx_rule_semi];
 
-def fx_check_syntax_round (src : String) : Pair String (List FxEdit) :=
+private def fx_check_syntax_round_tokens (src : String) (tokens : List FxTok) : Pair String (List FxEdit) :=
     let edits : List FxEdit := fx_plan_edits
-      (filter FxEdit fx_check_syntax_edit (fx_simple_rules(src, fx_lex src))) in
+      (filter FxEdit fx_check_syntax_edit (fx_simple_rules src tokens)) in
     MkPair(String, List FxEdit, fx_apply src edits, edits);
+
+def fx_check_syntax_round (src : String) : Pair String (List FxEdit) :=
+    fx_check_syntax_round_tokens src (fx_lex src);
 
 def fx_check_source (src : String) : String :=
     fx_outcome_text (fx_fixpoint_with fx_check_syntax_round fx_rounds src []);
+
+def fx_check_source_lexed (source : FxLexedSource) : String :=
+    let original : String := fx_lexed_text source in
+    let round (text : String) : Pair String (List FxEdit) :=
+      if str_eq text original then fx_check_syntax_round_tokens text (fx_lexed_tokens source)
+      else fx_check_syntax_round text in
+    fx_outcome_text (fx_fixpoint_with round fx_rounds original []);
 
 -- Constructors visible without the import cone: the file's own declarations.
 def fx_local_ctors (src : String) : List String :=
     fx_harvest_ctors src;
 
--- Raw bounded execution is retained for the existing rewrite goldens. It is
--- not permission to write: production callers must use fx_prepare below.
+-- Rewrite goldens use the raw candidate. The CLI requires checked convergence,
+-- formatting, and compiler acceptance.
 def fx_fix (ctors : List String) (src : String) : FxOutcome :=
     fx_fixpoint(append String (fx_local_ctors src) ctors, fx_rounds, src, Nil FxEdit);
 
@@ -88,73 +97,185 @@ def fx_prepare_error_message (e : FxPrepareError) : String :=
 
 -- Use the same rule intents as fx_round; do not maintain a second list of
 -- checks or declare a fuel-exhausted result clean.
-def fx_pending (ctors : List String) (src : String) : Bool :=
-    match fx_automatic_proposals(src, fx_all_rules src ctors (fx_lex src)) with
+private def fx_has_automatic_proposals (src : String) (proposals : List FxEdit) : Bool :=
+    match fx_automatic_proposals src proposals with
     | Nil => False
     | Cons _ _ => True
     end;
 
--- ctors includes local declarations and the complete imported constructor
--- set. No output is publishable until both stages have reached a fixpoint.
+def FxRoundTransitions : Type := List (Pair String String);
+
+-- The last field holds the terminal proposals for the saved constructor list.
+private inductive FxConvergedData : Type :=
+  | MkFxConverged : List String -> FxLexedSource -> List FxEdit -> FxRoundTransitions -> List FxEdit -> FxConvergedData;
+
+def FxConverged : Type := FxConvergedData;
+
+def fx_converged_source (converged : FxConverged) : FxLexedSource :=
+    match converged with | MkFxConverged _ source _ _ _ => source end;
+
+def fx_converged_rounds (converged : FxConverged) : FxRoundTransitions :=
+    match converged with | MkFxConverged _ _ _ rounds _ => rounds end;
+
+def fx_converged_initial_ctors (converged : FxConverged) : List String :=
+    match converged with | MkFxConverged visible _ _ _ _ => visible end;
+
+private inductive FxFormatted : Type :=
+  | MkFxFormatted : FxOutcome -> Maybe FxLexedSource -> List FxEdit -> FxFormatted;
+
+private def fx_format_converged_result (converged : FxConverged) : Either FxPrepareError FxFormatted :=
+    let (MkFxConverged ctors terminal edits _ proposals) := converged in
+    match fmt_checked_lexed terminal with
+    | Left e => Left FxPrepareError FxFormatted (FxFormatError e)
+    | Right checked => match checked with
+      | FmtUnchanged => Right FxPrepareError FxFormatted
+          (MkFxFormatted (MkFxOutcome (fx_lexed_text terminal) edits) (Nothing FxLexedSource) proposals)
+      | FmtChanged source =>
+          let formatted : String := fx_lexed_text source in
+          let refreshed : List FxEdit := fx_all_rules formatted ctors (fx_lexed_tokens source) in
+          if fx_has_automatic_proposals formatted refreshed then
+            Left FxPrepareError FxFormatted FxFormatReopensFix
+          else Right FxPrepareError FxFormatted
+            (MkFxFormatted (MkFxOutcome formatted edits) (Just FxLexedSource source) refreshed)
+      end
+    end;
+
+def fx_format_converged_with_snapshot (converged : FxConverged)
+    : Either FxPrepareError (Pair FxOutcome (Maybe FxLexedSource)) :=
+    match fx_format_converged_result converged with
+    | Left error => Left FxPrepareError (Pair FxOutcome (Maybe FxLexedSource)) error
+    | Right result => let (MkFxFormatted outcome snapshot _) := result in
+        Right FxPrepareError (Pair FxOutcome (Maybe FxLexedSource))
+          (MkPair FxOutcome (Maybe FxLexedSource) outcome snapshot)
+    end;
+
+-- Review can see constructor names newly exposed by edits or formatting.
+def fx_format_converged_with_review (converged : FxConverged) (imported : List String)
+    : Either FxPrepareError (Pair FxOutcome (List FxEdit)) :=
+    match fx_format_converged_result converged with
+    | Left error => Left FxPrepareError (Pair FxOutcome (List FxEdit)) error
+    | Right result => let (MkFxFormatted outcome snapshot proposals) := result in
+        let (MkFxConverged initial_ctors terminal _ rounds _) := converged in
+        let original : String := match rounds with
+          | Nil => fx_lexed_text terminal
+          | Cons first _ => fst String String first
+          end in
+        let final : String := fx_outcome_text outcome in
+        let review_inputs : List FxEdit := if str_eq original final then proposals else
+          let visible : List String := append String (fx_local_ctors final) imported in
+          if list_eq String str_eq initial_ctors visible then proposals else
+            let source : FxLexedSource := (snapshot ?? terminal) in
+            fx_all_rules final visible (fx_lexed_tokens source) in
+        Right FxPrepareError (Pair FxOutcome (List FxEdit))
+          (MkPair FxOutcome (List FxEdit) outcome (fx_review_proposals final review_inputs))
+    end;
+
+def fx_format_converged (converged : FxConverged) : Either FxPrepareError FxOutcome :=
+    match fx_format_converged_with_snapshot converged with
+    | Left error => Left FxPrepareError FxOutcome error
+    | Right formatted => let (MkPair outcome _) := formatted in Right FxPrepareError FxOutcome outcome
+    end;
+
+-- ctors includes local declarations and the complete imported constructor set.
 def fx_finish (ctors : List String) (o : FxOutcome) : Either FxPrepareError FxOutcome :=
-    let text : String := fx_outcome_text o in
-    match fx_pending ctors text with
-    | True => Left FxPrepareError FxOutcome FxNotConverged
-    | False =>
-        match fmt_checked text with
-        | Left e => Left FxPrepareError FxOutcome (FxFormatError e)
-        | Right formatted =>
-            match fx_pending ctors formatted with
-            | True => Left FxPrepareError FxOutcome FxFormatReopensFix
-            | False => Right FxPrepareError FxOutcome
-                (MkFxOutcome(formatted, fx_outcome_edits o))
-            end
-        end
+    let src : String := fx_outcome_text o in
+    let source : FxLexedSource := fx_lex_source src in
+    let proposals : List FxEdit := fx_all_rules src ctors (fx_lexed_tokens source) in
+    if fx_has_automatic_proposals src proposals then Left FxPrepareError FxOutcome FxNotConverged
+    else fx_format_converged
+      (MkFxConverged ctors source (fx_outcome_edits o) (Nil (Pair String String)) proposals);
+
+private inductive FxCheckedRound (Source : Type) : Type :=
+  | MkFxCheckedRound : Source -> List FxEdit -> List FxEdit -> FxCheckedRound Source;
+
+private def fx_checked_round_lexed (ctors : List String) (source : FxLexedSource)
+    : Either FxPrepareError (FxCheckedRound FxLexedSource) :=
+    let src : String := fx_lexed_text source in
+    let proposals : List FxEdit := fx_all_rules src ctors (fx_lexed_tokens source) in
+    match fx_checked_plan src proposals with
+    | Left cause => Left FxPrepareError (FxCheckedRound FxLexedSource)
+        (FxInvalidPlan (fx_plan_error_message cause))
+    | Right edits => match fx_certify_lexed_transaction_with_output source edits with
+      | Left cause => Left FxPrepareError (FxCheckedRound FxLexedSource)
+          (FxInvalidPlan (fx_plan_error_message cause))
+      | Right certified => let (MkPair proof output) := certified in
+          Right FxPrepareError (FxCheckedRound FxLexedSource)
+            (MkFxCheckedRound FxLexedSource output (fx_transaction_edits proof) proposals)
+      end
     end;
 
 def fx_checked_round (ctors : List String) (src : String) : Either FxPrepareError (Pair String (List FxEdit)) :=
-    match fx_checked_plan(src, fx_all_rules src ctors (fx_lex src)) with
-    | Left cause => Left FxPrepareError (Pair(String, List FxEdit))
-        (FxInvalidPlan (fx_plan_error_message cause))
-    | Right edits => match fx_certify_transaction src edits with
-      | Left cause => Left FxPrepareError (Pair(String, List FxEdit))
-          (FxInvalidPlan (fx_plan_error_message cause))
-      | Right proof => Right FxPrepareError (Pair(String, List FxEdit))
-          (MkPair(String, List FxEdit, fx_transaction_output proof, fx_transaction_edits proof))
-      end
+    match fx_checked_round_lexed ctors (fx_lex_source src) with
+    | Left cause => Left FxPrepareError (Pair String (List FxEdit)) cause
+    | Right result => let (MkFxCheckedRound output edits _) := result in
+        Right FxPrepareError (Pair String (List FxEdit)) (MkPair String (List FxEdit) (fx_lexed_text output) edits)
     end;
+
+private inductive FxFixpointTrace (Source : Type) : Type :=
+  | MkFxFixpointTrace : Source -> List FxEdit -> FxRoundTransitions -> List FxEdit -> FxFixpointTrace Source;
 
 -- Exact source snapshots are bounded by the round limit, so cycles cannot be
 -- hidden by hashes or by an A -> B -> A return to the initial source.
-def fx_checked_fixpoint_with
-    (round : String -> Either FxPrepareError (Pair String (List FxEdit)))
-    : Nat -> String -> List String -> List FxEdit -> Either FxPrepareError FxOutcome :=
-  fix go (fuel : Nat) (src : String) (seen : List String) (applied : List FxEdit)
-      : Either FxPrepareError FxOutcome :=
-    match elem String str_eq src seen with
-    | True => Left FxPrepareError FxOutcome FxCycle
-    | False => match round src with
-      | Left cause => Left FxPrepareError FxOutcome cause
-      | Right result => match result with
-        | MkPair out edits => match edits with
-          | Nil => Right FxPrepareError FxOutcome (MkFxOutcome src applied)
-          | Cons _ _ => match fuel with
-            | Z => Left FxPrepareError FxOutcome FxNotConverged
-            | S remaining => go(remaining, out, Cons String src seen, append FxEdit applied edits)
-            end
+private def fx_checked_fixpoint_trace (Source : Type) (source_text : Source -> String)
+    (round : Source -> Either FxPrepareError (FxCheckedRound Source))
+    : Nat -> Source -> List String -> List FxEdit -> FxRoundTransitions
+      -> Either FxPrepareError (FxFixpointTrace Source) :=
+  fix go (fuel : Nat) (source : Source) (seen : List String) (applied : List FxEdit)
+      (trace : FxRoundTransitions) : Either FxPrepareError (FxFixpointTrace Source) :=
+    let src : String := source_text source in
+    if elem String str_eq src seen then Left FxPrepareError (FxFixpointTrace Source) FxCycle
+    else
+      match round source with
+      | Left cause => Left FxPrepareError (FxFixpointTrace Source) cause
+      | Right result => let (MkFxCheckedRound out edits proposals) := result in
+        match edits with
+        | Nil => Right FxPrepareError (FxFixpointTrace Source)
+            (MkFxFixpointTrace Source source applied (reverse_lin (Pair String String) trace) proposals)
+        | Cons _ _ => match fuel with
+          | Z => Left FxPrepareError (FxFixpointTrace Source) FxNotConverged
+          | S remaining => go remaining out (Cons String src seen) (append FxEdit applied edits)
+              (Cons (Pair String String) (MkPair String String src (source_text out)) trace)
           end
         end
-      end
+      end;
+
+def fx_checked_fixpoint_with
+    (round : String -> Either FxPrepareError (Pair String (List FxEdit)))
+    (fuel : Nat) (src : String) (seen : List String) (applied : List FxEdit)
+    : Either FxPrepareError FxOutcome :=
+    let checked (text : String) : Either FxPrepareError (FxCheckedRound String) :=
+      match round text with
+      | Left cause => Left FxPrepareError (FxCheckedRound String) cause
+      | Right result => let (MkPair out edits) := result in
+          Right FxPrepareError (FxCheckedRound String) (MkFxCheckedRound String out edits (Nil FxEdit))
+      end in
+    match fx_checked_fixpoint_trace String (fun (text : String) => text) checked
+      fuel src seen applied (Nil (Pair String String)) with
+    | Left cause => Left FxPrepareError FxOutcome cause
+    | Right prepared => let (MkFxFixpointTrace final edits _ _) := prepared in
+        Right FxPrepareError FxOutcome (MkFxOutcome final edits)
     end;
 
-def fx_prepare (ctors : List String) (src : String) : Either FxPrepareError FxOutcome :=
+def fx_converge_lexed (ctors : List String) (initial : FxLexedSource) : Either FxPrepareError FxConverged :=
+    let src : String := fx_lexed_text initial in
     let visible : List String := append String (fx_local_ctors src) ctors in
-    match fx_ambiguous_literal src with
-    | True => Left FxPrepareError FxOutcome FxLiteralBinding
-    | False => match fx_checked_fixpoint_with (fx_checked_round visible) fx_rounds src [] [] with
-      | Left cause => Left FxPrepareError FxOutcome cause
-      | Right outcome => fx_finish visible outcome
-      end
+    if fx_ambiguous_lexed_literal initial then Left FxPrepareError FxConverged FxLiteralBinding
+    else
+      -- The final checked round returns no edits only when no automatic proposals remain.
+      match fx_checked_fixpoint_trace FxLexedSource fx_lexed_text (fx_checked_round_lexed visible)
+        fx_rounds initial (Nil String) (Nil FxEdit) (Nil (Pair String String)) with
+      | Left cause => Left FxPrepareError FxConverged cause
+      | Right prepared => let (MkFxFixpointTrace final edits rounds proposals) := prepared in
+          Right FxPrepareError FxConverged (MkFxConverged visible final edits rounds proposals)
+      end;
+
+def fx_converge (ctors : List String) (src : String) : Either FxPrepareError FxConverged :=
+    fx_converge_lexed ctors (fx_lex_source src);
+
+def fx_prepare (ctors : List String) (src : String) : Either FxPrepareError FxOutcome :=
+    match fx_converge ctors src with
+    | Left cause => Left FxPrepareError FxOutcome cause
+    | Right converged => fx_format_converged converged
     end;
 
 -- path:line: rule: message. Lines refer to the text the rule saw, which is the

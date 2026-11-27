@@ -1,16 +1,21 @@
 # Tooling
 
-The maintained command entry point is `scripts/ouro1.sh`. `scripts/coil.sh` is
-the project-facing name for the same toolchain: `coil check`, `coil fmt`,
-`coil build`, `coil doctor`, and the package verbs (`coil add`, `coil install`,
-`coil lock`) map onto `ouro1` and `ouro1 pkg`. `doctor` prints the native
-target and rejects `legacy-c`. Most user-facing tools are Ouro programs
-under `tools/`; the wrapper builds them on first use and rebuilds them when
-their sources change. Standalone native LSP, package verification and user
-tests use the PE binaries described below; the transitional C-host tool
-builder does not provision this group.
+Use `scripts/ouro1.sh` to check, evaluate, build, and run source. The
+`scripts/coil.sh` wrapper maps project commands to the same toolchain,
+including `coil add`, `coil install`, and `coil lock`. `coil doctor`
+prints the native target and rejects `legacy-c`.
+
+Run the shell examples from the repository root in a POSIX-compatible shell
+after [building the bootstrap toolchain](getting_started.md#build-the-bootstrap-toolchain).
+The wrapper builds most programs under `tools/` on first use and rebuilds
+them when their sources change. Provision the
+[standalone PE tools](#standalone-native-tools) separately for native LSP,
+package verification, and user tests.
 
 ## Check and evaluate
+
+Replace `path/to/module.ouro` with a source file. Replace the declaration
+name, expression, and type with forms valid in that module.
 
 ```sh
 sh scripts/ouro1.sh check path/to/module.ouro
@@ -18,13 +23,11 @@ sh scripts/ouro1.sh eval path/to/module.ouro --print name --type TYPE
 sh scripts/ouro1.sh eval path/to/module.ouro --eval 'expression' --type TYPE
 ```
 
-`check` resolves imports and typechecks the complete module closure.
-Relative `FILE` arguments stay in the caller's directory: the wrapper looks
-up the compiler from the repository root, but `pkg verify` still typechecks
-`_ouro_pkgs/...` inside the project that invoked it. `eval`
-elaborates and evaluates a declaration or expression in the module's scope.
-The evaluation wrapper defaults to `Nat`; use `--type TYPE` for another result
-type. The declared type is checked before native extraction.
+`check` resolves imports and typechecks the complete module closure. It resolves
+relative source paths from the caller's directory. `eval` resolves relative paths
+from the repository root. It checks a declaration or expression in the module's
+scope, emits C, and runs the resulting program with the C runtime. Evaluation
+defaults to `Nat`. Use `--type TYPE` for another result type.
 
 For compiler diagnostics and transformation tests, `check` can write its complete
 checked program:
@@ -47,7 +50,8 @@ sh scripts/ouro1.sh collect path/to/module.ouro
 ## Native program compile
 
 `ouro1 build FILE.ouro` compiles the checked import closure to a Windows PE.
-`ouro1 build --profile` invokes the toolchain cache driver instead:
+Replace `FILE.ouro` with the entry file. Without a source argument,
+`ouro1 build --profile` builds the toolchain.
 
 ```sh
 sh scripts/ouro1.sh build FILE.ouro --target x86_64-windows
@@ -59,15 +63,16 @@ sh scripts/ouro1.sh build --profile release
 `legacy-c` and non-`x86_64-windows` targets are rejected. The wrapper treats
 `build` as program compile when any argument ends with `.ouro`; otherwise it
 forwards to the toolchain driver. `ouro1 run FILE.ouro` compiles to
-`_build/native/run/<stem>.exe` and executes that image.
+`_build/native/run/<stem>.exe` and executes that image. Run it on Windows x86-64.
 
 [Build](build.md#host-bound-build-boundary) owns output publication and host
 limits; [Design](design.md#native-toolchain-contract) owns the native target.
 
 `tools/coil.ouro` provides the native CLI entry for `doctor`, `check`, program
-`build`, and `run FILE.ouro [PROGRAM_ARG ...]`. Its check command collects the
-complete import closure and accepts library modules without an executable entry
-point. Check fuel defaults to 16000; program build and run retain the positional
+`build`, `run FILE.ouro [PROGRAM_ARG ...]`, and `fmt [--check | --write] PATH...`.
+Its check command collects the complete import closure and accepts library
+modules without an executable entry point. Check fuel defaults to 16000; program
+build and run retain the positional
 producer's 200000 budget. Unknown, repeated, or incomplete check/build options
 return nonzero before compilation.
 
@@ -78,27 +83,67 @@ literally, including `--out` and `--`; run has no build options. The child owns
 stdout without a preceding build-path line. Build or process setup/wait errors
 produce a `coil:` diagnostic and exit 1; completed child exit codes, including
 259, are preserved. Process cancellation uses the inherited-process runtime's
-owned-job cleanup contract. The existing wrappers still own the remaining tool
-commands during migration.
+owned-job cleanup contract.
+
+`coil fmt` locates the fixed `ouro-fmt.exe` beside its loaded Windows image and
+passes every following argument unchanged. The formatter owns option validation
+and diagnostics. It inherits stdin, stdout, stderr, current directory and
+environment; its completed exit code is preserved. Image-path or process errors
+produce a `coil:` diagnostic and exit 1. The existing wrappers still own the
+remaining tool commands during migration.
+
+Native `coil analyze` forwards literal arguments to the fixed
+`ouro-analyze.exe` beside its loaded image, with inherited streams and working
+directory. The analyzer owns option validation and runs the separately named
+raw base and drive siblings with a provisional per-worker policy. This SOURCE
+route does not establish bundle provisioning, native IO acceptance or RSS
+parity; retained analyzer gates and launchers remain required. See the
+[native bounded entry](../tools/analyze/README.md#native-bounded-entry) for exact
+provisioning and the policy metric.
+
+
+`coil lsp` runs the fixed `ouro-lsp.exe` beside its loaded Windows image, passing
+all following arguments unchanged with inherited stdin, stdout, stderr, cwd and
+environment. The server owns framed stdout; the launcher prints no startup line
+and preserves the completed child DWORD exit code. Image/process errors produce
+a `coil:` diagnostic on stderr and exit 1. Before launch it refuses a hosted
+override returned by `prim_env_get` for `OURO_TEST_CHECK`, `OURO_PKG_CHECK`,
+`OURO_HOSTED_COMPILER_WRAPPER` or `OURO_HOSTED_FMT`, reporting the first key in
+that order. `OURO_ROOT` keeps its authorization meaning; tools must be provisioned
+explicitly. The standalone hosted LSP keeps its existing compatibility behavior.
+
+For native `coil pkg [PACKAGE_ARG ...]`, provisioning, forwarding and hosted
+checker refusal rules are in the [package guide](pkg.md#commands).
 
 
 ## Standalone native tools
 
-With a native `coil.exe` already built in `_build/native`, build the formatter,
-language server, package tool and test runner explicitly:
+On Windows x86-64, run the following PowerShell commands from the repository
+root after placing a working native `coil.exe` in `_build/native`. The commands
+build the native tools and the compiler worker required for formatter writes.
 
 ```powershell
 .\_build\native\coil.exe build tools/fmt.ouro --out _build/native/ouro-fmt.exe
+.\_build\native\coil.exe build tools/fix/check_main.ouro --out _build/native/ouro-fix-check.exe
 .\_build\native\coil.exe build tools/lsp.ouro --out _build/native/ouro-lsp.exe
 .\_build\native\coil.exe build tools/pkg/main.ouro --out _build/native/ouro-pkg.exe
 .\_build\native\coil.exe build tools/test/main.ouro --out _build/native/ouro-test.exe
+.\_build\native\coil.exe build tools/native_toolchain.ouro --out _build/native/ouro-toolchain.exe
 ```
 
-Invoke these executables directly. `ouro-lsp.exe`, `ouro-pkg.exe` and
-`ouro-test.exe` locate the fixed `coil.exe` beside their loaded Windows image;
-LSP formatting also requires `ouro-fmt.exe` there. Their subprocesses preserve
-literal arguments and the real working directory. A missing sibling, timeout,
-resource failure or malformed process result is an explicit failure.
+Invoke the formatter through `coil fmt` or `ouro-fmt.exe`. Formatter writes that
+change source require the `ouro-fix-check.exe` compiler worker beside the
+formatter; a missing worker refuses the write. The worker checks the complete
+import closure, and accepted original units require an accepted candidate before
+publication. Editor snippets rejected by the compiler retain the formatter's
+existing token and fixpoint checks.
+
+Use `coil lsp`, `coil pkg`, `coil test` or the standalone executables. On the
+native path, the language server, package verifier, and test runner locate
+`coil.exe` beside their loaded Windows image. LSP formatting also requires
+`ouro-fmt.exe` there. The subprocesses inherit the working directory and receive
+literal arguments. A missing sibling, timeout, resource failure, or malformed
+process result fails the operation.
 
 Each child tree uses one CPU, 3072 MiB and 16 MiB per captured stream. The
 provisional deadlines are 30 seconds for LSP checks, 10 seconds for formatting,
@@ -109,18 +154,62 @@ The native test policy laws check the exact deadlines and all resource fields.
 Large deadlines use small Nat factors so C-host builds avoid deeply nested
 constant constructors without changing those limits.
 
-Native `coil` currently exposes `doctor`, `check`, `build` and `run`. Tool
-dispatch and automatic tool builds are separate work. The retained shell
-suites still own their fixture preparation and assertions; native acceptance
+Native `coil` currently exposes `doctor`, `check`, `build`, `run`, `fmt`, `test`,
+`lsp`, `pkg`, `analyze`, and `toolchain rebuild`.
+Other tool dispatch and automatic tool builds are separate work. The retained
+shell suites still own their fixture preparation and assertions; native acceptance
 must provision direct-PE candidates and their siblings before running those
 assertions. A C-host candidate cannot exercise the bounded native process API.
-Hosted C-host suites instead pass `OURO_TEST_CHECK` /
-`OURO_HOSTED_COMPILER_WRAPPER` (`scripts/ouro1.sh`) and, for builds,
-`OURO_TEST_BUILD` (`scripts/build_tool.sh`). `ouro1 test` and `ouro1 pkg`
-set those variables when they are unset, and C-host test runs launch the
-child with `prim_proc_exec` instead of bounded capture. Use the retained
-suites' explicit `--native-tools DIR` option as described in
-[native tool acceptance](ci.md#local-profiles).
+The hosted `ouro1 pkg` wrapper supplies `OURO_PKG_CHECK` when both that
+variable and `OURO_TEST_CHECK` are empty or unset. The hosted `ouro1 test`
+wrapper sets `OURO_TEST_CHECK` when it is empty or unset and also provides
+defaults for `OURO_TEST_BUILD` and `OURO_HOSTED_COMPILER_WRAPPER` in that case.
+With `OURO_TEST_CHECK` set, the runner uses the hosted C process interface for
+test executables.
+Use `--native-tools DIR` in the retained suites to test the provisioned native
+tools. [Native tool acceptance](ci.md#local-profiles)
+
+## Native successor rebuild
+
+On Windows x86-64, run the following PowerShell commands from the repository
+root with an accepted `ouro-native-build.exe` beside `ouro-toolchain.exe`.
+Choose new output directories with existing parents. Keep source inputs and
+their parent tree read-only, and prevent other processes from modifying the
+command's snapshot, output, or parent paths while it runs.
+
+```powershell
+.\_build\native\ouro-toolchain.exe rebuild --source . --out _build/native-rebuild --stages 3 --no-cache
+.\_build\native\coil.exe toolchain rebuild --source . --out _build/native-rebuild-next --stages 3 --no-cache
+```
+
+The command accepts exactly these options. It copies the complete ordered
+import closure of `tools/native_build.ouro`, including that root and
+`Ouro.seal`, into an owned snapshot. It refuses imports outside the declared
+source root. Native handle-based resolution checks each source parent against
+that root, and the bounded file reader refuses final reparse points. The
+inventory retains logical relative paths and their order. The parent working
+directory does not change. The command is subject to
+time-of-check to time-of-use races if another process modifies these paths.
+
+N1 is the fixed loaded-image sibling. N1 builds N2, then N2 builds N3 from the
+same copied inputs and fixed native target, entry and fuel. Source, configuration
+and producer bytes are checked before and after successful stages. The complete
+unsigned N2/N3 images are compared, including padding and bytes after NUL; no
+cache, prefix comparison or seed promotion is used. A successful comparison
+prints only `NATIVE_REBUILD_COMPARE_OK`. Completed child streams, the ordered
+inventory and policy are retained under the output directory. Failures leave
+that owned directory for inspection and return nonzero.
+
+The accepted snapshot is limited to 256 MiB in total; discovery separately
+bounds each source file by 256 MiB and does not promise a total allocation bound.
+Each complete image is limited to 512 MiB. Each child tree has its own
+900-second deadline, 3072 MiB, one CPU and 16 MiB per captured stream, with empty
+stdin. The pair therefore does not have a single 900-second deadline.
+Malformed native path encoding and raw allocation or cleanup can still exit 73.
+The four hosted overrides refused by native `coil test` are also refused here.
+Provisioning and native N1 behavior remain prerequisites: image inspection and
+stage equality do not establish the [native toolchain contract](design.md#native-toolchain-contract)
+or isolated-host independence.
 
 ## Formatter
 
@@ -143,6 +232,13 @@ conservative text formatter rather than a complete AST pretty-printer, so it
 preserves comments and hand-aligned continuation lines.
 Unknown options, conflicting write/check modes and mixed file/selftest modes
 exit `2` before reading or changing source files.
+
+`ouro-fmt --selftest --fixtures DIR --out DIR` runs the retained golden,
+idempotence, multiline, write/refusal and tree-drift checks through Ouro-owned
+worker orchestration. Each worker and each tree file runs in a separate process.
+`--selftest-plan` keeps the shell orchestration used by `fmt_suite.sh`. That suite
+retains its fixture preparation and host checks; it does not by itself exercise
+the public `--selftest` orchestration.
 
 For a flat comma call already spread across lines, with each argument and the
 closing parenthesis on its own line, the formatter indents arguments two spaces
@@ -185,8 +281,7 @@ staging, replacement, recovery, and refusal conditions.
 | `dup-import` | automatic only for the identical path and alias, with trivia preserved |
 | `do-bind` | automatic syntax canonicalization to `do let! x := action;` |
 | `double-semi` | automatic removal of a redundant separator |
-| `dead-let` | automatic only for the rule's literal/dead-value proof or retention of the same executed IO action |
-| `identity-let` | automatic only for an unannotated local immediately returned through the same binder |
+| `dead-let`, `identity-let` | review required to preserve binding identity and evaluation |
 | `list-literal`, `peano-literal` | review required; constructor/provider identity is not a textual proof |
 | `unused-binder`, `unreachable-arm` | review required; no automatic renaming or arm removal |
 | `import-alias`, `list-type`, `nonrec-fix` | review required; no automatic API/resolution-affecting rewrite |
@@ -204,32 +299,32 @@ sh scripts/ouro1.sh lint --deny --profile project std samples
 sh scripts/ouro1.sh lint --family language path/to/file.ouro
 ```
 
-`analyze` runs repository-wide analyzer families such as architecture, dead
-code, API surface, trust policy, and suppressions, and on request the
-structured families that parse each source with the compiler frontend (control
-flow, dataflow, effects, taint, contracts, metrics, duplication, and others).
-Enable them per family (`--enable-cfg`, `--enable-taint`, ...) or as sets
-(`--enable-strict` for the families that are clean on the production tree,
-`--enable-light`, `--enable-heavy`, `--enable-all`); run
-`sh scripts/ouro1.sh analyze --help` for the current flags. Each source runs in
-its own bounded process, and structured families refuse a single source larger
-than 40 KiB; see [Build](build.md#memory-behavior).
+`analyze --strict` runs the base repository policy checks for architecture,
+suppressions, and the strict format subset. API surface checking uses its
+baseline. Dead code and trust graph checks require their own flags. Structured
+families parse source with the compiler frontend. Select individual families
+such as `--enable-cfg` or `--enable-taint`, or select a family set such as
+`--enable-strict`. The bounded driver runs structured checks per file. Global
+base-runner modes can hold the selected files in one process and have separate
+scope limits.
+[Analyzer flags and family sets](../tools/analyze/README.md#flags-and-family-sets) ·
+[Bounded execution](../tools/analyze/README.md#bounded-execution)
 
-`lint` is the only user-facing Ouro source linter. It parses individual
-files and runs language, proven style, and compiler-proved semantic
-families as separate processes. It is
-separate from the repository analyzer so each tool keeps a smaller dependency
-and memory footprint. Directory scans have no file-size cutoff. The launcher
-runs each source in its own process and returns nonzero if a child fails;
-memory exhaustion is not a successful skip.
+`lint` runs language, style, and semantic checks over Ouro source. Language
+and style checks use per-file processes. The semantic worker handles batches
+in bounded sessions. Directory discovery has no file-size cutoff, and a
+failed child process or memory exhaustion fails the command.
+[Semantic session lifetime](clippy_grade_firewall.md#session-lifetime-boundary)
+
 `lint --shard N/M` partitions the completed, deduplicated native inventory
 in its stable order: shard 1 receives the first file, shard 2 the second, and
 so on cyclically. Run all shards over the same roots and source revision to
 cover the complete inventory; each selected file retains all requested families.
 Indices satisfy `1 <= N <= M <= 128`; invalid or empty shard selections fail.
-Both tools prune build and dependency directories during root discovery.
-Analyzer diagnostic fixtures are opt-in with `--include-fixtures`; their
-expected findings are checked by the dedicated suites.
+Both tools prune build and dependency directories during discovery. The analyzer
+defaults to `std`, `compiler`, `tools/analyze`, and `samples`. Give an explicit
+scope and `--include-fixtures` to include analyzer diagnostic fixtures. The
+precision suite verifies their expected findings.
 
 The analyzer and linter are quality tools. They do not establish compiler
 acceptance. See [Quality tools](quality.md).
@@ -242,10 +337,29 @@ fallbacks, and cross-language candidates. See
 
 ## User tests
 
+On Windows x86-64, provision `coil.exe`, its checked build backend, and the
+standalone test runner before running these PowerShell examples.
+[Standalone native tools](#standalone-native-tools)
+
 ```powershell
+.\_build\native\coil.exe test samples/examples/test_demo.ouro
+.\_build\native\coil.exe test --out _build/native/user-tests path/to/test-directory
 .\_build\native\ouro-test.exe samples/examples/test_demo.ouro
 .\_build\native\ouro-test.exe path/to/test-directory
 ```
+
+`coil test` runs the fixed `ouro-test.exe` beside its loaded Windows image with
+unchanged arguments and inherited stdin, stdout, stderr, cwd and environment.
+Runner exit codes are preserved; image/process failures produce a `coil:`
+diagnostic and exit 1. Option validation, discovery, manifests and retained
+`--native-suite` inventories remain owned by the runner.
+
+This public native command refuses a hosted override returned by `prim_env_get`
+for `OURO_TEST_CHECK`, `OURO_TEST_BUILD`, `OURO_PKG_CHECK` or
+`OURO_HOSTED_COMPILER_WRAPPER`, reporting the first key in that order and exiting
+1 before launching the runner. The standalone hosted runner keeps its existing
+compatibility behavior. `OURO_TEST_OUT` and the runner's output and report
+settings retain their meanings.
 
 `std/test.ouro` provides the current assertion and test-runner helpers. A
 sibling `.golden` file is compared with program output when present.
@@ -261,8 +375,10 @@ Unknown or incomplete long options, including `--out` without a directory,
 print usage and exit 2. `--out DIR` selects the native binary directory;
 `OURO_TEST_OUT` remains the default when `--out` is omitted. An empty discovery
 result prints `test: no tests found` and exits 1.
-An unreadable or exhausted inventory fails explicitly. Checks and native
-builds use sibling `coil.exe`; fixture stdin is captured as exact bytes.
+An unreadable or exhausted native inventory fails explicitly. Native checks and
+builds use sibling `coil.exe` and pass fixture stdin through bounded capture.
+The hosted wrapper handles ordinary path discovery in the shell and passes a
+list to the runner. Manifest and native-suite modes are forwarded directly.
 Repository-owned check batches use the same native tool in strict manifest
 mode, for example:
 
@@ -274,8 +390,9 @@ python3 scripts/ouro_smith.py manifest --prefix=IMP.,ERGO.,REC. \
 Repository and compiler tests use additional suites documented in
 [Contributing](../CONTRIBUTING.md). The retained `ouro1-test` suite row
 restarts the loaded standalone runner on its success fixture and requires
-`test: ok`. This does not test future `coil test` dispatch, which needs a
-separate execution probe when that command is added.
+`test: ok`. Public `coil test` dispatch needs its own loaded-image, argv,
+hosted-override refusal and full runner execution probes; that standalone row
+does not establish them.
 For an explicit manifest, `--root` defaults to its containing directory.
 The native formatter, fixer, documentation, lint, and test selftests receive
 generated inputs from [OuroSmith](ouro_smith.md); the suite wrappers prepare
@@ -283,23 +400,30 @@ those inputs before invoking the native assertions.
 
 ## Documentation generator
 
+Generate a preview under `_build/api` or check committed API pages with the
+documentation suite.
+
 ```sh
 sh scripts/ouro1.sh doc --out _build/api std/io.ouro
-sh scripts/ouro1.sh doc --check --out docs/api --files-from std.list
+sh scripts/doc_suite.sh
 ```
 
 `doc` extracts declaration-adjacent documentation comments and writes one
 Markdown page per module plus an index. `docs/api/` is the committed generated
 reference for the standard library. `--check` reports drift without modifying
 files. A missing source or an unreadable `--files-from` list is an error.
-[Build](build.md#generated-artifacts-and-stage-loop) owns committed API
-regeneration.
+The [CLI](../tools/doc.ouro) and LSP share the [declaration scanner](../tools/doc/model.ouro).
+The suite runs the [generator self-tests](../tools/doc/selftest.ouro) and checks
+the committed pages. If the shared scanner changes, also run
+`sh scripts/lsp_suite.sh` for hover and symbol lookup.
+[Build](build.md#generated-artifacts-and-stage-loop) owns committed API regeneration.
 
 ## Repository gates and CI runner
 
-[CI](ci.md#local-profiles) owns the repository gate commands, profiles,
-required checks, and report contracts. The native gate inventory and migration
-boundary are documented in [native repository gates](native_repo_gates.md).
+Use the [validation matrix](ci.md#validation-matrix) to select a focused check.
+The [local profiles](ci.md#local-profiles) define the combined checks, and
+[native repository gates](native_repo_gates.md) describe the native inventory
+and migration boundary.
 
 ## Core toolchain performance evidence
 
@@ -314,9 +438,14 @@ local registries, installation, locks, and verification.
 
 ## Language server
 
+On Windows x86-64, provision `coil.exe`, `ouro-lsp.exe`, and `ouro-fmt.exe`
+before starting the server. Run these commands from the workspace root, with
+the tools at `_build/native` and an existing `_build` directory for scratch
+files. [Standalone native tools](#standalone-native-tools)
+
 ```powershell
 $env:OURO_ROOT = (Get-Location).Path
-.\_build\native\ouro-lsp.exe
+.\_build\native\coil.exe lsp
 ```
 
 The experimental language server communicates over standard input/output and
@@ -344,12 +473,18 @@ suggests matching nullary constructors from a local, non-parameterized
 expressions or resolve constructors from imports. Complex constructor
 signatures and families with more than 256 arms keep ordinary prefix completion.
 
-The server runs sibling `coil.exe` for checks and `ouro-fmt.exe` for
-formatting through bounded captured processes. Child output is consumed by
-the protocol adapter; it does not enter framed stdout directly. Missing
-tools and process failures produce diagnostics, and a failed formatter
-returns no edit. `OURO_LSP_OURO1` no longer selects a checker. Several
-operations rebuild an index from open documents and imported files.
+The native server runs sibling `coil.exe` for checks and `ouro-fmt.exe` for
+formatting through bounded captured processes. The protocol adapter consumes
+child output before publishing responses. Missing checker tools or check
+process failures produce diagnostics. A formatter failure returns a `null`
+result. `OURO_LSP_OURO1` no longer selects a checker.
+
+Hover, definition, and completion can reuse a file's declarations and import
+spellings when the path and source bytes match a cached entry. A workspace
+symbol request can share those entries across open documents within the
+request. The server uses the open buffer for each document, authorizes import
+paths again, and reads the imported files from disk. The cache retains at most
+64 entries, with a cost limit per entry for text and rows.
 
 The explicitly configured `OURO_ROOT` remains the authorization boundary
 for file URIs,
@@ -358,8 +493,9 @@ traversal, links/reparse points, non-file URIs, and canonical paths outside that
 root are rejected. Protocol frames are limited to 1 MiB, one retained document
 to 512 KiB, and all open document text to 2 MiB. Formatting and unsaved-buffer
 checks use exclusive scratch files under the root's existing `_build` directory
-and remove them after the child command completes. A failed scratch creation or
-write publishes a `TOOL_ERROR` diagnostic; it cannot report a clean check.
+and remove them after the child command completes. A failure to create or write
+checker scratch publishes `TOOL_ERROR`. The same failure during formatting
+returns a `null` result.
 
 ## VS Code
 

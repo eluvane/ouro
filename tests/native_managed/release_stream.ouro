@@ -1,0 +1,157 @@
+import "../../tools/native_release_stream_windows.ouro", "../../std/fs.ouro",
+  "../../std/fs_bounded.ouro", "../../std/parse.ouro", "../analyze/precision/assertions.ouro";
+
+def release_stream_fixture_usage : IO Unit :=
+    do eprintln "usage: native-release-stream MODE SOURCE STAGE DECLARED_BYTES BYTE_CAP"; exit 2;
+
+def release_stream_fixture_setup : IO Unit :=
+    do eprintln "PRECISION_FAIL native-release-stream setup"; exit 93;
+
+def release_stream_fixture_closed (path : String) (bytes : Nat)
+    (result : Either NativeReleaseStreamFailure NativeReleaseClosedStage) : Bool :=
+    match result with
+    | Left _ => False
+    | Right stage => andb (str_eq path (native_release_stream_closed_path stage))
+        (eq_nat bytes (native_release_stream_closed_bytes stage))
+    end;
+
+def release_stream_fixture_collision
+    (result : Either NativeReleaseStreamFailure NativeReleaseClosedStage) : Bool :=
+    match result with
+    | Right _ => False
+    | Left failure => andb (notb (native_release_stream_created failure))
+        (if let ReleaseStreamOutput phase status :=
+            (native_release_stream_error failure : NativeReleaseStreamError) then
+            andb (ltb_nat 0 status)
+              (str_eq "release_stream_create" (native_release_stream_error_code (ReleaseStreamOutput phase status)))
+          else False)
+    end;
+
+def release_stream_fixture_cap (cap : Nat) (bytes : Nat)
+    (result : Either NativeReleaseStreamFailure NativeReleaseClosedStage) : Bool :=
+    match result with
+    | Right _ => False
+    | Left failure => andb (notb (native_release_stream_created failure))
+        (if let ReleaseStreamInput error :=
+            (native_release_stream_error failure : NativeReleaseStreamError) then
+            if let FsBoundedReadTooLarge expected actual := error then
+              andb (eq_nat cap expected) (eq_nat bytes actual)
+            else False
+          else False)
+    end;
+
+def release_stream_fixture_length (bytes : Nat) (cap : Nat)
+    (result : Either NativeReleaseStreamFailure NativeReleaseClosedStage) : Bool :=
+    match result with
+    | Right _ => False
+    | Left failure => andb (notb (native_release_stream_created failure))
+        (if let ReleaseStreamSourceLength expected actual :=
+            (native_release_stream_error failure : NativeReleaseStreamError) then
+            andb (eq_nat bytes expected)
+              (andb (notb (eq_nat expected actual)) (leb_nat actual cap))
+          else False)
+    end;
+
+def release_stream_fixture_binary : String := str_of_codes [65, 0, 255, 128, 13, 10, 66];
+
+def release_stream_fixture_deferred (source : String) (stage : String) (bytes : Nat) (cap : Nat) : IO Unit :=
+    match andb (eq_nat bytes (str_len release_stream_fixture_binary)) (leb_nat bytes cap) with
+    | False => release_stream_fixture_usage
+    | True => let action : IO (Either NativeReleaseStreamFailure NativeReleaseClosedStage) :=
+                  native_release_stream_copy_checked cap bytes source stage in
+        match native_release_stream_plan_checked cap bytes source stage with
+        | Left _ => release_stream_fixture_usage
+        | Right _ => do let! wrote := fs_write_checked source release_stream_fixture_binary;
+                        match wrote with
+                        | Left _ => release_stream_fixture_setup
+                        | Right _ => do let! result := action;
+                                        let! loaded := fs_read_bounded_checked bytes stage;
+                                        precision_run "native-release-stream"
+                                          [ MkPair String Bool "native-release-stream/deferred-current-input"
+                                              (release_stream_fixture_closed stage bytes result)
+                                          , MkPair String Bool "native-release-stream/deferred-binary-bytes"
+                                              (match loaded with | Left _ => False
+                                                | Right content => str_eq release_stream_fixture_binary content end)
+                                          ]
+                        end
+        end
+    end;
+
+def release_stream_fixture_run (mode : String) (source : String) (stage : String) (bytes : Nat) (cap : Nat) : IO Unit :=
+    match str_eq mode "deferred" with
+    | True => release_stream_fixture_deferred source stage bytes cap
+    | False => match str_eq mode "reuse" with
+      | True => let action : IO (Either NativeReleaseStreamFailure NativeReleaseClosedStage) :=
+                    native_release_stream_copy_checked cap bytes source stage in
+          do let! first := action;
+             let! second := action;
+             precision_run "native-release-stream"
+               [ MkPair String Bool "native-release-stream/reused-first-copy"
+                   (release_stream_fixture_closed stage bytes first)
+               , MkPair String Bool "native-release-stream/reused-create-refused"
+                   (release_stream_fixture_collision second)
+               ]
+      | False => match str_eq mode "copy" with
+        | True => do let! result := native_release_stream_copy_checked cap bytes source stage;
+                     precision_run "native-release-stream"
+                       [MkPair String Bool "native-release-stream/copy-closed"
+                         (release_stream_fixture_closed stage bytes result)]
+        | False => match str_eq mode "collision" with
+          | True => do let! result := native_release_stream_copy_checked cap bytes source stage;
+                       precision_run "native-release-stream"
+                         [MkPair String Bool "native-release-stream/existing-stage-refused"
+                           (release_stream_fixture_collision result)]
+          | False => match str_eq mode "actual-cap" with
+            | True => match leb_nat bytes cap with
+              | False => release_stream_fixture_usage
+              | True => do let! result := native_release_stream_copy_checked cap bytes source stage;
+                           precision_run "native-release-stream"
+                             [MkPair String Bool "native-release-stream/actual-cap-before-payload"
+                               (release_stream_fixture_cap cap (S cap) result)]
+              end
+            | False => match str_eq mode "cap" with
+              | True => do let! result := native_release_stream_copy_checked cap bytes source stage;
+                           precision_run "native-release-stream"
+                             [MkPair String Bool "native-release-stream/cap-before-stage"
+                               (release_stream_fixture_cap cap bytes result)]
+              | False => match str_eq mode "length" with
+                | True => do let! result := native_release_stream_copy_checked cap bytes source stage;
+                             precision_run "native-release-stream"
+                               [MkPair String Bool "native-release-stream/source-length-before-stage"
+                                 (release_stream_fixture_length bytes cap result)]
+                | False => release_stream_fixture_usage
+                end
+              end
+            end
+          end
+        end
+      end
+    end;
+
+-- @entry main
+def main : IO Unit :=
+    do let! args := argv;
+       match tail String args with
+       | Nil => release_stream_fixture_usage
+       | Cons mode args1 => match args1 with
+         | Nil => release_stream_fixture_usage
+         | Cons source args2 => match args2 with
+           | Nil => release_stream_fixture_usage
+           | Cons stage args3 => match args3 with
+             | Nil => release_stream_fixture_usage
+             | Cons raw_bytes args4 => match args4 with
+               | Nil => release_stream_fixture_usage
+               | Cons raw_cap extra => match extra with
+                 | Cons _ _ => release_stream_fixture_usage
+                 | Nil => match parse_nat raw_bytes, parse_nat raw_cap with
+                   | Just bytes, Just cap => release_stream_fixture_run mode source stage bytes cap
+                   | Just _, Nothing => release_stream_fixture_usage
+                   | Nothing, Just _ => release_stream_fixture_usage
+                   | Nothing, Nothing => release_stream_fixture_usage
+                   end
+                 end
+               end
+             end
+           end
+         end
+       end;

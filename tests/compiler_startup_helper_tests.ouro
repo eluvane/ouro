@@ -2,7 +2,8 @@
 -- test the internal linker boundary independently of helper name lookup.
 import "../compiler/native/managed_startup_memory.ouro",
   "../compiler/driver.ouro",
-  "compiler_startup_test_support.ouro";
+  "compiler_startup_test_support.ouro",
+  "compiler_managed_helper_test_support.ouro";
 
 def startup_helper_prefix : String :=
     prim_string_concat
@@ -19,48 +20,21 @@ def startup_helper_source (mode : Nat) : String :=
           | False => "def raw_windows_argv_open (owner : Pointer Size) (count : Pointer Word) : Effect Word := pure Word zero;" end end end);
 
 def startup_helper_compiler (program : CheckedProgram) (contracts : List LowerContract) : ManagedCompiler :=
-    ManagedCompilerOf program ([] : List Nat) 0 0 0 0 0 0 contracts
-      (check_environment_from_entries (checked_program_entries program));
+    managed_helper_test_compiler program contracts;
 
 def startup_helper_contracts (mode : Nat) (contract : LowerContract) : List LowerContract :=
-    match contract with | LowerContractOf id annotation arguments result binding =>
-      match eqNat mode 2 with | True => ([] : List LowerContract) | False =>
-        ([LowerContractOf (match eqNat mode 3 with | True => S id | False => id end)
-          (match eqNat mode 4 with | True => CSort 0 | False => annotation end) arguments result
-          (match eqNat mode 5 with
-            | True => Just(PrimitiveBinding, PrimitiveIntrinsicBinding PrimitiveArgv PrimitiveRuntimeAction PrimitiveMayGc (Nothing CoreTerm))
-            | False => binding end)] : List LowerContract) end end;
+    managed_helper_test_contracts PrimitiveArgv mode contract;
 
 def startup_helper_resolve (mode : Nat) (program : CheckedProgram) : Either NativeLowerError Nat :=
-    let compiler : ManagedCompiler := startup_helper_compiler(program, [] : List LowerContract) in
-    let name : List Nat := managed_startup_helper_name ManagedStartupArgvOpen in
-    lower_bind Nat Nat (managed_source_symbol program name) (fun (id : Nat) =>
-      match lookup_type(id, checked_program_entries program) with
-      | Nothing => Left NativeLowerError Nat (LowerUnknownGlobal id)
-      | Just annotation => lower_bind LowerContract Nat
-          (lower_make_contract primitive_default_fuel (checked_program_entries program) id annotation (Nothing PrimitiveBinding))
-          (fun (contract : LowerContract) => lower_bind CoreTerm Nat
-            (managed_startup_expected compiler ManagedStartupArgvOpen) (fun (expected : CoreTerm) =>
-              lower_bind LowerContract Nat
-                (managed_runtime_contract (startup_helper_compiler(program, startup_helper_contracts mode contract))
-                  (match eqNat mode 8 with | True => 0 | False => primitive_default_fuel end) name expected)
-                (fun (selected : LowerContract) => lower_map Unit Nat (fun (_ : Unit) => id)
-                  (lower_require(eqNat(lower_contract_id selected, id), LowerInvalidCall id))))) end);
+    managed_helper_test_resolve mode (managed_startup_helper_name ManagedStartupArgvOpen)
+      (fun (compiler : ManagedCompiler) => managed_startup_expected compiler ManagedStartupArgvOpen)
+      (startup_helper_contracts mode) program;
 
 def startup_helper_status (result : Either NativeLowerError Nat) : String :=
-    match result with
-      | Right _ => "linked" | Left error => match error with
-        | LowerResourceExhausted => "resource" | LowerMetadataMismatch _ => "metadata"
-        | LowerBodyMismatch _ => "body" | LowerInvalidCall _ => "call"
-        | LowerDeclarationFailure _ _ _ => "declaration" | LowerUnsupportedType _ => "type"
-        | LowerUnsupportedTerm _ => "term" | LowerUnsupportedPrimitive _ => "primitive"
-        | LowerUnknownGlobal _ => "global" | LowerUnboundLocal _ => "local" | LowerEffectMismatch => "effect"
-        | LowerInvalidEntry _ => "entry" | LowerMirFailure _ => "mir" | LowerBackendFailure _ => "backend" end end;
+    managed_helper_test_status result;
 
 def startup_helper_probe (mode : Nat) : String :=
-    match compile_checked_source(mul 100 50, prim_string_to_char_codes (startup_helper_source mode)) with
-    | CErr _ => "source-rejected"
-    | COk program => startup_helper_status (startup_helper_resolve mode program) end;
+    managed_helper_test_probe (startup_helper_source mode) (startup_helper_resolve mode);
 
 -- All candidates share one checked program and one derived environment. A
 -- successful lookup must not authorize another body, type, or raw contract.
@@ -118,6 +92,192 @@ def startup_helper_shared_laws : List StartupTest :=
       | Left _ => [startup_test_assert "shared environment fixture contract is accepted" False]
       | Right values => values end end;
 
+def startup_symbol_lookup_probe (declarations : String) : String :=
+    match compile_checked_source 5000 (prim_string_to_char_codes
+        (prim_string_concat startup_helper_prefix declarations)) with
+    | CErr _ => "source-rejected"
+    | COk program => startup_helper_status
+        (managed_source_symbol program (managed_startup_helper_name ManagedStartupArgvOpen))
+    end;
+
+def startup_symbol_link_probe (declarations : String) : String :=
+    match compile_checked_source 5000 (prim_string_to_char_codes
+        (prim_string_concat startup_helper_prefix declarations)) with
+    | CErr _ => "source-rejected"
+    | COk program => startup_helper_status (startup_helper_resolve 0 program)
+    end;
+
+def startup_symbol_definition (name : String) : String :=
+    prim_string_concat "def " (prim_string_concat name
+      " (owner : Pointer Size) (count : Pointer Word) : Effect Word := pure Word zero;");
+
+def startup_symbol_module_compile (scoped : Bool) : CompResult CheckedProgram :=
+    let declaration : String := startup_symbol_definition "raw_windows_argv_open" in
+    let trigger : String := match scoped with
+      | True => "private def scope_trigger (value : Word) : Word := value; "
+      | False => "def scope_trigger (value : Word) : Word := value; "
+      end in
+    compile_checked_units 5000 (prim_string_to_char_codes "root.ouro")
+      ([MkPair (List Nat) (List Nat) (prim_string_to_char_codes "root.ouro")
+          (prim_string_to_char_codes "import \"helper.ouro\"; def root_identity (value : Word) : Word := value;"),
+        MkPair (List Nat) (List Nat) (prim_string_to_char_codes "helper.ouro")
+          (prim_string_to_char_codes (prim_string_concat startup_helper_prefix
+            (prim_string_concat trigger declaration)))] : List (Pair (List Nat) (List Nat)));
+
+def startup_symbol_module_probe (scoped : Bool) : String :=
+    match startup_symbol_module_compile scoped with
+    | CErr _ => "source-rejected"
+    | COk program => startup_helper_status (startup_helper_resolve 0 program)
+    end;
+
+def startup_symbol_scoped_identity (_ : Unit) : Bool :=
+    match startup_symbol_module_compile True with
+    | CErr _ => False
+    | COk program => match checked_program_intern program with | MkIntern names _ _ _ =>
+        let name : List Nat := managed_startup_helper_name ManagedStartupArgvOpen in
+        match source_lookup_id names name with
+        | Nothing => False
+        | Just lexical => match lower_find_entry lexical (checked_program_entries program) with
+          | Just _ => False
+          | Nothing => match managed_source_symbol program name with
+            | Left _ => False
+            | Right selected => andb(notb(eqNat selected lexical),
+                match lower_find_entry selected (checked_program_entries program) with
+                | Nothing => False | Just _ => True end)
+            end
+          end
+        end
+      end
+    end;
+
+-- Invalid wrappers exercise identity selection only. Native acceptance still requires replay.
+def startup_symbol_duplicate_probe (mode : Nat) : String :=
+    match compile_checked_source 5000 (prim_string_to_char_codes (startup_helper_source 0)) with
+    | CErr _ => "source-rejected"
+    | COk program => startup_helper_status (lower_bind Nat Nat
+        (managed_source_symbol program (managed_startup_helper_name ManagedStartupArgvOpen))
+        (fun (id : Nat) => match lower_find_entry id (checked_program_entries program) with
+          | Nothing => Left NativeLowerError Nat (LowerUnknownGlobal id)
+          | Just entry => match program with | CheckedProgramOf state entries cores =>
+              match state with | MkIntern names next strings next_string =>
+                let modified : CheckedProgram := match eqNat mode 0 with
+                  | True => CheckedProgramOf state (Cons Entry entry entries) cores
+                  | False => CheckedProgramOf
+                      (MkIntern (Cons (Pair (List Nat) Nat)
+                        (MkPair (List Nat) Nat
+                          (match eqNat mode 1 with
+                           | True => managed_startup_helper_name ManagedStartupArgvOpen
+                           | False => prim_string_to_char_codes "unrelated_name"
+                           end) id) names) next strings next_string) entries cores
+                  end in
+                managed_source_symbol modified (managed_startup_helper_name ManagedStartupArgvOpen)
+              end end
+          end))
+    end;
+
+def startup_symbol_relabel (program : CheckedProgram) (old : Nat) (updated : Nat) : CheckedProgram :=
+    match program with | CheckedProgramOf state entries cores =>
+      match state with | MkIntern names _ strings next_string =>
+        CheckedProgramOf
+          (MkIntern (map (Pair (List Nat) Nat) (Pair (List Nat) Nat)
+            (fun (row : Pair (List Nat) Nat) => match row with | MkPair spelling id =>
+              MkPair (List Nat) Nat spelling (match eqNat id old with | True => updated | False => id end)
+              end) names) (S updated) strings next_string)
+          (map Entry Entry (fun (entry : Entry) => if let MkEntry id annotation body := entry then
+              match eqNat id old with
+              | True => MkEntry updated annotation body | False => entry end
+            else entry) entries)
+          (map (Pair Nat CoreTerm) (Pair Nat CoreTerm)
+            (fun (row : Pair Nat CoreTerm) => match row with | MkPair id body =>
+              MkPair Nat CoreTerm (match eqNat id old with | True => updated | False => id end) body
+              end) cores)
+      end
+    end;
+
+def startup_symbol_wide_identity (_ : Unit) : Bool :=
+    let wide : Nat := add
+      ((fix grow (remaining : Nat) (value : Nat) : Nat :=
+        match remaining with
+        | Z => value
+        | S next => grow next (add value value)
+        end) 64 1) 17 in
+    match compile_checked_source 5000 (prim_string_to_char_codes (startup_helper_source 0)) with
+    | CErr _ => False
+    | COk program => match managed_source_symbol program (managed_startup_helper_name ManagedStartupArgvOpen) with
+      | Left _ => False
+      | Right id => match lower_recheck_program 5000 (startup_symbol_relabel program id wide) with
+        | Left _ => False
+        | Right checked => match startup_helper_resolve 0 checked with
+          | Left _ => False | Right selected => eqNat selected wide end
+        end
+      end
+    end;
+
+def startup_symbol_spelling_laws : List StartupTest :=
+    let requested : List Nat := managed_startup_helper_name ManagedStartupArgvOpen in
+    let accepts (spelling : String) : Bool :=
+      managed_source_spelling requested (prim_string_to_char_codes spelling) in
+    [startup_test_assert "plain helper spelling is exact" (accepts "raw_windows_argv_open"),
+     startup_test_assert "zero module ordinal is canonical" (accepts "_ouro_m_0_raw_windows_argv_open"),
+     startup_test_assert "nonzero module ordinal is canonical" (accepts "_ouro_m_17_raw_windows_argv_open"),
+     startup_test_assert "module ordinal does not require a host word"
+       (accepts "_ouro_m_184467440737095516160_raw_windows_argv_open"),
+     startup_test_assert "leading zero module ordinal is rejected" (notb(accepts "_ouro_m_017_raw_windows_argv_open")),
+     startup_test_assert "double zero module ordinal is rejected" (notb(accepts "_ouro_m_00_raw_windows_argv_open")),
+     startup_test_assert "empty module ordinal is rejected" (notb(accepts "_ouro_m__raw_windows_argv_open")),
+     startup_test_assert "nondecimal module ordinal is rejected" (notb(accepts "_ouro_m_x_raw_windows_argv_open")),
+     startup_test_assert "negative module ordinal is rejected" (notb(accepts "_ouro_m_-1_raw_windows_argv_open")),
+     startup_test_assert "truncated module ordinal is rejected" (notb(accepts "_ouro_m_17")),
+     startup_test_assert "truncated helper name is rejected" (notb(accepts "_ouro_m_17_raw_windows_argv")),
+     startup_test_assert "nested module spelling does not match the inner helper"
+       (notb(accepts "_ouro_m_17__ouro_m_0_raw_windows_argv_open")),
+     startup_test_assert "unrelated prefix cannot match a helper suffix"
+       (notb(accepts "other_raw_windows_argv_open")),
+     startup_test_assert "extra helper suffix is rejected"
+       (notb(accepts "_ouro_m_17_raw_windows_argv_open_extra"))];
+
+def startup_symbol_laws : List StartupTest :=
+    append StartupTest startup_symbol_spelling_laws
+      [startup_test_assert "private import retains the lexical token but selects the checked scoped declaration"
+         (startup_symbol_scoped_identity MkUnit),
+       startup_test_assert "checked helper and raw contract retain an ID wider than a host word"
+         (startup_symbol_wide_identity MkUnit),
+       startup_test_eq "plain checked module helper retains the raw contract"
+         (startup_symbol_module_probe False) "linked",
+       startup_test_eq "private declaration scopes the same helper without changing its raw contract"
+         (startup_symbol_module_probe True) "linked",
+       startup_test_eq "canonical envelope selects an ordinary checked body"
+         (startup_symbol_link_probe (startup_symbol_definition "_ouro_m_17_raw_windows_argv_open")) "linked",
+       startup_test_eq "plain and canonical helper candidates are ambiguous"
+         (startup_symbol_lookup_probe (prim_string_concat
+           (startup_symbol_definition "raw_windows_argv_open")
+           (startup_symbol_definition "_ouro_m_17_raw_windows_argv_open"))) "metadata",
+       startup_test_eq "two canonical helper candidates are ambiguous"
+         (startup_symbol_lookup_probe (prim_string_concat
+           (startup_symbol_definition "_ouro_m_17_raw_windows_argv_open")
+           (startup_symbol_definition "_ouro_m_18_raw_windows_argv_open"))) "metadata",
+       startup_test_eq "leading zero spelling cannot supply a checked helper"
+         (startup_symbol_lookup_probe (startup_symbol_definition "_ouro_m_017_raw_windows_argv_open")) "global",
+       startup_test_eq "nested spelling cannot supply the inner checked helper"
+         (startup_symbol_lookup_probe (startup_symbol_definition "_ouro_m_17__ouro_m_0_raw_windows_argv_open")) "global",
+       startup_test_eq "a lexical helper token is not a checked declaration"
+         (startup_symbol_lookup_probe
+           "def witness (raw_windows_argv_open : Word) : Word := raw_windows_argv_open;") "global",
+       startup_test_eq "a reserved constructor name is not a checked helper declaration"
+         (startup_symbol_lookup_probe "inductive Token : Type := | raw_windows_argv_open : Token;") "global",
+       startup_test_eq "a canonical helper axiom still lacks a checked body"
+         (startup_symbol_link_probe
+           "axiom _ouro_m_17_raw_windows_argv_open : Pointer Size -> Pointer Word -> Effect Word;") "body",
+       startup_test_eq "a canonical helper keeps the full pointer pointee contract"
+         (startup_symbol_link_probe
+           "def _ouro_m_17_raw_windows_argv_open (owner : Pointer Word) (count : Pointer Word) : Effect Word := pure Word zero;") "metadata",
+       startup_test_eq "duplicate declaration IDs are rejected by selection"
+         (startup_symbol_duplicate_probe 0) "metadata",
+       startup_test_eq "duplicate matching intern rows are rejected by selection"
+         (startup_symbol_duplicate_probe 1) "metadata",
+       startup_test_eq "duplicate ID under an unrelated spelling is rejected by selection"
+         (startup_symbol_duplicate_probe 2) "metadata"];
+
 def main : IO Unit :=
     startup_test_run (append StartupTest
       [startup_test_eq "checked startup body links the same raw definition" (startup_helper_probe 0) "linked",
@@ -129,4 +289,4 @@ def main : IO Unit :=
        startup_test_eq "a helper axiom cannot supply an implementation" (startup_helper_probe 7) "body",
        startup_test_eq "helper normalization preserves fuel failure" (startup_helper_probe 8) "resource",
        startup_test_eq "a foreign declaration cannot masquerade as a checked helper body" (startup_helper_probe 9) "body"]
-      startup_helper_shared_laws);
+      (append StartupTest startup_helper_shared_laws startup_symbol_laws));

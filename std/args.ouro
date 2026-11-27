@@ -1,5 +1,6 @@
--- Command-line grammar is small by design: long options, single-dash flags, and -- to end options.
--- Boolean switches are passed in so --flag value cannot accidentally consume a positional word.
+-- Parse long options and single-dash flags. `--` ends option parsing.
+-- A bare long option listed in `bools` is a flag and leaves the next word
+-- for separate parsing.
 
 import "map.ouro";
 
@@ -63,57 +64,74 @@ def short_name (w : String) : Maybe String :=
     end;
 
 def args_parse_go : Nat -> List String -> Args -> Bool -> List String -> Args :=
-  fix args_parse_go (fuel : Nat) (bools : List String) (acc : Args)
-      (only_pos : Bool) (ws : List String) : Args :=
-    match fuel with
-    | Z => acc
-    | S fuel2 =>
-      match ws with
-      | Nil => acc
-      | Cons w rest =>
-        match only_pos with
-        | True => args_parse_go fuel2 bools (args_add_pos acc w) True rest
-        | False =>
-          match str_eq w "--" with
-          | True => args_parse_go fuel2 bools acc True rest
-          | False =>
-            match long_name w with
-            | Just name =>
-              match str_split_first name "=" with
-              | Just kv =>
-                match kv with
-                | MkPair k v =>
-                  args_parse_go fuel2 bools (args_add_opt acc k v) False rest
-                end
-              | Nothing =>
-                match str_set_mem name bools with
-                | True =>
-                  args_parse_go fuel2 bools (args_add_flag acc name) False rest
-                | False =>
-                  match rest with
-                  | Cons nxt rest2 =>
-                    match is_dashed nxt with
-                    | False =>
-                      args_parse_go fuel2 bools
-                        (args_add_opt acc name nxt) False rest2
-                    | True =>
-                      args_parse_go fuel2 bools
-                        (args_add_flag acc name) False rest
+  fun (fuel : Nat) (bools : List String) (acc : Args)
+      (only_pos : Bool) (ws : List String) =>
+    let reverse_lists (state : Args) : Args :=
+        MkArgs (reverse_lin String (args_positional state)) (args_opts state)
+          (reverse_lin String (args_flags state))
+    in
+    let prepend_pos (state : Args) (word : String) : Args :=
+        MkArgs (Cons String word (args_positional state)) (args_opts state)
+          (args_flags state)
+    in
+    let prepend_flag (state : Args) (name : String) : Args :=
+        MkArgs (args_positional state) (args_opts state)
+          (Cons String name (args_flags state))
+    in
+    -- The loop stores positional words and flags in reverse order.
+    let go : Nat -> Args -> Bool -> List String -> Args :=
+      fix go (remaining_fuel : Nat) (state : Args) (positional_only : Bool)
+          (remaining : List String) : Args :=
+        match remaining_fuel with
+        | Z => reverse_lists state
+        | S fuel2 =>
+          match remaining with
+          | Nil => reverse_lists state
+          | Cons w rest =>
+            match positional_only with
+            | True => go fuel2 (prepend_pos state w) True rest
+            | False =>
+              match str_eq w "--" with
+              | True => go fuel2 state True rest
+              | False =>
+                match long_name w with
+                | Just name =>
+                  match str_split_first name "=" with
+                  | Just kv =>
+                    match kv with
+                    | MkPair k v => go fuel2 (args_add_opt state k v) False rest
                     end
-                  | Nil => acc
+                  | Nothing =>
+                    match str_set_mem name bools with
+                    | True => go fuel2 (prepend_flag state name) False rest
+                    | False =>
+                      match rest with
+                      | Cons nxt rest2 =>
+                        match is_dashed nxt with
+                        | False => go fuel2 (args_add_opt state name nxt) False rest2
+                        | True => go fuel2 (prepend_flag state name) False rest
+                        end
+                      | Nil => reverse_lists state
+                      end
+                    end
+                  end
+                | Nothing =>
+                  match short_name w with
+                  | Just name => go fuel2 (prepend_flag state name) False rest
+                  | Nothing => go fuel2 (prepend_pos state w) False rest
                   end
                 end
-              end
-            | Nothing =>
-              match short_name w with
-              | Just name =>
-                args_parse_go fuel2 bools (args_add_flag acc name) False rest
-              | Nothing =>
-                args_parse_go fuel2 bools (args_add_pos acc w) False rest
               end
             end
           end
         end
+    in
+    match fuel with
+    | Z => acc
+    | S _ =>
+      match ws with
+      | Nil => acc
+      | Cons _ _ => go fuel (reverse_lists acc) only_pos ws
       end
     end;
 
@@ -123,30 +141,26 @@ def args_parse_bools (bools : List String) (ws : List String) : Args :=
 def args_parse (ws : List String) : Args :=
     args_parse_bools(Nil String, ws);
 
--- prim_argv keeps the program path in slot 0; tools want the rest.
+-- Skip argument zero, which contains the program path.
 def args_of_argv (argv : List String) : Args :=
     args_parse (tail String argv);
 
 def args_of_argv_bools (bools : List String) (argv : List String) : Args :=
     args_parse_bools(bools, tail String argv);
 
--- Strict command entry points can reject a non-boolean long option whose
--- value is absent before using the intentionally forgiving Args parser.
+-- Check before parsing that each non-boolean long option has a value.
+-- The value can follow `=` or be the next word if it does not start with `-`.
 def args_argv_options_complete (bools : List String) (argv : List String) : Bool :=
     let complete_long (next : List String -> Bool) (name : String) (rest : List String) : Bool :=
-        match str_split_first name "=" with
-        | Just _ => next rest
-        | Nothing =>
-          match str_set_mem name bools with
-          | True => next rest
-          | False =>
-            match rest with
-            | Nil => False
-            | Cons nxt rest2 =>
-              match is_dashed nxt with
-              | True => False
-              | False => next rest2
-              end
+        match str_set_mem name bools with
+        | True => next rest
+        | False =>
+          match rest with
+          | Nil => False
+          | Cons nxt rest2 =>
+            match is_dashed nxt with
+            | True => False
+            | False => next rest2
             end
           end
         end
@@ -155,9 +169,14 @@ def args_argv_options_complete (bools : List String) (argv : List String) : Bool
         match str_eq w "--" with
         | True => True
         | False =>
-          match long_name w with
-          | Nothing => next rest
-          | Just name => complete_long next name rest
+          match str_starts w "--" with
+          | False => next rest
+          | True =>
+            -- Check the separator before slicing to avoid copying inline values.
+            match str_contains w "=" with
+            | True => next rest
+            | False => complete_long next (str_drop w 2) rest
+            end
           end
         end
     in

@@ -373,7 +373,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     raw = list(sys.argv[1:] if argv is None else argv)
     timeout_s = _int_env("OURO_CLIPPY_TIMEOUT_S", 7200, minimum=1, maximum=86400)
     memory_mb = _int_env("OURO_CLIPPY_MEMORY_MB", 3072, minimum=512, maximum=12288)
-    jobs = _int_env("OURO_CLIPPY_JOBS", 2, minimum=1, maximum=3)
+    from local_scheduler import MEMORY_ENV, available_memory_mib, bounded_jobs
+
+    jobs = bounded_jobs(_int_env("OURO_CLIPPY_JOBS", 2, minimum=1, maximum=3))
+    if MEMORY_ENV in os.environ:
+        jobs = min(jobs, max(1, available_memory_mib() // memory_mb))
     if not _uses_native_clippy_surface(raw):
         return _run_lint_semantic(raw, timeout_s=timeout_s, memory_mb=memory_mb)
     if _has_flag(raw, "--print-files"):

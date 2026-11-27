@@ -27,6 +27,7 @@ import sys
 import tokenize
 import io
 from dataclasses import dataclass, field
+from itertools import pairwise
 from pathlib import Path
 
 from repo_support import write_json_atomic
@@ -42,6 +43,9 @@ IDENT = re.compile(r"[A-Za-z_][A-Za-z_0-9']*\Z")
 WORD = re.compile(r"[A-Za-z_][A-Za-z_0-9']*")
 OPERATORS = (":=", "=>", "->", "<-", "|>", "&&", "||", "==", "!=", "<=", ">=",
              "::", "++", "--", "<<", ">>", "+=", "-=", "...", "${", "$(")
+_OPERATORS_BY_FIRST: dict[str, list[str]] = {}
+for _operator in OPERATORS:
+    _OPERATORS_BY_FIRST.setdefault(_operator[0], []).append(_operator)
 CONTROL = {"match", "with", "end", "fix", "if", "then", "else", "elif", "fi",
            "case", "esac", "for", "while", "try", "except", "return", "raise",
            "switch", "do", "done", "break", "continue", "catch", "finally"}
@@ -132,19 +136,24 @@ def digest(value):
     return hashlib.sha256(json.dumps(value, separators=(",", ":"), ensure_ascii=True).encode()).hexdigest()
 
 
-def lex(source, language):
+def lex(source, language, *, only_lexeme: str | None = None, collect_comments: bool = True):
     """Retain every non-trivia byte, including preprocessor/shell syntax.
 
     No identifier/literal is inferred from comments. OCaml comments nest; shell
     here-documents are data regions. Unsupported/unclosed regions are errors.
+    Filtering tokens or omitting comments still scans and validates the source.
     """
     result, comments, i, line, heredocs = [], [], 0, 1, []
+    lexeme_width = len(only_lexeme) if only_lexeme is not None else 0
+    line_opener = {"ouro": "--", "sh": "#", "c": "//", "h": "//"}.get(language)
+    block = {"ml": ("(*", "*)"), "mli": ("(*", "*)"), "c": ("/*", "*/"), "h": ("/*", "*/")}.get(language)
     while i < len(source):
         start, first_line = i, line
-        if source[i].isspace():
-            line += source[i] == "\n"
+        char = source[i]
+        if char.isspace():
+            line += char == "\n"
             i += 1
-            if source[i - 1] == "\n" and heredocs:
+            if char == "\n" and heredocs:
                 for delimiter, tabs in heredocs:
                     begin, begin_line = i, line
                     while i < len(source):
@@ -157,27 +166,28 @@ def lex(source, language):
                             break
                     else:
                         raise ValueError(f"unclosed here-document at line {begin_line}")
-                    result.append(Token('"' + source[begin:i] + '"', begin, i, begin_line))
+                    value = '"' + source[begin:i] + '"'
+                    if only_lexeme is None or value == only_lexeme:
+                        result.append(Token(value, begin, i, begin_line))
                 heredocs = []
             continue
-        if language == "sh" and source.startswith("<<", i) and not source.startswith("<<<", i):
+        if language == "sh" and char == "<" and source.startswith("<<", i) and not source.startswith("<<<", i):
             match = re.match(r"<<(-?)\s*(['\"]?)([A-Za-z_][A-Za-z_0-9]*)\2", source[i:])
             if match:
                 heredocs.append((match[3], bool(match[1])))
-                i += len(match[0])
-                result.append(Token(match[0], start, i, first_line))
+                value = match[0]
+                i += len(value)
+                if only_lexeme is None or value == only_lexeme:
+                    result.append(Token(value, start, i, first_line))
                 continue
-        opener = next((x for x in ({"ouro": ("--",), "sh": ("#",), "c": ("//",),
-                                   "h": ("//",), "ml": (), "mli": ()}.get(language, ()))
-                       if source.startswith(x, i)), None)
-        if opener:
+        if line_opener is not None and char == line_opener[0] and source.startswith(line_opener, i):
             i = source.find("\n", i)
             if i < 0:
                 i = len(source)
-            comments.append((first_line, source[start:i]))
+            if collect_comments:
+                comments.append((first_line, source[start:i]))
             continue
-        block = ("(*", "*)") if language in {"ml", "mli"} else ("/*", "*/")
-        if language in {"ml", "mli", "c", "h"} and source.startswith(block[0], i):
+        if block is not None and char == block[0][0] and source.startswith(block[0], i):
             depth, i = 1, i + 2
             while i < len(source) and depth:
                 if block[0] == "(*" and source.startswith(block[0], i):
@@ -188,11 +198,11 @@ def lex(source, language):
                     i += 1
             if depth:
                 raise ValueError(f"unclosed comment at line {line}")
-            comments.append((line, source[start:i]))
-            line += source[start:i].count("\n")
+            if collect_comments:
+                comments.append((line, source[start:i]))
+            line += source.count("\n", start, i)
             continue
-        char = source[i]
-        if language == "ouro" and source.startswith('"""', i):
+        if language == "ouro" and char == '"' and source.startswith('"""', i):
             body = i + 3
             if source.startswith("\r\n", body):
                 current = body + 2
@@ -213,18 +223,20 @@ def lex(source, language):
                 current = end + 1
             else:
                 raise ValueError(f"unclosed string at line {line}")
-            result.append(Token(source[start:i], start, i, first_line))
-            line += source[start:i].count("\n")
+            if only_lexeme is None or (i - start == lexeme_width and source.startswith(only_lexeme, start)):
+                result.append(Token(source[start:i], start, i, first_line))
+            line += source.count("\n", start, i)
             continue
-        if language == "ouro" and source.startswith('r#"', i):
+        if language == "ouro" and char == "r" and source.startswith('r#"', i):
             close = source.find('"#', i + 3)
             if close < 0:
                 raise ValueError(f"unclosed raw string at line {line}")
             i = close + 2
-            result.append(Token(source[start:i], start, i, first_line))
-            line += source[start:i].count("\n")
+            if only_lexeme is None or (i - start == lexeme_width and source.startswith(only_lexeme, start)):
+                result.append(Token(source[start:i], start, i, first_line))
+            line += source.count("\n", start, i)
             continue
-        if language == "ouro" and source.startswith('b"', i):
+        if language == "ouro" and char == "b" and source.startswith('b"', i):
             i += 1
             char = source[i]
         # A quote inside an Ouro/OCaml identifier is not a string delimiter.
@@ -232,30 +244,44 @@ def lex(source, language):
         if language in {"ml", "mli"} and char == "'":
             is_quote = bool(re.match(r"'(?:[^'\\\n]|\\.)'", source[i:]))
         if is_quote:
-            i += 1
-            while i < len(source):
-                if source[i] == "\\" and not (language == "sh" and char == "'"):
-                    i += 2
-                elif source[i] == char:
-                    i += 1
-                    break
-                else:
-                    i += 1
-            else:
+            quote_end = source.find(char, i + 1)
+            if quote_end < 0:
                 raise ValueError(f"unclosed string at line {line}")
+            if (char == "'" and language == "sh") or (first_escape := source.find("\\", i + 1, quote_end)) < 0:
+                i = quote_end + 1
+            else:
+                i = first_escape
+                while i < len(source):
+                    if source[i] == "\\":
+                        i += 2
+                    elif source[i] == char:
+                        i += 1
+                        break
+                    else:
+                        i += 1
+                else:
+                    raise ValueError(f"unclosed string at line {line}")
+            line += source.count("\n", start, i)
         elif char.isalpha() or char == "_":
             i += 1
-            while i < len(source) and (source[i].isalnum() or (source[i] in "_'" and language != "sh")):
+            while i < len(source) and (
+                source[i].isalnum() or (source[i] in "_'" and language != "sh"
+                                       and (source[i] != "'" or language not in {"c", "h"}))
+            ):
                 i += 1
         elif char.isdigit():
             i += 1
             while i < len(source) and (source[i].isalnum() or source[i] in "._"):
                 i += 1
         else:
-            op = next((x for x in OPERATORS if source.startswith(x, i)), char)
+            op = char
+            for candidate in _OPERATORS_BY_FIRST.get(char, ()):
+                if source.startswith(candidate, i):
+                    op = candidate
+                    break
             i += len(op)
-        result.append(Token(source[start:i], start, i, first_line))
-        line += source[start:i].count("\n")
+        if only_lexeme is None or (i - start == lexeme_width and source.startswith(only_lexeme, start)):
+            result.append(Token(source[start:i], start, i, first_line))
     return result, comments
 
 
@@ -285,6 +311,9 @@ def binders(tokens, language):
             if j + 1 < len(tokens) and IDENT.fullmatch(tokens[j]) and tokens[j + 1] in {'=', ';', ',', ')', '['}:
                 bound.append(tokens[j])
     for i, lexeme in enumerate(tokens):
+        if language == "ouro" and lexeme == "let" and i and tokens[i - 1] == "if":
+            # The field scope ends at else. Keep the pattern rigid here.
+            continue
         if lexeme in {"let", "fix", "fun"} and i + 1 < len(tokens):
             j = i + 1
             if tokens[j] in {"!", "rec"}:
@@ -293,7 +322,7 @@ def binders(tokens, language):
                 bound.append(tokens[j])
         if lexeme == "(" and language == "ouro":
             j, group = i + 1, []
-            while j < len(tokens) and IDENT.fullmatch(tokens[j]):
+            while j < len(tokens) and IDENT.fullmatch(tokens[j]) and tokens[j] not in RESERVED:
                 group.append(tokens[j])
                 j += 1
             if j < len(tokens) and tokens[j] == ":":
@@ -371,6 +400,18 @@ def lexical_symbols(path, source):
             name = start + 1 + (start + 1 < end and values[start + 1] == "rec")
             if name < end and IDENT.fullmatch(values[name]):
                 regions.append((start, end, name, "def" if values[start] in {"let", "and"} else "type"))
+    declared_names = {values[name] for _, _, name, _ in regions if name >= 0}
+    export_lines: dict[str, int] = {}
+    mark_comments: dict[int, list[str]] = collections.defaultdict(list)
+    # The lexer reports comments in source order.
+    for line, comment in comments:
+        if "@" in comment:
+            for names in re.findall(r"@(?:entry|export|api)\s+([^;@]+)", comment):
+                for name in WORD.findall(names):
+                    if name in declared_names:
+                        export_lines.setdefault(name, line)
+        if MARKER in comment:
+            mark_comments[line].append(comment)
     symbols = []
     for start, end, name_index, kind in regions:
         name = "<module>" if name_index < 0 else values[name_index]
@@ -403,16 +444,12 @@ def lexical_symbols(path, source):
             public = "static" not in ts[:ts.index("{")] if "{" in ts else True
         if language in {"ml", "mli"}:
             public = True  # .mli/embedding visibility needs module-aware proof
-        preceding = [(ln, text) for ln, text in comments if ln < tokens[start].line]
-        marks = []
-        for ln, comment in preceding:
-            exports = re.findall(r"@(?:entry|export|api)\s+([^;@]+)", comment)
-            if any(name in WORD.findall(names) for names in exports):
-                public = True
-            if MARKER in comment and tokens[start].line == ln + 1:
-                marks.append(json.loads(comment.split(MARKER, 1)[1].removesuffix("*/").removesuffix("*)").strip()))
+        start_line = tokens[start].line
+        public = public or export_lines.get(name, start_line) < start_line
+        marks = [json.loads(comment.split(MARKER, 1)[1].removesuffix("*/").removesuffix("*)").strip())
+                 for comment in mark_comments.get(start_line - 1, ())]
         refs = set(x for x in ts if IDENT.fullmatch(x)) - set(bound) - {name}
-        symbols.append(Symbol(path, name, tokens[start].line, tokens[end - 1].line,
+        symbols.append(Symbol(path, name, start_line, tokens[end - 1].line,
                               language, kind, ts, normalize(ts, name, bound), refs,
                               call_names(body, bound), public, wrapper,
                               tuple(x for x in body if x in CONTROL), classifications=marks,
@@ -447,18 +484,26 @@ def python_symbols(path, source):
     tree = ast.parse(source, filename=path)
     symbols = []
     lines = source.splitlines()
-    for parent in [tree, *(n for n in ast.walk(tree) if isinstance(n, ast.ClassDef))]:
+    nodes_by_parent = {child: parent for parent in ast.walk(tree) for child in ast.iter_child_nodes(parent)}
+    for parent in [tree, *(node for node in nodes_by_parent if isinstance(node, ast.ClassDef))]:
+        scope = []
+        ancestor = parent
+        while ancestor is not tree:
+            if isinstance(ancestor, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)):
+                scope.append(ancestor.name)
+            ancestor = nodes_by_parent[ancestor]
         for node in parent.body:
             if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
                 continue
-            name = node.name if parent is tree else parent.name + "." + node.name
+            nodes = tuple(ast.walk(node))
+            name = ".".join([*reversed(scope), node.name])
             local = [a.arg for a in (*node.args.posonlyargs, *node.args.args, *node.args.kwonlyargs)]
             if node.args.vararg:
                 local.append(node.args.vararg.arg)
             if node.args.kwarg:
                 local.append(node.args.kwarg.arg)
-            local += [n.id for n in ast.walk(node) if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Store)]
-            local += [n.name for n in ast.walk(node) if isinstance(n, ast.ExceptHandler) and n.name]
+            local += [n.id for n in nodes if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Store)]
+            local += [n.name for n in nodes if isinstance(n, ast.ExceptHandler) and n.name]
             mapping = {n: f"$local{i}" for i, n in enumerate(dict.fromkeys(local))}
             mapping[node.name] = "$self"
             # Nested Python scopes, comprehensions, global/nonlocal statements
@@ -468,7 +513,7 @@ def python_symbols(path, source):
                            ast.GeneratorExp, ast.Global, ast.Nonlocal, ast.ClassDef)
             nested = any(isinstance(n, scope_nodes) or
                          (isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)) and n is not node)
-                         for n in ast.walk(node))
+                         for n in nodes)
             declaration_refs = {n.id for part in [node.args, node.returns, *node.decorator_list]
                                 if part is not None for n in ast.walk(part) if isinstance(n, ast.Name)}
             if nested or declaration_refs & set(local):
@@ -483,8 +528,8 @@ def python_symbols(path, source):
                         for key, item in ast.iter_fields(value) if key not in {"type_comment"}))
 
             normalized = (canonical(node.args), canonical(node.returns), canonical(node.body), canonical(node.decorator_list))
-            refs = {n.id for n in ast.walk(node) if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Load)} - set(local) - {node.name}
-            calls = tuple(ast_name(n.func) for n in ast.walk(node) if isinstance(n, ast.Call))
+            refs = {n.id for n in nodes if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Load)} - set(local) - {node.name}
+            calls = tuple(ast_name(n.func) for n in nodes if isinstance(n, ast.Call))
             body = [n for n in node.body if not (isinstance(n, ast.Expr) and isinstance(n.value, ast.Constant) and isinstance(n.value.value, str))]
             wrapper = ""
             if len(body) == 1 and isinstance(body[0], ast.Return) and isinstance(body[0].value, ast.Call):
@@ -495,9 +540,9 @@ def python_symbols(path, source):
             if node.lineno > 1 and MARKER in lines[node.lineno - 2]:
                 marks = [json.loads(lines[node.lineno - 2].split(MARKER, 1)[1].strip())]
             symbols.append(Symbol(path, name, node.lineno, node.end_lineno, "py", "def",
-                                  [type(n).__name__ for n in ast.walk(node)], normalized,
+                                  [type(n).__name__ for n in nodes], normalized,
                                   refs, calls, parent is not tree or not node.name.startswith("_") or bool(node.decorator_list),
-                                  wrapper, tuple(type(n).__name__.lower() for n in ast.walk(node)
+                                  wrapper, tuple(type(n).__name__.lower() for n in nodes
                                                  if isinstance(n, (ast.If, ast.For, ast.While, ast.Try, ast.Match))), node, marks))
             if isinstance(parent, ast.ClassDef) and node.name.startswith('test_') and any(ast_name(base).split('.')[-1] == 'TestCase' for base in parent.bases):
                 symbols[-1].kind = 'test'
@@ -508,9 +553,10 @@ def python_symbols(path, source):
             if name.startswith('_') and set(name.lower().split('_')) & {'mode', 'config', 'flag'}:
                 kind = 'mode' if 'mode' in name.lower().split('_') else 'config'
                 symbols.append(Symbol(path, name, node.lineno, node.end_lineno, 'py', kind, [], (), set(), ()))
+    top_nodes = tuple(ast.walk(top))
     symbols.append(Symbol(path, '<module>', 1, len(lines), 'py', 'module', [], (),
-                          {n.id for n in ast.walk(top) if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Load)},
-                          tuple(ast_name(n.func) for n in ast.walk(top) if isinstance(n, ast.Call)),
+                          {n.id for n in top_nodes if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Load)},
+                          tuple(ast_name(n.func) for n in top_nodes if isinstance(n, ast.Call)),
                           public=True, tree=top))
     return symbols, tree
 
@@ -565,7 +611,37 @@ def purposes(symbol):
     return result
 
 
-def owned_fingerprints(symbols, sources):
+def _python_owner_bindings(path, body):
+    bindings = {}
+    for node in body:
+        if isinstance(node, (ast.Import, ast.ImportFrom)):
+            for alias in node.names:
+                local = alias.asname or alias.name.split('.')[0]
+                if isinstance(node, ast.ImportFrom):
+                    module = node.module or ''
+                    candidate = posixpath.join(posixpath.dirname(path), module.replace('.', '/') + '.py')
+                    imported = (candidate, alias.name)
+                else:
+                    module, imported = alias.name, None
+                bindings[local] = ('import:' + module + ':' + alias.name, imported)
+        elif isinstance(node, (ast.Assign, ast.AnnAssign, ast.ClassDef)):
+            names = [node.name] if isinstance(node, ast.ClassDef) else [n.id for n in ast.walk(node)
+                     if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Store)]
+            bindings.update({name: (path + '#' + name, None) for name in names})
+    return bindings
+
+
+def _ouro_scope_bindings(symbols):
+    for symbol in symbols:
+        key = symbol.key
+        yield symbol.name, key
+        if symbol.kind in {"inductive", "record"}:
+            for marker, name in pairwise(symbol.tokens):
+                if marker == "|":
+                    yield name, key + "/" + name
+
+
+def owned_fingerprints(symbols, sources, *, python_bindings=None):
     """Resolve Ouro's flat import scopes before claiming equality.
 
     Distinct nominal datatypes/constructors remain distinct even when their
@@ -579,21 +655,17 @@ def owned_fingerprints(symbols, sources):
             imports[path] = quoted_import_targets(source, path)
         elif path.endswith('.py'):
             owners = {s.name: s.key for s in by_path.get(path, {}).values()}
-            for node in ast.parse(source).body:
-                if isinstance(node, (ast.Import, ast.ImportFrom)):
-                    for alias in node.names:
-                        local = alias.asname or alias.name.split('.')[0]
-                        module = (node.module or '') if isinstance(node, ast.ImportFrom) else alias.name
-                        candidate = posixpath.join(posixpath.dirname(path), module.replace('.', '/') + '.py')
-                        owners[local] = (candidate + '#' + alias.name if isinstance(node, ast.ImportFrom)
-                                         and candidate in sources else 'import:' + module + ':' + alias.name)
-                elif isinstance(node, (ast.Assign, ast.AnnAssign, ast.ClassDef)):
-                    names = [node.name] if isinstance(node, ast.ClassDef) else [n.id for n in ast.walk(node)
-                             if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Store)]
-                    owners.update({name: path + '#' + name for name in names})
+            bindings = (_python_owner_bindings(path, ast.parse(source).body)
+                        if python_bindings is None else python_bindings[path])
+            # An import can name a file that failed extraction later in the scan.
+            for name, (fallback, imported) in bindings.items():
+                owners[name] = (imported[0] + '#' + imported[1]
+                                if imported is not None and imported[0] in sources else fallback)
             python_owners[path] = owners
-    scopes = {}
+    scopes, module_bindings = {}, {}
     for path in imports:
+        if path not in by_path:
+            continue
         todo, seen = [path], set()
         while todo:
             p = todo.pop()
@@ -602,55 +674,71 @@ def owned_fingerprints(symbols, sources):
                 todo.extend(imports.get(p, []))
         scope = collections.defaultdict(set)
         for p in sorted(seen):
-            for s in by_path.get(p, {}).values():
-                scope[s.name].add(s.key)
-                if s.kind in {"inductive", "record"}:
-                    for i, value in enumerate(s.tokens[:-1]):
-                        if value == "|":
-                            scope[s.tokens[i + 1]].add(s.key + "/" + s.tokens[i + 1])
+            if p not in module_bindings:
+                module_bindings[p] = list(_ouro_scope_bindings(by_path.get(p, {}).values()))
+            for name, owner in module_bindings[p]:
+                scope[name].add(owner)
         scopes[path] = scope
-    representatives = {s.key: s.key for s in symbols}
+    symbol_keys = [symbol.key for symbol in symbols]
+    representatives = {key: key for key in symbol_keys}
+
+    def resolve_fingerprint(symbol) -> tuple[str, tuple[str, ...]]:
+        normalized = symbol.normalized
+        dependencies: set[str] = set()
+        if symbol.language == 'py':
+            owners = python_owners[symbol.path]
+
+            def resolve(value):
+                if not isinstance(value, tuple):
+                    return value
+                if len(value) == 2 and value[0] == 'id' and isinstance(value[1], str):
+                    owner = owners.get(value[1])
+                    if owner:
+                        dependencies.add(owner)
+                        return ('id', '@' + representatives.get(owner, owner))
+                return tuple(resolve(v) for v in value)
+
+            normalized = resolve(normalized)
+        elif symbol.language == 'ouro':
+            normalized = []
+            scope = scopes.get(symbol.path, {})
+            for lexeme in symbol.normalized:
+                candidates = scope.get(lexeme)
+                if not candidates:
+                    normalized.append(lexeme)
+                elif len(candidates) == 1:
+                    owner = next(iter(candidates))
+                    dependencies.add(owner)
+                    normalized.append("@" + representatives.get(owner, owner))
+                else:
+                    normalized.append("@ambiguous:" + symbol.path + ":" + lexeme)
+        return digest(normalized), tuple(dependencies)
+
     fingerprints = {}
+    changed_owners: set[str] = set()
+    # Repeated keys can have distinct bodies. Each input row owns its fingerprint.
+    snapshots: list[tuple[str, tuple[str, ...]] | None] = [None] * len(symbols)
     # Union only proven equivalent implementations. Each successful round
     # strictly decreases the number of owners; cycles never require unfolding.
     for _ in range(len(symbols) + 1):
         groups = collections.defaultdict(list)
-        for s in symbols:
-            normalized = s.normalized
-            if s.language == 'py':
-                def resolve(value, owners=python_owners[s.path]):
-                    if not isinstance(value, tuple):
-                        return value
-                    if len(value) == 2 and value[0] == 'id' and isinstance(value[1], str):
-                        owner = owners.get(value[1])
-                        if owner:
-                            return ('id', '@' + representatives.get(owner, owner))
-                    return tuple(resolve(v) for v in value)
-                normalized = resolve(normalized)
-            elif s.language == 'ouro':
-                normalized = []
-                scope = scopes.get(s.path, {})
-                for lexeme in s.normalized:
-                    owners = scope.get(lexeme, set())
-                    if len(owners) == 1:
-                        owner = next(iter(owners))
-                        normalized.append("@" + representatives.get(owner, owner))
-                    elif owners:
-                        normalized.append("@ambiguous:" + s.path + ":" + lexeme)
-                    else:
-                        normalized.append(lexeme)
-            fingerprint = digest(normalized)
-            fingerprints[s.key] = fingerprint
-            if s.kind == "def":
-                groups[(s.language, fingerprint)].append(s.key)
-        changed = False
+        for index, (symbol, key) in enumerate(zip(symbols, symbol_keys, strict=True)):
+            snapshot = snapshots[index]
+            if snapshot is None or not changed_owners.isdisjoint(snapshot[1]):
+                snapshot = resolve_fingerprint(symbol)
+                snapshots[index] = snapshot
+            fingerprint, _dependencies = snapshot
+            fingerprints[key] = fingerprint
+            if symbol.kind == "def":
+                groups[(symbol.language, fingerprint)].append(key)
+        changed_owners = set()
         for group in groups.values():
             owner = min(representatives[key] for key in group)
             for key in group:
                 if representatives[key] != owner:
                     representatives[key] = owner
-                    changed = True
-        if not changed:
+                    changed_owners.add(key)
+        if not changed_owners:
             break
     return fingerprints
 
@@ -811,18 +899,18 @@ def fallback_findings(symbols):
                             {"line": handler.lineno, "primary_calls": calls}, "A bare exception handler silently discards every failure.",
                             "Catch the supported failure explicitly and preserve error semantics."))
         elif s.language == 'ouro':
-            for i in range(len(s.tokens) - 3):
-                if s.tokens[i] != '|' or s.tokens[i + 1] not in {'Left', 'Nothing', 'Error', 'False'}:
+            tokens = s.tokens
+            for i in range(len(tokens) - 3):
+                if tokens[i] != '|' or tokens[i + 1] not in {'Left', 'Nothing', 'Error', 'False'}:
                     continue
-                arm = s.tokens[i + 2:]
-                stop = next((j for j, t in enumerate(arm) if t in {'|', 'end'}), len(arm))
-                arm = arm[:stop]
-                if '=>' not in arm:
+                arrow = next((j for j in range(i + 2, len(tokens)) if tokens[j] in {'=>', '|', 'end'}), len(tokens))
+                if (arrow + 2 >= len(tokens) or tokens[arrow] != '=>'
+                        or tokens[arrow + 1] in {'|', 'end'} or tokens[arrow + 2] in {'|', 'end'}):
                     continue
-                body = arm[arm.index('=>') + 1:]
-                if len(body) > 1 and body[0] not in s.bindings and set(body[0].lower().split('_')) & {'legacy', 'compat', 'fallback', 'old'}:
+                alternate = tokens[arrow + 1]
+                if alternate not in s.bindings and set(alternate.lower().split('_')) & {'legacy', 'compat', 'fallback', 'old'}:
                     findings.append(make_finding('STRUCT_LEGACY_FALLBACK', [s],
-                        {'failure_constructor': s.tokens[i + 1], 'alternate_call': body[0]},
+                        {'failure_constructor': tokens[i + 1], 'alternate_call': alternate},
                         'A failed result selects a named compatibility implementation.',
                         'Propagate the failure or classify this exact compatibility boundary.'))
         elif s.language in {'c', 'h'}:
@@ -1042,11 +1130,13 @@ def orphan_findings(symbols, sources, source_refs):
 def unreachable_findings(symbols):
     findings = []
     for s in symbols:
-        if s.language == 'ouro' and any(s.tokens[i:i + 3] in (['match', 'True', 'with'], ['match', 'False', 'with'])
-                                        for i in range(len(s.tokens) - 2)):
-            findings.append(make_finding('STRUCT_UNREACHABLE_BRANCH', [s], {'condition': 'literal Boolean match'},
-                'A literal Boolean scrutinee fixes the selected branch.',
-                'Replace the match with its selected expression.'))
+        if s.language == 'ouro':
+            tokens = s.tokens
+            if any(tokens[i] == 'match' and tokens[i + 1] in ('True', 'False') and tokens[i + 2] == 'with'
+                   for i in range(len(tokens) - 2)):
+                findings.append(make_finding('STRUCT_UNREACHABLE_BRANCH', [s], {'condition': 'literal Boolean match'},
+                    'A literal Boolean scrutinee fixes the selected branch.',
+                    'Replace the match with its selected expression.'))
         if s.tree is None:
             continue
         for node in ast.walk(s.tree):
@@ -1081,6 +1171,10 @@ def classify(findings, symbols):
     return issues
 
 
+def _is_within_directory(resolved_path: Path, directory: Path) -> bool:
+    return resolved_path.is_relative_to(directory) or resolved_path.is_relative_to(directory.resolve())
+
+
 def inventory(root):
     result = subprocess.run(["git", "ls-files", "--cached", "--others", "--exclude-standard", "-z"], cwd=root,
                             stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
@@ -1091,18 +1185,20 @@ def inventory(root):
         raise ValueError("empty repository inventory")
     for path in paths:
         full = root / path
-        if full.is_symlink() or not full.is_file() or not full.resolve().is_relative_to(root.resolve()):
+        resolved = None if full.is_symlink() or not full.is_file() else full.resolve()
+        if resolved is None or not _is_within_directory(resolved, root):
             raise ValueError(f"required tracked/source input missing or unsafe: {path}")
     return paths
 
 
 def boundaries(root, paths):
     result = {}
+    known_paths = set(paths)
     generated = root / "docs/generated_artifact_hashes.sha256"
     if generated.is_file():
         for line in generated.read_text().splitlines():
             expected, path = line.split()
-            if path not in paths or hashlib.sha256((root / path).read_bytes()).hexdigest() != expected:
+            if path not in known_paths or hashlib.sha256((root / path).read_bytes()).hexdigest() != expected:
                 raise ValueError(f"generated source missing or stale: {path}")
             result[path] = {"kind": "generated-artifact", "owner": "docs/generated_artifact_hashes.sha256"}
     for manifest_path in ("tests/analyze/manifest.json", "quality/fixtures/manifest.json",
@@ -1110,23 +1206,30 @@ def boundaries(root, paths):
         file = root / manifest_path
         if not file.is_file():
             continue
-        def visit(value, file=file, manifest_path=manifest_path):
+        parent = file.parent
+
+        def visit(value, parent=parent, manifest_path=manifest_path):
             if isinstance(value, dict):
                 if "scope" in value:
-                    local = (file.parent / value['scope']).resolve()
-                    if not local.is_relative_to(file.parent.resolve()):
+                    local = (parent / value['scope']).resolve()
+                    if not _is_within_directory(local, parent):
                         raise ValueError('fixture scope escapes its harness: ' + manifest_path)
-                    scope = local.relative_to(root.resolve()).as_posix()
+                    try:
+                        relative = local.relative_to(root)
+                    except ValueError:
+                        relative = local.relative_to(root.resolve())
+                    scope = relative.as_posix()
+                    prefix = scope + "/"
                     for path in paths:
-                        if path == scope or path.startswith(scope + "/"):
+                        if path == scope or path.startswith(prefix):
                             result[path] = {"kind": "fixture-input", "owner": manifest_path}
                 if "path" in value:
                     path = value["path"]
                     if not isinstance(path, str) or not path:
                         raise ValueError('invalid fixture path: ' + manifest_path)
-                    if not (root / path).resolve().is_relative_to(file.parent.resolve()):
+                    if not _is_within_directory((root / path).resolve(), parent):
                         raise ValueError('fixture path escapes its harness: ' + manifest_path)
-                    if path not in paths:
+                    if path not in known_paths:
                         raise ValueError('required fixture missing from inventory: ' + path)
                     result[path] = {"kind": "fixture-input", "owner": manifest_path}
                 for child in value.values():
@@ -1141,7 +1244,7 @@ def boundaries(root, paths):
 
         for case in load_cases((root / lex_manifest).parent):
             path = (Path(lex_manifest).parent / case["file"]).as_posix()
-            if path not in paths:
+            if path not in known_paths:
                 raise ValueError("required lex fixture missing from inventory: " + path)
             result[path] = {"kind": "fixture-input", "owner": lex_manifest,
                             "expected_lex_error": case["error"]}
@@ -1175,10 +1278,32 @@ def encoded_symbol_names(tokens):
     return names
 
 
+def _top_level_symbol_references(symbols, tokens):
+    pending = {symbol.name for symbol in symbols}
+    exposed = set()
+    if not pending:
+        return exposed
+    spans = iter(sorted((symbol.line, symbol.end) for symbol in symbols))
+    span = next(spans, None)
+    covered_until = 0
+    # The lexer emits tokens in line order. Declaration spans may overlap.
+    for token in tokens:
+        if token.value not in pending:
+            continue
+        while span is not None and span[0] <= token.line:
+            covered_until = max(covered_until, span[1])
+            span = next(spans, None)
+        if token.line > covered_until:
+            pending.remove(token.value)
+            exposed.add(token.value)
+    return exposed
+
+
 def analyze(root, *, supplied=None):
     paths = sorted(supplied) if supplied is not None else inventory(root)
     bounds = {} if supplied is not None else boundaries(root, paths)
     symbols, file_rows, source_refs, issues, sources = [], [], collections.defaultdict(set), [], {}
+    python_bindings = {}
     for path in paths:
         suffix = Path(path).suffix
         data = supplied[path] if supplied is not None else (root / path).read_bytes()
@@ -1201,9 +1326,15 @@ def analyze(root, *, supplied=None):
                 found, tree = python_symbols(path, source)
                 comments = [(t.start[0], t.string) for t in tokenize.generate_tokens(io.StringIO(source).readline)
                             if t.type == tokenize.COMMENT]
-                strings = [n.value for n in ast.walk(tree) if isinstance(n, ast.Constant) and isinstance(n.value, str)]
-                refs = {n.id for n in ast.walk(tree) if isinstance(n, ast.Name)}
-                refs |= {n.attr for n in ast.walk(tree) if isinstance(n, ast.Attribute)}
+                strings, refs = [], set()
+                for node in ast.walk(tree):
+                    if isinstance(node, ast.Constant) and isinstance(node.value, str):
+                        strings.append(node.value)
+                    elif isinstance(node, ast.Name):
+                        refs.add(node.id)
+                    elif isinstance(node, ast.Attribute):
+                        refs.add(node.attr)
+                python_bindings[path] = _python_owner_bindings(path, tree.body)
             else:
                 found, tokens, comments = lexical_symbols(path, source)
                 strings = [t.value for t in tokens if t.value.startswith(('"', "'"))]
@@ -1212,8 +1343,9 @@ def analyze(root, *, supplied=None):
                     refs.update(encoded_symbol_names(tokens))
                 # Macro tables and top-level dispatch glue are references too;
                 # their identifiers must not be confused with declarations.
+                exposed = _top_level_symbol_references(found, tokens)
                 for s in found:
-                    if any(t.value == s.name and not any(d.line <= t.line <= d.end for d in found) for t in tokens):
+                    if s.name in exposed:
                         s.public = True
             if boundary and boundary.get("expected_lex_error"):
                 issues.append(f"{path}: negative lex fixture unexpectedly accepted")
@@ -1223,7 +1355,7 @@ def analyze(root, *, supplied=None):
             for s in found:
                 if s.name in literal_words:
                     s.public = True
-            for word in refs | set(WORD.findall("\n".join(strings))):
+            for word in refs | literal_words:
                 source_refs[word].add(path)
             # Isolated fixture programs are data consumed by a named harness,
             # not competing production ownership. They still get lexed/parsed.
@@ -1237,7 +1369,7 @@ def analyze(root, *, supplied=None):
                                   "boundary": boundary})
             else:
                 issues.append(f"{path}: incomplete structural extraction: {exc}")
-    fingerprints = owned_fingerprints(symbols, sources)
+    fingerprints = owned_fingerprints(symbols, sources, python_bindings=python_bindings)
     clones = clone_findings(symbols, fingerprints)
     by_name, by_path = symbol_index(symbols)
     findings = [*clones, *semantic_findings(symbols, clones),

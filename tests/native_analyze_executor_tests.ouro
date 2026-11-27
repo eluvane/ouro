@@ -1,0 +1,210 @@
+import "analyze/precision/assertions.ouro", "../tools/analyze/native_executor.ouro";
+
+-- Policy and transport laws do not establish native worker acceptance.
+
+def native_executor_fixture_standard : String :=
+    "ANALYZE_OK profile=standard files=1 imports=1 decls=2 refs=3 exports=1 constructors=0 modules=1 branches=0 suppressions=0 strict-diagnostics=0\nANALYZE_FACTS architecture=graph suppressions=parsed deadcode=typed-facts api_surface=baseline format=facts-only trust=effects-taint-required structured=ouro-analyze-drive\n";
+
+def native_executor_fixture_strict : String :=
+    str_replace (str_replace native_executor_fixture_standard "profile=standard" "profile=strict")
+      "format=facts-only" "format=strict-subset";
+
+def native_executor_fixture_clean : ProcResult :=
+    MkProcResult Z "ANALYZE_DRIVE files=1 findings=0 rejected=0 families=dataflow\n" "";
+
+def native_executor_fixture_found : ProcResult :=
+    MkProcResult 1
+      "tools/a.ouro:1:1: warning[OURO-DF003] dataflow/alias: message\n  hint: fix\n  witness: name\nANALYZE_DRIVE files=1 findings=1 rejected=0 families=dataflow\n" "";
+
+def native_executor_fixture_policy (base : ProcessCaptureLimits) (drive : ProcessCaptureLimits) : Bool :=
+    match native_analyze_policy_checked (NativeAnalyzePolicyOf base drive) with
+    | Left _ => False | Right _ => True end;
+
+def native_executor_fixture_limits : ProcessCaptureLimits :=
+    ProcessCaptureLimitsOf 1 1 1 bounded_native_report_stream_limit bounded_native_report_stream_limit;
+
+def native_executor_fixture_sum : Bool :=
+    match native_analyze_batch_record "local a" "standard" "1" True
+        (MkProcResult Z native_executor_fixture_standard "") native_analyze_batch_empty with
+    | Left _ => False
+    | Right first => match native_analyze_batch_record "format a" "strict" "1" False
+        (MkProcResult Z native_executor_fixture_strict "") first with
+      | Left _ => False
+      | Right formatted => match native_analyze_batch_record "local b" "standard" "1" True
+          (MkProcResult Z native_executor_fixture_standard "") formatted with
+        | Left _ => False
+        | Right locals => match native_analyze_batch_record "architecture" "strict" "2" False
+            (MkProcResult Z (str_replace native_executor_fixture_strict "files=1" "files=2") "") locals with
+          | Left _ => False
+          | Right final => match native_analyze_base_read "strict" "2" (native_analyze_batch_finish ["--strict"] final) with
+            | Left _ => False
+            | Right report => match report with | MkNativeAnalyzeBaseReport counts _ =>
+                precision_strings counts ["2", "2", "4", "6", "2", "0", "2", "0", "0", "0"]
+              end
+            end
+          end
+        end
+      end
+    end;
+
+def native_executor_fixture_base_failure : Bool :=
+    match native_analyze_batch_record "local a" "standard" "1" True
+        (MkProcResult Z "partial output\n" "") native_analyze_batch_empty with
+    | Left _ => False
+    | Right state =>
+        let result : ProcResult := native_analyze_batch_finish [] state in
+        andb(eq_nat (proc_code result) 1, andb(str_eq (proc_stdout result) "partial output\n",
+          str_eq (proc_stderr result) "ANALYZE_FAIL: local a: base worker omitted or malformed the completion report\n"))
+    end;
+
+def native_executor_fixture_drive_sum : Bool :=
+    match native_analyze_drive_record "dataflow" "tools/a.ouro" native_executor_fixture_clean native_analyze_drive_empty with
+    | Left _ => False
+    | Right first => match native_analyze_drive_record "dataflow" "tools/b.ouro" native_executor_fixture_clean first with
+      | Left _ => False
+      | Right final => match bounded_native_report_verify
+          (MkBoundedDriveExpected (Just String "2") (Just String "dataflow") (Nothing String))
+          (native_analyze_drive_finish "dataflow" final) with
+        | Left _ => False | Right _ => True end
+      end
+    end;
+
+def native_executor_fixture_drive_failure : Bool :=
+    match native_analyze_drive_record "dataflow" "tools/a.ouro" native_executor_fixture_found native_analyze_drive_empty with
+    | Left _ => False
+    | Right final => let result : ProcResult := native_analyze_drive_finish "dataflow" final in
+        andb(eq_nat (proc_code result) 1,
+          str_eq (proc_stdout result) (proc_stdout native_executor_fixture_found))
+    end;
+
+def native_executor_fixture_decimal (left : String) (right : String) (expected : String) : Bool :=
+    match native_analyze_decimal_add left right with | Nothing => False | Just actual => str_eq actual expected end;
+
+def native_analyze_executor_laws : List (Pair String Bool) :=
+  [ MkPair String Bool "native-executor/policy/independent-valid-worker-limits"
+      (native_executor_fixture_policy native_executor_fixture_limits (ProcessCaptureLimitsOf 2 3 1 7 11))
+  , MkPair String Bool "native-executor/policy/missing-deadline-refused"
+      (notb(native_executor_fixture_policy (ProcessCaptureLimitsOf Z 1 1 1 1) native_executor_fixture_limits))
+  , MkPair String Bool "native-executor/policy/infinite-deadline-refused"
+      (notb(native_executor_fixture_policy
+        (ProcessCaptureLimitsOf (sub process_capture_u32_bound 1) 1 1 1 1) native_executor_fixture_limits))
+  , MkPair String Bool "native-executor/policy/missing-memory-bound-refused"
+      (notb(native_executor_fixture_policy native_executor_fixture_limits (ProcessCaptureLimitsOf 1 Z 1 1 1)))
+  , MkPair String Bool "native-executor/policy/memory-overflow-refused"
+      (notb(native_executor_fixture_policy native_executor_fixture_limits (ProcessCaptureLimitsOf 1 (pow_nat 2 44) 1 1 1)))
+  , MkPair String Bool "native-executor/policy/unsupported-cpu-count-refused"
+      (notb(native_executor_fixture_policy native_executor_fixture_limits (ProcessCaptureLimitsOf 1 1 2 1 1)))
+  , MkPair String Bool "native-executor/policy/stdout-cap-uses-report-owner"
+      (notb(native_executor_fixture_policy
+        (ProcessCaptureLimitsOf 1 1 1 (S bounded_native_report_stream_limit) 1) native_executor_fixture_limits))
+  , MkPair String Bool "native-executor/policy/stderr-cap-uses-report-owner"
+      (notb(native_executor_fixture_policy native_executor_fixture_limits
+        (ProcessCaptureLimitsOf 1 1 1 1 (S bounded_native_report_stream_limit))))
+  , MkPair String Bool "native-executor/counts/local-only-counted-once" native_executor_fixture_sum
+  , MkPair String Bool "native-executor/base/malformed-report-is-failure" native_executor_fixture_base_failure
+  , MkPair String Bool "native-executor/counts/decimal-carry"
+      (native_executor_fixture_decimal "999999999999999999999999999" "1" "1000000000000000000000000000")
+  , MkPair String Bool "native-executor/counts/unequal-widths"
+      (andb(native_executor_fixture_decimal "1" "1000" "1001", native_executor_fixture_decimal "1000" "1" "1001"))
+  , MkPair String Bool "native-executor/counts/leading-zero-refused"
+      (match native_analyze_decimal_add "01" "2" with | Nothing => True | Just _ => False end)
+  , MkPair String Bool "native-executor/counts/missing-field-refused"
+      (match native_analyze_counts_add ["0"] native_analyze_counts_zero with | Nothing => True | Just _ => False end)
+  , MkPair String Bool "native-executor/options/baseline-value-survives-strict-filter"
+      (precision_strings (native_analyze_without_flag "--strict" ["--strict", "--api-baseline", "--strict"])
+        ["--api-baseline", "--strict"])
+  , MkPair String Bool "native-executor/options/baseline-value-does-not-request-full-text"
+      (notb(native_analyze_full_text ["--api-baseline", "--enable-format"]))
+  , MkPair String Bool "native-executor/options/format-preserves-fixture-selection"
+      (precision_strings (native_analyze_format_flags ["--strict", "--include-fixtures"])
+        ["--strict", "--include-fixtures"])
+  , MkPair String Bool "native-executor/options/preparation-retains-format-and-baseline-words"
+      (match native_analyze_prepare_options ["--strict", "--api-baseline", "--enable-format", "--include-fixtures"] with
+       | NativeAnalyzePrepareOptionsOf local full_text format =>
+           andb (precision_strings local ["--api-baseline", "--enable-format", "--include-fixtures"])
+             (andb (notb full_text) (match format with
+              | Nothing => False
+              | Just words => precision_strings words ["--strict", "--include-fixtures"]
+              end))
+       end)
+  , MkPair String Bool "native-executor/options/preparation-skips-format-for-literal-strict"
+      (match native_analyze_prepare_options ["--api-baseline", "--strict", "--enable-all"] with
+       | NativeAnalyzePrepareOptionsOf local full_text format =>
+           andb (precision_strings local ["--api-baseline", "--strict", "--enable-all"])
+             (andb full_text (match format with | Nothing => True | Just _ => False end))
+       end)
+  , MkPair String Bool "native-executor/options/dashed-values-render-for-raw-base"
+      (precision_strings (native_analyze_base_words ["--scope", "--literal.ouro", "--api-baseline", "--literal.tsv", "--strict"])
+        ["--scope=--literal.ouro", "--api-baseline=--literal.tsv", "--strict"])
+  , MkPair String Bool "native-executor/baseline/local-and-format-shards-are-distinct"
+      (let workspace : NativeAnalyzeWorkspace := MkNativeAnalyzeWorkspace "C:/scratch" "C:/scratch/owned" "C:/scratch/owned.dir" in
+        andb(str_eq (native_analyze_workspace_baseline_relative workspace SkeletonLocal "std/io.ouro")
+            "api-baseline/mode-local/std/io.ouro.tsv",
+          str_eq (native_analyze_workspace_baseline_relative workspace SkeletonFormat "std/io.ouro")
+            "api-baseline/format/std/io.ouro.tsv"))
+  , MkPair String Bool "native-executor/workspace/validates-names-and-rejects-case-aliases"
+      (all Bool (fun (check : Bool) => check)
+        [ native_analyze_workspace_names_safe ["Z.ouro", "a.ouro", "雪.ouro"]
+        , notb(native_analyze_workspace_names_safe ["Z.ouro", "a.ouro", "z.ouro"])
+        , notb(native_analyze_workspace_names_safe ["valid.ouro", "COM¹.log"])
+        , notb(native_analyze_workspace_names_safe ["valid.ouro", str_of_codes [97, 0, 98]])
+        , native_analyze_workspace_contains_name "z.ouro" ["a.ouro", "Z.ouro"]
+        , notb(native_analyze_workspace_contains_name "a" ["a.ouro", "Z.ouro"])
+        ])
+  , MkPair String Bool "native-executor/workspace/staging-path-component-and-depth-limits"
+      (let deepest : String := str_join "/" (replicate String "dir" 128) in
+        all Bool (fun (check : Bool) => check)
+          [ native_analyze_workspace_relative "format/std/雪.ouro"
+          , native_analyze_workspace_relative deepest
+          , notb(native_analyze_workspace_relative (str_concat deepest "/file"))
+          , notb(native_analyze_workspace_relative "format//a.ouro")
+          , notb(native_analyze_workspace_relative "format/COM1/a.ouro")
+          ])
+  , MkPair String Bool "native-executor/drive/two-files-one-banner" native_executor_fixture_drive_sum
+  , MkPair String Bool "native-executor/drive/findings-retain-nonzero-verdict" native_executor_fixture_drive_failure
+  , MkPair String Bool "native-executor/drive/wrong-source-refused"
+      (match native_analyze_drive_record "dataflow" "tools/b.ouro" native_executor_fixture_found native_analyze_drive_empty with
+       | Left _ => True | Right _ => False end)
+  , MkPair String Bool "native-executor/base/unreported-output-refused"
+      (match native_analyze_base_read "standard" "1"
+          (MkProcResult Z (str_concat "unreported\n" native_executor_fixture_standard) "") with
+       | Left _ => True | Right _ => False end)
+  , MkPair String Bool "native-executor/base/missing-facts-refused"
+      (match native_analyze_base_read "standard" "1"
+          (MkProcResult Z "ANALYZE_OK profile=standard files=1 imports=1 decls=2 refs=3 exports=1 constructors=0 modules=1 branches=0 suppressions=0 strict-diagnostics=0\n" "") with
+       | Left _ => True | Right _ => False end)
+  , MkPair String Bool "native-executor/base/dump-preamble-keeps-completion"
+      (match native_analyze_base_read "standard" "1"
+          (MkProcResult Z (str_concat "FACT definition tools/a.ouro:1:1 name=value kind=def export=1 entry=0 ns=tools\nFACT_SUMMARY decls=2 defs=1 constructors=0 modules=1 branches=0 exports=1 refs=3 typed_asts=0\n"
+            native_executor_fixture_standard) "") with
+       | Left _ => False | Right _ => True end)
+  , MkPair String Bool "native-executor/base/strict-opt-in-facts-match-format-pass"
+      (match native_analyze_base_read "strict" "1"
+          (native_analyze_batch_finish ["--strict", "--enable-format"]
+            (MkNativeAnalyzeBatchState ["1", "1", "2", "3", "1", "0", "1", "0", "0", "0"]
+              (Just String "ANALYZE_FACTS architecture=graph suppressions=parsed deadcode=typed-facts api_surface=baseline format=opt-in trust=effects-taint-required structured=ouro-analyze-drive")
+              "" "" False)) with
+       | Left _ => False | Right _ => True end)
+  , MkPair String Bool "native-executor/merge/direct-input-error-code-retained"
+      (eq_nat (proc_code (native_analyze_merge_results (MkProcResult 2 "" "invalid arguments\n")
+        (Nothing ProcResult))) 2)
+  , MkPair String Bool "native-executor/merge/incomplete-success-line-hidden"
+      (str_eq (native_analyze_failure_output "diagnostic\nANALYZE_OK profile=standard") "diagnostic\n")
+  , MkPair String Bool "native-executor/merge/findings-hide-global-success"
+      (let result : ProcResult := native_analyze_merge_results (MkProcResult Z native_executor_fixture_standard "")
+          (Just ProcResult native_executor_fixture_found) in
+        andb(eq_nat (proc_code result) 1, str_eq (proc_stdout result) (proc_stdout native_executor_fixture_found)))
+  , MkPair String Bool "native-executor/cleanup/worker-diagnostics-retained"
+      (let (MkPair output errors) := native_analyze_executor_streams
+          (NativeAnalyzeCleanupFailure (AnalyzeWorkspaceRejected "cleanup" "owned")
+            (Nothing NativeAnalyzeExecutorError) (Just ProcResult (MkProcResult 1 "diagnostic\n" "reason\n"))) in
+        andb(str_eq output "diagnostic\n", str_eq errors "reason\n"))
+  , MkPair String Bool "native-executor/capture/timeout-is-typed-failure"
+      (let (MkPair output errors) := native_analyze_executor_streams
+          (NativeAnalyzeProcessFailure "base" (NativeAnalyzeDirectoryFailure
+            (ProcessDirectoryCapture (ProcessCaptureTimedOut 1 "partial\n" "timeout\n")))) in
+        andb(str_eq output "partial\n", str_eq errors "timeout\n"))
+  ];
+
+-- @entry main
+def main : IO Unit := precision_run "native-analyze-executor" native_analyze_executor_laws;

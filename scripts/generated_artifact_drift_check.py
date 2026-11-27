@@ -127,8 +127,10 @@ def current_reference(seed: Path, cfg) -> tuple[dict[str, Path], dict[str, Any],
             {name: sha256_file(path) for name, path in evidence.items()})
 
 
-def promotion_bytes(path: Path) -> bytes:
-    return path.read_text(encoding="utf-8", errors="surrogateescape").encode("utf-8", errors="surrogateescape")
+def promotion_bytes(raw: bytes) -> bytes:
+    if b"\r" not in raw:
+        return raw
+    return raw.replace(b"\r\n", b"\n").replace(b"\r", b"\n")
 
 
 def frontend_regen_check(
@@ -160,18 +162,20 @@ def frontend_regen_check(
         return issues, data
     expected = reference["driver_u.c"]
     raw = out.read_bytes()
-    promoted = promotion_bytes(out)
+    promoted = promotion_bytes(raw)
     reference_bytes = expected.read_bytes()
-    normalized_reference = promotion_bytes(expected)
+    normalized_reference = promotion_bytes(reference_bytes)
     out_hash = hashlib.sha256(raw).hexdigest()
-    promoted_hash = hashlib.sha256(promoted).hexdigest()
+    promoted_hash = out_hash if promoted is raw else hashlib.sha256(promoted).hexdigest()
     reference_hash = hashlib.sha256(reference_bytes).hexdigest()
+    normalized_reference_hash = (reference_hash if normalized_reference is reference_bytes
+                                 else hashlib.sha256(normalized_reference).hexdigest())
     data.update({
         "regenerated_sha256": out_hash,
         "promotion_normalized_sha256": promoted_hash,
         "reference": rel(expected),
         "reference_sha256": reference_hash,
-        "reference_promotion_normalized_sha256": hashlib.sha256(normalized_reference).hexdigest(),
+        "reference_promotion_normalized_sha256": normalized_reference_hash,
         "bytes": len(raw),
         "promotion_normalized_bytes": len(promoted),
     })
@@ -236,12 +240,14 @@ def stage_loop_check(
             continue
         raw = regenerated.read_bytes()
         # Promotion uses universal-newline text reads and an LF binary writer.
-        promoted = promotion_bytes(regenerated)
+        promoted = promotion_bytes(raw)
         reference_bytes = expected.read_bytes()
-        normalized_reference = promotion_bytes(expected)
+        normalized_reference = promotion_bytes(reference_bytes)
         rh = hashlib.sha256(raw).hexdigest()
-        ph = hashlib.sha256(promoted).hexdigest()
+        ph = rh if promoted is raw else hashlib.sha256(promoted).hexdigest()
         reference_hash = hashlib.sha256(reference_bytes).hexdigest()
+        normalized_reference_hash = (reference_hash if normalized_reference is reference_bytes
+                                     else hashlib.sha256(normalized_reference).hexdigest())
         same = promoted == normalized_reference
         comparisons.append({
             "artifact": name,
@@ -250,7 +256,7 @@ def stage_loop_check(
             "regenerated_sha256": rh,
             "promotion_normalized_sha256": ph,
             "reference_sha256": reference_hash,
-            "reference_promotion_normalized_sha256": hashlib.sha256(normalized_reference).hexdigest(),
+            "reference_promotion_normalized_sha256": normalized_reference_hash,
             "promotion_normalized": raw != promoted,
             "pass": same,
         })

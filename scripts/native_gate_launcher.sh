@@ -1,6 +1,5 @@
 #!/usr/bin/env sh
-# Shared startup boundary for the public Ouro-native gate launchers.
-# Sourced with fixed tool metadata; argument forwarding and exec remain here.
+# Both native gate launchers source this file with fixed tool metadata.
 
 set -eu
 if ! ulimit -s unlimited 2>/dev/null; then

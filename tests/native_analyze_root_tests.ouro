@@ -1,0 +1,237 @@
+import "analyze/precision/assertions.ouro", "../tools/analyze/native_request.ouro";
+
+def native_root_fixture_error_tag (error : NativeAnalyzeRootError) : Nat :=
+    match error with
+    | NativeAnalyzeRootExplicit _ => 0 | NativeAnalyzeRootFilesystem _ _ => 1
+    | NativeAnalyzeRootDirectory _ => 2 | NativeAnalyzeRootResolve _ => 3
+    | NativeAnalyzeRootCanonical _ => 4 | NativeAnalyzeRootMarker _ => 5
+    | NativeAnalyzeRootUnavailable _ => 6 | NativeAnalyzeRootMissingSeal _ => 7
+    | NativeAnalyzeRootTraversalLimit _ _ => 8 | NativeAnalyzeRootCycle _ => 9
+    | NativeAnalyzeRootParent _ _ => 10
+    end;
+
+def native_root_fixture_result (expected : Either NativeAnalyzeRootError String)
+    (actual : Either NativeAnalyzeRootError String) : Bool :=
+    match expected with
+    | Right path => match actual with | Left _ => False | Right other => str_eq path other end
+    | Left error => match actual with
+      | Right _ => False
+      | Left other => andb(eq_nat (native_root_fixture_error_tag error) (native_root_fixture_error_tag other),
+          str_eq (native_analyze_root_error_message error) (native_analyze_root_error_message other))
+      end
+    end;
+
+def native_root_fixture_inspect (markers : List String)
+    (blocked : Maybe (Pair String NativeAnalyzeRootError)) (directory : String)
+    : IO (Either NativeAnalyzeRootError Bool) :=
+    io_pure (Either NativeAnalyzeRootError Bool) (match blocked with
+      | Nothing => Right NativeAnalyzeRootError Bool (elem String str_eq directory markers)
+      | Just entry => match entry with | MkPair path error => if str_eq directory path then
+          Left NativeAnalyzeRootError Bool error else Right NativeAnalyzeRootError Bool (elem String str_eq directory markers)
+        end
+      end);
+
+def native_root_fixture_parent (edges : List (Pair String String)) (directory : String)
+    : IO (Either NativeAnalyzeRootError String) :=
+    io_pure (Either NativeAnalyzeRootError String)
+      (match find (Pair String String) (fun (edge : Pair String String) =>
+          match edge with | MkPair child _ => str_eq child directory end) edges with
+       | Nothing => Left NativeAnalyzeRootError String (NativeAnalyzeRootResolve (native_analyze_root_parent_path directory))
+       | Just edge => match edge with | MkPair _ parent => Right NativeAnalyzeRootError String parent end
+       end);
+
+def native_root_fixture_edges : List (Pair String String) :=
+    [ MkPair String String "C:/repo/tools/analyze" "C:/repo/tools"
+    , MkPair String String "C:/repo/tools" "C:/repo"
+    , MkPair String String "C:/repo" "C:/"
+    , MkPair String String "//server/share/repo/tools" "//server/share/repo"
+    , MkPair String String "//server/share/repo" "//server/share"
+    , MkPair String String "//?/UNC/server/share/tools" "//?/UNC/server/share"
+    ];
+
+def native_root_fixture_search (fuel : Nat) (caller : String) (markers : List String)
+    (edges : List (Pair String String)) (blocked : Maybe (Pair String NativeAnalyzeRootError))
+    (expected : Either NativeAnalyzeRootError String) : IO Bool :=
+    do let! result := native_analyze_root_search_with fuel caller
+         (native_root_fixture_inspect markers blocked) (native_root_fixture_parent edges);
+       io_pure Bool (native_root_fixture_result expected result);
+
+def native_root_fixture_explicit (environment : Maybe String)
+    (resolved : Either QualityInputError String) (expected : Either NativeAnalyzeRootError String) : IO Bool :=
+    do let! result := native_analyze_repo_root_with environment "C:/repo/tools"
+         (io_pure (Either QualityInputError String) resolved)
+         (fun (directory : String) => io_pure (Either NativeAnalyzeRootError Bool)
+           (Left NativeAnalyzeRootError Bool (NativeAnalyzeRootUnavailable directory)))
+         (native_root_fixture_parent []);
+       io_pure Bool (native_root_fixture_result expected result);
+
+def native_root_fixture_absent_explicit : IO Bool :=
+    do let! result := native_analyze_repo_root_with (Nothing String) "C:/repo/tools"
+         (io_pure (Either QualityInputError String) (Left QualityInputError String (QualityInvalidInput "unexpected explicit root owner")))
+         (native_root_fixture_inspect ["C:/repo/tools"] (Nothing (Pair String NativeAnalyzeRootError)))
+         (native_root_fixture_parent []);
+       io_pure Bool (native_root_fixture_result (Right NativeAnalyzeRootError String "C:/repo/tools") result);
+
+def native_root_fixture_absence (names : Either FsError (List String))
+    (expected : Either NativeAnalyzeRootError String) : Bool :=
+    native_root_fixture_result expected
+      (match native_analyze_root_absence_checked "C:/repo/tools" names with
+       | Left error => Left NativeAnalyzeRootError String error
+       | Right present => Right NativeAnalyzeRootError String (if present then "present" else "absent")
+       end);
+
+def native_root_fixture_wrong_marker (kind : FsPathKind) : Bool :=
+    match native_analyze_root_marker_checked "C:/repo/tools" (Right FsError FsPathKind kind) with
+    | Right _ => False
+    | Left error => native_root_fixture_result
+        (Left NativeAnalyzeRootError String (NativeAnalyzeRootMarker "C:/repo/tools/Ouro.seal"))
+        (Left NativeAnalyzeRootError String error)
+    end;
+
+def native_root_fixture_paths (edges : List (Pair String String)) : Bool :=
+    all (Pair String String) (fun (edge : Pair String String) => match edge with | MkPair child parent =>
+        native_root_fixture_result (Right NativeAnalyzeRootError String parent)
+          (native_analyze_root_parent_checked child [] parent) end) edges;
+
+def native_analyze_root_laws : List (Pair String (IO Bool)) :=
+  [ MkPair String (IO Bool) "native-root/search/nested-caller-reaches-project"
+      (native_root_fixture_search 3 "C:/repo/tools/analyze" ["C:/repo"] native_root_fixture_edges
+        (Nothing (Pair String NativeAnalyzeRootError)) (Right NativeAnalyzeRootError String "C:/repo"))
+  , MkPair String (IO Bool) "native-root/search/nearest-nested-project-wins"
+      (native_root_fixture_search 3 "C:/repo/tools/analyze" ["C:/repo/tools", "C:/repo"] native_root_fixture_edges
+        (Nothing (Pair String NativeAnalyzeRootError)) (Right NativeAnalyzeRootError String "C:/repo/tools"))
+  , MkPair String (IO Bool) "native-root/search/caller-marker-needs-no-parent"
+      (native_root_fixture_search 1 "C:/repo/tools" ["C:/repo/tools"] []
+        (Nothing (Pair String NativeAnalyzeRootError)) (Right NativeAnalyzeRootError String "C:/repo/tools"))
+  , MkPair String (IO Bool) "native-root/search/exact-fuel-completion"
+      (native_root_fixture_search 2 "C:/repo/tools" ["C:/repo"] native_root_fixture_edges
+        (Nothing (Pair String NativeAnalyzeRootError)) (Right NativeAnalyzeRootError String "C:/repo"))
+  , MkPair String (IO Bool) "native-root/search/exhaustion-does-not-probe-next-marker"
+      (native_root_fixture_search 1 "C:/repo/tools" ["C:/repo"] []
+        (Just (Pair String NativeAnalyzeRootError) (MkPair String NativeAnalyzeRootError "C:/repo" (NativeAnalyzeRootUnavailable "unexpected probe")))
+        (Left NativeAnalyzeRootError String (NativeAnalyzeRootTraversalLimit "C:/repo/tools" 1)))
+  , MkPair String (IO Bool) "native-root/search/zero-fuel-refuses-caller-marker"
+      (native_root_fixture_search 0 "C:/repo/tools" ["C:/repo/tools"] []
+        (Nothing (Pair String NativeAnalyzeRootError))
+        (Left NativeAnalyzeRootError String (NativeAnalyzeRootTraversalLimit "C:/repo/tools" 0)))
+  , MkPair String (IO Bool) "native-root/search/drive-root-without-seal"
+      (native_root_fixture_search 1 "C:/" [] [] (Nothing (Pair String NativeAnalyzeRootError))
+        (Left NativeAnalyzeRootError String (NativeAnalyzeRootMissingSeal "C:/")))
+  , MkPair String (IO Bool) "native-root/search/no-seal-through-parent-chain"
+      (native_root_fixture_search 3 "C:/repo/tools" [] native_root_fixture_edges
+        (Nothing (Pair String NativeAnalyzeRootError))
+        (Left NativeAnalyzeRootError String (NativeAnalyzeRootMissingSeal "C:/repo/tools")))
+  , MkPair String (IO Bool) "native-root/search/share-root-without-seal"
+      (native_root_fixture_search 1 "//server/share" [] [] (Nothing (Pair String NativeAnalyzeRootError))
+        (Left NativeAnalyzeRootError String (NativeAnalyzeRootMissingSeal "//server/share")))
+  , MkPair String (IO Bool) "native-root/search/UNC-parent-root-retains-prefix"
+      (native_root_fixture_search 3 "//server/share/repo/tools" ["//server/share"] native_root_fixture_edges
+        (Nothing (Pair String NativeAnalyzeRootError)) (Right NativeAnalyzeRootError String "//server/share"))
+  , MkPair String (IO Bool) "native-root/search/extended-UNC-parent-root"
+      (native_root_fixture_search 2 "//?/UNC/server/share/tools" ["//?/UNC/server/share"] native_root_fixture_edges
+        (Nothing (Pair String NativeAnalyzeRootError)) (Right NativeAnalyzeRootError String "//?/UNC/server/share"))
+  , MkPair String (IO Bool) "native-root/search/slash-root-does-not-query-parent"
+      (native_root_fixture_search 1 "/" [] [] (Nothing (Pair String NativeAnalyzeRootError))
+        (Left NativeAnalyzeRootError String (NativeAnalyzeRootMissingSeal "/")))
+  , MkPair String (IO Bool) "native-root/search/traversal-error-does-not-ascend"
+      (native_root_fixture_search 3 "C:/repo/tools" ["C:/repo"] native_root_fixture_edges
+        (Just (Pair String NativeAnalyzeRootError) (MkPair String NativeAnalyzeRootError "C:/repo/tools"
+          (NativeAnalyzeRootFilesystem "C:/repo/tools" (FsOperationFailed "list" "C:/repo/tools"))))
+        (Left NativeAnalyzeRootError String (NativeAnalyzeRootFilesystem "C:/repo/tools" (FsOperationFailed "list" "C:/repo/tools"))))
+  , MkPair String (IO Bool) "native-root/search/parent-query-error-is-preserved"
+      (native_root_fixture_search 2 "C:/repo/tools" [] [] (Nothing (Pair String NativeAnalyzeRootError))
+        (Left NativeAnalyzeRootError String (NativeAnalyzeRootResolve "C:/repo/tools/..")))
+  , MkPair String (IO Bool) "native-root/search/self-parent-is-a-cycle"
+      (native_root_fixture_search 3 "C:/repo/tools" [] [MkPair String String "C:/repo/tools" "C:/repo/tools"]
+        (Nothing (Pair String NativeAnalyzeRootError))
+        (Left NativeAnalyzeRootError String (NativeAnalyzeRootCycle "C:/repo/tools")))
+  , MkPair String (IO Bool) "native-root/search/repeated-parent-is-a-cycle"
+      (native_root_fixture_search 3 "C:/repo/tools" [] [MkPair String String "C:/repo/tools" "C:/repo", MkPair String String "C:/repo" "C:/repo/tools"]
+        (Nothing (Pair String NativeAnalyzeRootError))
+        (Left NativeAnalyzeRootError String (NativeAnalyzeRootCycle "C:/repo/tools")))
+  , MkPair String (IO Bool) "native-root/search/relative-caller-is-rejected"
+      (native_root_fixture_search 1 "C:tools" [] [] (Nothing (Pair String NativeAnalyzeRootError))
+        (Left NativeAnalyzeRootError String (NativeAnalyzeRootCanonical "C:tools")))
+  , MkPair String (IO Bool) "native-root/search/duplicated-prefix-separators-refused"
+      (do let! rejected := native_root_fixture_search 1 "///server/share" [] []
+            (Just (Pair String NativeAnalyzeRootError) (MkPair String NativeAnalyzeRootError "///server/share"
+              (NativeAnalyzeRootUnavailable "unexpected marker probe")))
+            (Left NativeAnalyzeRootError String (NativeAnalyzeRootCanonical "///server/share"));
+          io_pure Bool (andb(rejected, andb(notb(native_analyze_root_boundary "///server/share"),
+            all String (fun (path : String) => notb(native_analyze_root_path_valid path)) ["///server/share", "C://repo"]))))
+  , MkPair String (IO Bool) "native-root/search/extended-drive-relative-caller-is-rejected"
+      (do let! rejected := native_root_fixture_search 1 "//?/C:relative" [] []
+            (Just (Pair String NativeAnalyzeRootError) (MkPair String NativeAnalyzeRootError "//?/C:relative"
+              (NativeAnalyzeRootUnavailable "unexpected marker probe")))
+            (Left NativeAnalyzeRootError String (NativeAnalyzeRootCanonical "//?/C:relative"));
+          io_pure Bool (andb(rejected, andb(notb(native_analyze_root_path_valid "//?/C:relative"),
+            notb(native_analyze_root_boundary "//?/C:relative")))))
+  , MkPair String (IO Bool) "native-root/explicit/owner-result-bypasses-marker-search"
+      (native_root_fixture_explicit (Just String "../chosen") (Right QualityInputError String "D:/chosen")
+        (Right NativeAnalyzeRootError String "D:/chosen"))
+  , MkPair String (IO Bool) "native-root/explicit/invalid-does-not-fall-back"
+      (native_root_fixture_explicit (Just String "missing") (Left QualityInputError String (QualityInvalidInput "invalid explicit root"))
+        (Left NativeAnalyzeRootError String (NativeAnalyzeRootExplicit (QualityInvalidInput "invalid explicit root"))))
+  , MkPair String (IO Bool) "native-root/explicit/empty-remains-explicit"
+      (native_root_fixture_explicit (Just String "") (Left QualityInputError String (QualityInvalidInput "empty explicit root"))
+        (Left NativeAnalyzeRootError String (NativeAnalyzeRootExplicit (QualityInvalidInput "empty explicit root"))))
+  , MkPair String (IO Bool) "native-root/explicit/absent-does-not-call-explicit-owner" native_root_fixture_absent_explicit
+  , MkPair String (IO Bool) "native-root/marker/regular-file-is-found"
+      (io_pure Bool (match native_analyze_root_marker_checked "C:/repo/tools" (Right FsError FsPathKind FsRegularFile) with
+        | Left _ => False | Right found => match found with | Nothing => False | Just present => present end end))
+  , MkPair String (IO Bool) "native-root/marker/unavailable-needs-absence-evidence"
+      (io_pure Bool (match native_analyze_root_marker_checked "C:/repo/tools" (Right FsError FsPathKind FsPathUnavailable) with
+        | Left _ => False | Right found => match found with | Nothing => True | Just _ => False end end))
+  , MkPair String (IO Bool) "native-root/marker/directory-and-unsafe-entry-refused"
+      (io_pure Bool (all FsPathKind native_root_fixture_wrong_marker [FsDirectory, FsUnsafeEntry]))
+  , MkPair String (IO Bool) "native-root/marker/checked-empty-list-establishes-absence"
+      (io_pure Bool (native_root_fixture_absence (Right FsError (List String) []) (Right NativeAnalyzeRootError String "absent")))
+  , MkPair String (IO Bool) "native-root/marker/listed-unavailable-marker-refused"
+      (io_pure Bool (native_root_fixture_absence (Right FsError (List String) ["Ouro.seal"])
+        (Left NativeAnalyzeRootError String (NativeAnalyzeRootUnavailable "C:/repo/tools/Ouro.seal"))))
+  , MkPair String (IO Bool) "native-root/marker/case-alias-unavailable-refused"
+      (io_pure Bool (native_root_fixture_absence (Right FsError (List String) ["oUrO.sEaL"])
+        (Left NativeAnalyzeRootError String (NativeAnalyzeRootUnavailable "C:/repo/tools/Ouro.seal"))))
+  , MkPair String (IO Bool) "native-root/marker/list-error-is-preserved"
+      (io_pure Bool (native_root_fixture_absence (Left FsError (List String) (FsOperationFailed "list" "C:/repo/tools"))
+        (Left NativeAnalyzeRootError String (NativeAnalyzeRootFilesystem "C:/repo/tools" (FsOperationFailed "list" "C:/repo/tools")))))
+  , MkPair String (IO Bool) "native-root/path/volume-share-and-slash-boundaries"
+      (io_pure Bool (all String native_analyze_root_boundary ["C:/", "/", "//server/share", "//server/share/",
+        "//?/UNC/server/share", "//?/C:/", "//?/Volume{abc}/"]))
+  , MkPair String (IO Bool) "native-root/path/incomplete-relative-and-dot-paths-refused"
+      (io_pure Bool (all String (fun (path : String) => notb(native_analyze_root_path_valid path))
+        ["", "C:", "C:tools", "//", "//server", "//?/UNC/server", "C:/repo/..", "C:/repo//tools", "//./C:/repo"]))
+  , MkPair String (IO Bool) "native-root/path/parent-root-preserves-prefix"
+      (io_pure Bool (native_root_fixture_paths [MkPair String String "C:/repo" "C:/",
+        MkPair String String "//server/share/repo" "//server/share", MkPair String String "//?/UNC/server/share/tools" "//?/UNC/server/share",
+        MkPair String String "/repo" "/", MkPair String String "C:/repo 雪/tools 😀" "C:/repo 雪"]))
+  , MkPair String (IO Bool) "native-root/path/cross-volume-parent-refused"
+      (io_pure Bool (native_root_fixture_result (Left NativeAnalyzeRootError String (NativeAnalyzeRootParent "C:/repo/tools" "D:/repo"))
+        (native_analyze_root_parent_checked "C:/repo/tools" [] "D:/repo")))
+  , MkPair String (IO Bool) "native-root/path/skipped-parent-refused"
+      (io_pure Bool (native_root_fixture_result (Left NativeAnalyzeRootError String (NativeAnalyzeRootParent "C:/repo/tools" "C:/"))
+        (native_analyze_root_parent_checked "C:/repo/tools" [] "C:/")))
+  , MkPair String (IO Bool) "native-root/path/case-alias-parent-cycle-refused"
+      (io_pure Bool (native_root_fixture_result (Left NativeAnalyzeRootError String (NativeAnalyzeRootCycle "c:/REPO/TOOLS"))
+        (native_analyze_root_parent_checked "C:/repo/tools" [] "c:/REPO/TOOLS")))
+  , MkPair String (IO Bool) "native-root/contract/finite-128-directory-limit"
+      (io_pure Bool (eq_nat native_analyze_root_search_limit 128))
+  , MkPair String (IO Bool) "native-root/contract/scope-and-baseline-remain-caller-relative"
+      (io_pure Bool (match native_analyze_parse ["--scope", "../std/args.ouro", "--api-baseline", "../quality/api_surface.tsv"] with
+        | Left _ => False
+        | Right request => andb(precision_strings (native_analyze_request_scopes request) ["../std/args.ouro"],
+            precision_strings (native_analyze_rebase_flags "C:/repo/tools" (native_analyze_request_flags request))
+              ["--api-baseline", "C:/repo/tools/../quality/api_surface.tsv"])
+        end))
+  ];
+
+def native_root_fixture_run (rev : List (Pair String Bool)) (law : Pair String (IO Bool))
+    : IO (List (Pair String Bool)) :=
+    match law with | MkPair name operation => do let! passed := operation;
+        io_pure (List (Pair String Bool)) (Cons (Pair String Bool) (MkPair String Bool name passed) rev)
+    end;
+
+-- @entry main
+def main : IO Unit :=
+    do let! rows := io_fold (Pair String (IO Bool)) (List (Pair String Bool)) native_root_fixture_run [] native_analyze_root_laws;
+       precision_run "native-analyze-root" (reverse_lin (Pair String Bool) rows);

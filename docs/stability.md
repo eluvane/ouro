@@ -1,8 +1,7 @@
 # Stability and compatibility
 
-Ouro is pre-1.0 research software. The project is still refining the language,
-runtime, package model, tooling, and bootstrap path, so compatibility is
-narrower than it will be for a stable release.
+Ouro is pre-1.0 research software. Check these compatibility rules before
+upgrading code, package files, or tool automation.
 
 ## Versioning
 
@@ -20,7 +19,7 @@ change also needs an RFC.
 | Kernel/core acceptance | Changes are deliberate, tested against valid and invalid corpora, and documented with the trust boundary. |
 | Surface syntax and semantics | May evolve; examples, diagnostics, formatter behavior, and docs move with the change. |
 | Standard library | Module names and signatures may change; generated API pages and samples are updated together. |
-| CLI and tools | Commands may evolve, but documented commands are checked by repository gates. |
+| CLI and tools | Commands may evolve. The [focused validation suites](ci.md#validation-matrix) cover tool behavior. The [documentation gate](ci.md#documentation-and-repository-checks) covers repository paths, links, and selected examples. |
 | Diagnostic codes | Stable codes are preferred within a release line; replacements are recorded when a code changes. |
 | Package files | `Ouro.seal` and `Ouro.lock` are experimental and may require migration. |
 | Core artifact schema | A breaking encoding receives a new version identifier rather than silent reinterpretation. |
@@ -28,10 +27,9 @@ change also needs an RFC.
 
 ## What counts as breaking
 
-A change is breaking when existing Ouro code or automation can be accepted,
-rejected, evaluated, imported, packaged, or invoked differently. That includes
-the surfaces in the table above, including diagnostic codes and trusted
-components.
+A change is breaking when it alters how existing code or automation is
+accepted, evaluated, imported, packaged, or invoked. Diagnostic codes and
+trusted components are also part of this policy.
 
 ## Experimental areas
 
@@ -45,14 +43,20 @@ The following areas are especially likely to change before 1.0:
 - self-hosting and bootstrap artifacts;
 - generated-development and synthesis interfaces.
 
-Import aliases identify the directly imported file. If a new import makes a
-bare name ambiguous in an aliased graph, qualify the use with an alias. A
-plain-only graph still rejects duplicate declarations. Code that used one alias
-to reach another file's transitive declaration needs a direct import of that
-file. Scoped local opens and private declarations are supported; selective
-imports and visibility remain pre-1.0 surfaces; see [module syntax](syntax.md#modules-and-imports).
-`private` is now a reserved declaration modifier; rename an existing binder or
-declaration spelled `private` before upgrading.
+## Import migration
+
+An alias identifies the file named in its import. If older code used an
+alias to reach a transitive declaration, import the declaring file directly
+and use its alias. Qualify a bare name that becomes ambiguous after adding
+an import to an aliased graph. A graph of plain imports still rejects
+colliding public declarations.
+
+The compiler reserves `private` as a declaration modifier. Rename any binder
+or declaration named `private` in older code before upgrading. Scoped local
+opens and private declarations are supported. Selective imports and
+visibility remain pre-1.0 surfaces. The [module syntax reference](syntax.md#modules-and-imports)
+describes supported forms. [RFC 0004](rfc/0004-module-identity.md) remains
+proposed.
 
 ## Assurance is separate from compatibility
 

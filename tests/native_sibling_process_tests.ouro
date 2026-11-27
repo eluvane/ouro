@@ -1,6 +1,8 @@
 -- Pure subprocess routing and LSP/package verdict regression laws.
 import "analyze/precision/assertions.ouro",
-  "../tools/lsp_process_model.ouro";
+  "../tools/lsp_process_model.ouro",
+  "../tools/ci_gate/native_host_bound_model.ouro",
+  "../tools/repo_gate/report.ouro";
 
 def sibling_test_right (status : Nat) (output : String) (error : String) : Either NativeSiblingError ProcResult :=
     Right NativeSiblingError ProcResult (MkProcResult status output error);
@@ -13,14 +15,35 @@ def sibling_test_command (image : String) (name : String) (arguments : List Stri
         (list_eq String str_eq (command_args command) expected)
     end;
 
+def sibling_test_checked_command (image : String) (arguments : List String)
+    (program : String) : Bool :=
+    match native_sibling_command_checked (Right ExecutablePathError String image)
+        "ouro-native-build.exe" arguments with
+    | Left _ => False
+    | Right command => andb (str_eq(command_program command, program))
+        (list_eq String str_eq (command_args command) arguments)
+    end;
+
+def sibling_test_checked_image_error (cause : ExecutablePathError) : Bool :=
+    match native_sibling_command_checked (Left ExecutablePathError String cause)
+        "ouro-native-build.exe" ["--coil-dispatch", "check", "source.ouro"] with
+    | Right _ => False
+    | Left error => if let NativeSiblingImageError actual := (error : NativeSiblingError) then
+        str_eq(executable_path_error_message actual, executable_path_error_message cause)
+      else False
+    end;
+
+def sibling_test_checked_no_parent (image : String) : Bool :=
+    match native_sibling_command_checked (Right ExecutablePathError String image)
+        "ouro-native-build.exe" ["--coil-dispatch", "check", "source.ouro"] with
+    | Right _ => False
+    | Left error => if let NativeSiblingParentError actual := (error : NativeSiblingError) then str_eq actual image else False
+    end;
+
 def sibling_test_no_parent (image : String) : Bool :=
     match native_sibling_command image "coil.exe" (native_sibling_check_args "source.ouro") with
     | Right _ => False
-    | Left error => match error with
-      | NativeSiblingImageError _ => False
-      | NativeSiblingParentError actual => str_eq actual image
-      | NativeSiblingProcessError _ _ => False
-      end
+    | Left error => if let NativeSiblingParentError actual := (error : NativeSiblingError) then str_eq actual image else False
     end;
 
 def sibling_test_diagnostic (path : String) (result : Either NativeSiblingError ProcResult)
@@ -41,12 +64,11 @@ def sibling_test_format_null (result : Either NativeSiblingError ProcResult) : B
     str_eq(json_print (lsp_process_format "before" result), "null");
 
 def sibling_test_limits (limits : ProcessCaptureLimits) (expected : Nat) : Bool :=
-    match limits with | ProcessCaptureLimitsOf timeout memory cpu output error =>
-      andb (eq_nat timeout expected)
-        (andb (eq_nat(memory, mul 12 256))
-          (andb (eq_nat cpu 1)
-            (andb(eq_nat(output, mul(256, mul 256 256)), eq_nat error output))))
-    end;
+    let (ProcessCaptureLimitsOf timeout memory cpu output error) := limits in
+    andb (eq_nat timeout expected)
+      (andb (eq_nat(memory, mul 12 256))
+        (andb (eq_nat cpu 1)
+          (andb(eq_nat(output, mul(256, mul 256 256)), eq_nat error output))));
 
 def sibling_test_uri (path : String) (expected : String) : Bool :=
     andb (str_eq(path_to_uri path, expected))
@@ -54,6 +76,23 @@ def sibling_test_uri (path : String) (expected : String) : Bool :=
       | Nothing => False
       | Just decoded => str_eq decoded (path_normalize path)
       end);
+
+def sibling_test_symbol_uri_runs : Bool :=
+    let symbol : String -> String -> Nat -> Sym :=
+      fun (path : String) (name : String) (line : Nat) =>
+        MkSym path (MkDecl "def" name "" (Nil String) line) in
+    let empty : Sym := symbol "" "keep_empty" 0 in
+    let first : Sym := symbol "/one/main #.ouro" "keep_first" 1 in
+    let same : Sym := symbol "/one/main #.ouro" "keep_second" 5 in
+    let other : Sym := symbol "/two/main #.ouro" "keep_first" 3 in
+    let skipped : Sym := symbol "/one/skip.ouro" "skip" 2 in
+    let syms : List Sym := [empty, first, skipped, same, other, first, empty] in
+    let items : List Sym -> String := fun (xs : List Sym) =>
+      json_print (JArr (map Sym Json document_symbol_item xs)) in
+    andb (str_eq (json_print (workspace_symbol_result "keep" syms))
+            (items [empty, first, same, other, first, empty]))
+      (str_eq (json_print (document_symbol_result "main #.ouro" syms))
+        (items [first, same, other, first]));
 
 def sibling_test_lsp_range (range : Json) (first : Nat) (last : Nat) : Bool :=
     let start : Json := json_field range "start" in
@@ -71,22 +110,115 @@ def sibling_test_lsp_positioned (text : String) (column : Nat)
       (andb (str_eq(json_field_str diagnostic "message" "", "positioned error"))
         (sibling_test_lsp_range (json_field diagnostic "range") first last));
 
+def sibling_test_lsp_decoded_widths : Bool :=
+    let line : String := str_of_codes [127, 194, 128, 239, 191, 191, 240, 144, 128, 128, 255] in
+    andb (maybe Nat Bool False (eq_nat 6) (lsp_byte_column line 4))
+      (andb (maybe Nat Bool False (eq_nat 2) (lsp_utf16_column line 2 True))
+        (andb (maybe Nat Bool False (eq_nat 3) (lsp_utf16_column line 8 False))
+          (andb (maybe Nat Bool False (eq_nat 5) (lsp_utf16_column line 8 True))
+            (match lsp_byte_column line 6 with
+             | Just _ => False
+             | Nothing => match lsp_utf16_column line 11 False with
+               | Just _ => False | Nothing => True end
+             end))));
+
 def sibling_test_lsp_completion (text : String) (column : Nat) : Bool :=
     let symbols : List Sym :=
       [ MkSym "C:/work/main.ouro" (MkDecl "def" "target" "def target : Nat" [] 1)
       , MkSym "C:/work/main.ouro" (MkDecl "def" "other" "def other : Nat" [] 2) ] in
-    match completion_result text 0 column symbols with
-    | JArr items => match items with
+    if let JArr items := (completion_result text 0 column symbols : Json) then
+      match items with
       | Cons item rest => andb (nullb Json rest)
           (str_eq(json_field_str item "label" "", "target"))
       | Nil => False
       end
-    | JNull => False
-    | JBool _ => False
-    | JNum _ => False
-    | JStr _ => False
-    | JObj _ => False
+    else False;
+
+def sibling_test_native_host_command (located : Either ExecutablePathError String)
+    (root : String) (out : String) (program : String) : Bool :=
+    match native_sibling_command_checked located native_host_bound_sibling
+        (native_host_bound_validation_argv root out) with
+    | Left _ => False
+    | Right command => andb (str_eq(command_program command, program))
+        (list_eq String str_eq (command_args command)
+          ["--profile", "control-plane-native", "--root", root, "--out", out])
     end;
+
+def sibling_test_native_host_error (located : Either ExecutablePathError String)
+    (message : String) : Bool :=
+    match native_sibling_command_checked located native_host_bound_sibling
+        (native_host_bound_validation_argv "." "_build/native-ci") with
+    | Right _ => False
+    | Left error => str_eq(native_sibling_error_message error, message)
+    end;
+
+def sibling_test_native_host_cli (raw : List String) : Bool :=
+    native_host_bound_cli_valid raw (args_of_argv_bools native_host_bound_switches raw);
+
+def sibling_test_host_fields : List (Pair String Json) :=
+    if let JObj fields := (gate_report_json "control-plane-native"
+        [gate_check "native-host-bound-fixture" []] : Json) then
+      fields
+    else [];
+
+def sibling_test_host_replace (key : String) (value : Json) : String :=
+    json_print (JObj (map (Pair String Json) (Pair String Json)
+      (fun (field : Pair String Json) => let (MkPair name old) := field in
+        MkPair String Json name
+          (match str_eq name key with | True => value | False => old end)) sibling_test_host_fields));
+
+def sibling_test_host_without (key : String) : String :=
+    json_print (JObj (filter (Pair String Json)
+      (fun (field : Pair String Json) => let (MkPair name _) := field in notb (str_eq name key)) sibling_test_host_fields));
+
+def sibling_test_host_reject_value (key : String) (value : Json) : Bool :=
+    notb (host_bound_validation_report_text_ok (sibling_test_host_replace key value));
+
+def sibling_test_host_gate_fields : List (Pair String Json) :=
+    if let JObj fields := (check_json (gate_check "native-host-bound-fixture" []) : Json) then
+      fields
+    else [];
+
+def sibling_test_host_gate_replace (key : String) (value : Json) : Json :=
+    JObj (map (Pair String Json) (Pair String Json)
+      (fun (field : Pair String Json) => let (MkPair name old) := field in
+        MkPair String Json name
+          (match str_eq name key with | True => value | False => old end)) sibling_test_host_gate_fields);
+
+def sibling_test_host_gate_without (key : String) : Json :=
+    JObj (filter (Pair String Json)
+      (fun (field : Pair String Json) => let (MkPair name _) := field in notb (str_eq name key)) sibling_test_host_gate_fields);
+
+def sibling_test_host_reject_gate (gate : Json) : Bool :=
+    sibling_test_host_reject_value "gates" (JArr [gate]);
+
+def sibling_test_host_reject_gate_value (key : String) (value : Json) : Bool :=
+    sibling_test_host_reject_gate (sibling_test_host_gate_replace key value);
+
+def sibling_test_host_reject_gate_missing (key : String) : Bool :=
+    sibling_test_host_reject_gate (sibling_test_host_gate_without key);
+
+def sibling_test_host_reject_metric (metric : Json) : Bool :=
+    sibling_test_host_reject_gate_value "metrics" (JArr [metric]);
+
+def sibling_test_host_missing_report : Bool :=
+    let result : CiResult := host_bound_result False
+      (host_bound_effective_code True False 0) "log" "gate" "validation" True False in
+    andb (str_eq(ci_result_status result, "fail"))
+      (andb (ci_result_required result)
+        (andb (ci_result_blocking result)
+          (eq_nat(host_bound_effective_code True False 0, 1))));
+
+def sibling_test_host_captured_result : Bool :=
+    let status : Nat := sub process_capture_u32_bound 1 in
+    let output : String := str_of_codes [111, 117, 116, 0, 255, 13, 10] in
+    let error : String := str_of_codes [101, 114, 114, 0, 254, 10] in
+    let result : ProcResult := native_host_bound_process_result
+      (sibling_test_right status output error) in
+    andb (eq_nat(proc_code result, status))
+      (andb (str_eq(proc_stdout result, output))
+        (str_eq(proc_stderr result, error)));
+
 
 def native_sibling_process_laws : List (Pair String Bool) :=
     [ MkPair String Bool "native-sibling/command-drive"
@@ -103,6 +235,19 @@ def native_sibling_process_laws : List (Pair String Bool) :=
         (sibling_test_command "\\\\?\\UNC\\host\\share\\renamed.exe" "coil.exe" (["check", "space 雪/../literal.ouro", "", "a\"b", "tail\\", "&|<>"] : List String) "\\\\?\\UNC\\host\\share\\coil.exe" (["check", "space 雪/../literal.ouro", "", "a\"b", "tail\\", "&|<>"] : List String))
     , MkPair String Bool "native-sibling/command-unicode"
         (sibling_test_command "C:/Каталог 雪😀/renamed.exe" "coil.exe" (["check", "space 雪/../literal.ouro", "", "a\"b", "tail\\", "&|<>"] : List String) "C:/Каталог 雪😀/coil.exe" (["check", "space 雪/../literal.ouro", "", "a\"b", "tail\\", "&|<>"] : List String))
+    , MkPair String Bool "native-sibling/checked-loaded-image-command"
+        (sibling_test_checked_command "C:\\release 雪\\coil.exe"
+          (["--coil-dispatch", "run", "space/../main.ouro", "", "a\"b", "tail\\", "&|<>"] : List String)
+          "C:\\release 雪\\ouro-native-build.exe")
+    , MkPair String Bool "native-sibling/checked-image-query-failure"
+        (sibling_test_checked_image_error ExecutablePathQueryFailed)
+    , MkPair String Bool "native-sibling/checked-image-cleanup-cause"
+        (sibling_test_checked_image_error
+          (ExecutablePathCleanupFailed (Just ExecutablePathError ExecutablePathQueryFailed)))
+    , MkPair String Bool "native-sibling/checked-image-empty"
+        (sibling_test_checked_no_parent "")
+    , MkPair String Bool "native-sibling/checked-image-no-parent"
+        (sibling_test_checked_no_parent "coil.exe")
     , MkPair String Bool "native-sibling/no-parent-empty"
         (sibling_test_no_parent "")
     , MkPair String Bool "native-sibling/no-parent-bare-image"
@@ -133,14 +278,34 @@ def native_sibling_process_laws : List (Pair String Bool) :=
         (sibling_test_limits(native_sibling_limits (mul(120, mul 10 100)), mul(120, mul 10 100)))
     , MkPair String Bool "native-sibling/lsp-clean-marker"
         (nullb(Json, lsp_process_diagnostics("C:/work/main.ouro", sibling_test_right 0 "CHECK_OK\n" "")))
+    , MkPair String Bool "native-sibling/lsp-clean-marker-crlf"
+        (nullb(Json, lsp_process_diagnostics("C:/work/main.ouro", sibling_test_right 0 "CHECK_OK\r\n" "")))
+    , MkPair String Bool "native-sibling/lsp-marker-across-streams"
+        (nullb(Json, lsp_process_diagnostics("C:/work/main.ouro", sibling_test_right 0 "runner detail\nCHECK_" "OK\n")))
+    , MkPair String Bool "native-sibling/lsp-rejection-marker-without-diagnostic"
+        (sibling_test_diagnostic "C:/work/main.ouro" (sibling_test_right 0 "CHECK_OK\n" "runner detail: CHECK_FAIL\n")
+          "CHECK_PROTOCOL" 1 0 0 "native checker exited 0 without a successful CHECK_OK verdict")
+    , MkPair String Bool "native-sibling/lsp-clean-marker-with-failed-status"
+        (sibling_test_diagnostic "C:/work/main.ouro" (sibling_test_right 2 "CHECK_OK\n" "") "CHECK_FAIL" 1 0 0 "CHECK_OK")
+    , MkPair String Bool "native-sibling/lsp-clean-marker-with-stderr-warning"
+        (sibling_test_diagnostic "C:/work/main.ouro" (sibling_test_right 0 "CHECK_OK\n"
+          "OURO-STYLE warning C:/work/main.ouro:7:2 style note\n") "OURO-STYLE" 2 6 1 "style note")
     , MkPair String Bool "native-sibling/lsp-native-rejection"
         (sibling_test_diagnostic "C:/work/main.ouro" (sibling_test_right 1 "" "coil: source 41:3\n") "CHECK_FAIL" 1 0 0 "coil: source 41:3")
     , MkPair String Bool "native-sibling/lsp-unparsed-empty-failure"
         (sibling_test_diagnostic "C:/work/main.ouro" (sibling_test_right 42 "" "") "CHECK_FAIL" 1 0 0 "native checker exited 42")
+    , MkPair String Bool "native-sibling/lsp-unparsed-whitespace-failure"
+        (sibling_test_diagnostic "C:/work/main.ouro" (sibling_test_right 42 " \r\n" "\t \n") "CHECK_FAIL" 1 0 0 "native checker exited 42")
     , MkPair String Bool "native-sibling/lsp-preserve-check-fail"
         (sibling_test_diagnostic "C:/work/main.ouro" (sibling_test_right 1 "CHECK_FAIL: rejected declaration\n" "") "CHECK_FAIL" 1 0 0 "rejected declaration")
+    , MkPair String Bool "native-sibling/lsp-preserve-indented-check-fail"
+        (sibling_test_diagnostic "C:/work/main.ouro" (sibling_test_right 1 "runner detail\r\n"
+          " \tCHECK_FAIL:\t rejected declaration \t\r\n") "CHECK_FAIL" 1 0 0 "rejected declaration")
     , MkPair String Bool "native-sibling/lsp-preserve-positioned"
         (sibling_test_diagnostic "C:/work/main.ouro" (sibling_test_right 1 "OURO-TYPE error C:/work/main.ouro:3:5 type mismatch\n" "") "OURO-TYPE" 1 2 4 "type mismatch")
+    , MkPair String Bool "native-sibling/lsp-location-retains-path-colons"
+        (sibling_test_diagnostic "/workspace/part:main.ouro" (sibling_test_right 1
+          "OURO-TYPE  error /workspace/part:main.ouro:0:5 type  mismatch\r\n" "") "OURO-TYPE" 1 0 4 "type mismatch\r")
     , MkPair String Bool "native-sibling/lsp-preserve-warning"
         (sibling_test_diagnostic "C:/work/main.ouro" (sibling_test_right 0 "CHECK_OK\nOURO-STYLE warning C:/work/main.ouro:7:2 style note\n" "") "OURO-STYLE" 2 6 1 "style note")
     , MkPair String Bool "native-sibling/lsp-zero-without-verdict"
@@ -191,8 +356,15 @@ def native_sibling_process_laws : List (Pair String Bool) :=
         (sibling_test_uri "C:\\work\\%41 #?.ouro" "file:///C:/work/%2541%20%23%3F.ouro")
     , MkPair String Bool "lsp/uri-posix-reserved-path-bytes"
         (sibling_test_uri "/work/%41#?.ouro" "file:///work/%2541%23%3F.ouro")
+    , MkPair String Bool "lsp/symbol-uri-path-runs" sibling_test_symbol_uri_runs
     , MkPair String Bool "lsp/utf16-default-capability"
         (str_eq(json_field_str lsp_capabilities "positionEncoding" "", "utf-16"))
+    , MkPair String Bool "lsp/import-group-semicolon-in-path"
+        (precision_strings (imports_of "import \"a;b.ouro\", \"second.ouro\";")
+          ["a;b.ouro", "second.ouro"])
+    , MkPair String Bool "lsp/import-after-nul"
+        (precision_strings (imports_of (str_cat3 "import \"first.ouro\";" (str_of_codes [0])
+          "import \"second.ouro\";")) ["first.ouro", "second.ouro"])
     , MkPair String Bool "lsp/word-ascii"
         (str_eq(word_at "\"x\" target" 0 5, "target"))
     , MkPair String Bool "lsp/word-after-bmp"
@@ -201,12 +373,27 @@ def native_sibling_process_laws : List (Pair String Bool) :=
         (str_eq(word_at "\"😀\" target" 0 6, "target"))
     , MkPair String Bool "lsp/word-past-line-clamps"
         (str_eq(word_at "target" 0 99, "target"))
+    , MkPair String Bool "lsp/word-and-prefix-at-punctuation"
+        (andb (str_eq(word_in_line "f_2'.g" 4, "f_2'"))
+          (andb (str_eq(prefix_in_line "f_2'.g" 3, "f_2"))
+            (str_eq(word_in_line "f_2'.g" 5, "g"))))
+    , MkPair String Bool "lsp/byte-column-past-line"
+        (andb (str_null (word_in_line "target" 7)) (str_null (prefix_in_line "target" 7)))
+    , MkPair String Bool "lsp/prepare-rename-empty-line"
+        (str_eq(json_print (prepare_rename_result "" 0 0), "null"))
+    , MkPair String Bool "lsp/prepare-rename-inside-surrogate-pair"
+        (sibling_test_lsp_range (prepare_rename_result "ab😀c" 0 3) 0 2)
+    , MkPair String Bool "lsp/prepare-rename-past-line-clamps"
+        (sibling_test_lsp_range (prepare_rename_result "._2'" 0 99) 1 4)
     , MkPair String Bool "lsp/prepare-rename-after-bmp"
         (sibling_test_lsp_range (prepare_rename_result "\"雪\" target" 0 8) 4 10)
     , MkPair String Bool "lsp/prepare-rename-after-non-bmp"
         (sibling_test_lsp_range (prepare_rename_result "\"😀\" target" 0 8) 5 11)
     , MkPair String Bool "lsp/prepare-rename-after-mixed-unicode"
         (sibling_test_lsp_range (prepare_rename_result "\"雪😀\" target" 0 7) 6 12)
+    , MkPair String Bool "lsp/rename-whole-tokens-preserves-unicode-and-newlines"
+        (str_eq(rename_text "😀.f_2' + f_2'x\n(f_2')\n" "f_2'" "next",
+          "😀.next + f_2'x\n(next)\n"))
     , MkPair String Bool "lsp/completion-after-bmp"
         (sibling_test_lsp_completion "\"雪\" tar" 7)
     , MkPair String Bool "lsp/completion-after-non-bmp"
@@ -221,6 +408,7 @@ def native_sibling_process_laws : List (Pair String Bool) :=
         (sibling_test_lsp_positioned "\"雪\" target" 1 1 2)
     , MkPair String Bool "lsp/diagnostic-non-bmp-scalar-range"
         (sibling_test_lsp_positioned "\"😀\" target" 1 1 3)
+    , MkPair String Bool "lsp/column-width-boundaries-and-invalid-tail" sibling_test_lsp_decoded_widths
     , MkPair String Bool "lsp/invalid-source-position-is-explicit"
         (str_eq(json_field_str (lsp_diagnostic_utf16 [str_of_codes [255]]
           (diag_of "OURO-POSITION" (JNum "1") 0 0 "invalid source")) "code" "", "CHECK_PROTOCOL"))
@@ -249,6 +437,168 @@ def native_sibling_process_laws : List (Pair String Bool) :=
         (notb (lsp_message_valid (JObj
           [rpc_version_field, MkPair String Json "id" (JNum "22"),
            MkPair String Json "method" (JBool False)])))
+    , MkPair String Bool "native-ci/loaded-image-command"
+        (sibling_test_native_host_command
+          (Right ExecutablePathError String "C:/release/renamed.exe")
+          "." "_build/native ci/../literal" "C:/release/ouro-repo-gate.exe")
+    , MkPair String Bool "native-ci/loaded-image-extended-unicode"
+        (sibling_test_native_host_command
+          (Right ExecutablePathError String "\\\\?\\C:\\Каталог 雪😀\\renamed.exe")
+          "space/../root \"&|<>" "out\\tail\\"
+          "\\\\?\\C:\\Каталог 雪😀\\ouro-repo-gate.exe")
+    , MkPair String Bool "native-ci/refuse-image-query"
+        (sibling_test_native_host_error
+          (Left ExecutablePathError String ExecutablePathQueryFailed)
+          "current executable path: GetModuleFileNameW failed")
+    , MkPair String Bool "native-ci/refuse-image-cleanup"
+        (sibling_test_native_host_error
+          (Left ExecutablePathError String
+            (ExecutablePathCleanupFailed (Just ExecutablePathError ExecutablePathQueryFailed)))
+          (executable_path_error_message
+            (ExecutablePathCleanupFailed (Just ExecutablePathError ExecutablePathQueryFailed))))
+    , MkPair String Bool "native-ci/refuse-no-image-parent"
+        (sibling_test_native_host_error
+          (Right ExecutablePathError String "renamed.exe")
+          "current executable path has no parent directory: renamed.exe")
+    , MkPair String Bool "native-ci/exact-process-limits"
+        (sibling_test_limits native_host_bound_limits (mul(9, mul(100, mul 10 100))))
+    , MkPair String Bool "native-ci/cli-host-bound-literal-paths"
+        (sibling_test_native_host_cli
+          ["worker", "--profile", "host-bound", "--root", "space/../root",
+           "--out", "out \"&|<>", "--quiet"])
+    , MkPair String Bool "native-ci/cli-refuse-other-profile"
+        (notb (sibling_test_native_host_cli ["worker", "--profile", "pr-native"]))
+    , MkPair String Bool "native-ci/cli-refuse-gate"
+        (notb (sibling_test_native_host_cli ["worker", "--gate", "host-bound-report"]))
+    , MkPair String Bool "native-ci/cli-refuse-unknown-flag"
+        (notb (sibling_test_native_host_cli ["worker", "--native-fallback"]))
+    , MkPair String Bool "native-ci/cli-refuse-incomplete-options"
+        (all (List String) (fun (raw : List String) =>
+          notb (sibling_test_native_host_cli raw))
+          [["worker", "--profile"], ["worker", "--root"], ["worker", "--out"]])
+    , MkPair String Bool "native-ci/cli-refuse-positional"
+        (notb (sibling_test_native_host_cli ["worker", "source.ouro"]))
+    , MkPair String Bool "native-ci/report-current-owner-shape"
+        (host_bound_validation_report_text_ok
+          (gate_report_string "control-plane-native" [gate_check "native-host-bound-fixture" []]))
+    , MkPair String Bool "native-ci/report-current-owner-metrics"
+        (host_bound_validation_report_text_ok
+          (gate_report_string "control-plane-native"
+            [ gate_check_metrics "native-host-bound-fixture"
+                [gate_metric "rows" "1", gate_metric "text" ""] []
+            , gate_check "native-host-bound-second" [] ]))
+    , MkPair String Bool "native-ci/report-owner-nonblocking-gate"
+        (host_bound_validation_report_text_ok
+          (gate_report_string "control-plane-native"
+            [MkGateCheck "native-host-bound-fixture" False [] []]))
+    , MkPair String Bool "native-ci/report-extra-fields"
+        (host_bound_validation_report_text_ok
+          (json_print (JObj (snoc (Pair String Json) sibling_test_host_fields
+            (json_kv "extension" (JStr "metadata"))))))
+    , MkPair String Bool "native-ci/report-refuse-false"
+        (sibling_test_host_reject_value "pass" (JBool False))
+    , MkPair String Bool "native-ci/report-refuse-nonboolean-pass"
+        (all Json (sibling_test_host_reject_value "pass")
+          [JStr "true", JStr "false", JNum "1", JNum "0", JNull])
+    , MkPair String Bool "native-ci/report-refuse-missing-pass"
+        (notb (host_bound_validation_report_text_ok (sibling_test_host_without "pass")))
+    , MkPair String Bool "native-ci/report-refuse-empty-gates"
+        (sibling_test_host_reject_value "gates" (JArr []))
+    , MkPair String Bool "native-ci/report-refuse-missing-gates"
+        (notb (host_bound_validation_report_text_ok (sibling_test_host_without "gates")))
+    , MkPair String Bool "native-ci/report-refuse-nonarray-gates"
+        (all Json (sibling_test_host_reject_value "gates") [JObj [], JNull, JStr "gates"])
+    , MkPair String Bool "native-ci/report-refuse-nonobject-gate"
+        (all Json sibling_test_host_reject_gate
+          [JNull, JBool True, JNum "1", JStr "gate", JArr []])
+    , MkPair String Bool "native-ci/report-refuse-gate-missing-fields"
+        (all String sibling_test_host_reject_gate_missing
+          ["name", "status", "blocking", "metrics", "issues"])
+    , MkPair String Bool "native-ci/report-refuse-nonstring-gate-name"
+        (all Json (sibling_test_host_reject_gate_value "name")
+          [JNull, JBool True, JNum "1", JArr [], JObj []])
+    , MkPair String Bool "native-ci/report-refuse-nonpassing-gate"
+        (all Json (sibling_test_host_reject_gate_value "status")
+          [JStr "fail", JStr "skip", JStr "unavailable", JStr "PASS",
+           JBool True, JNum "1", JNull, JArr [], JObj []])
+    , MkPair String Bool "native-ci/report-refuse-hidden-failed-gate"
+        (sibling_test_host_reject_value "gates"
+          (JArr [check_json (gate_check "first" []),
+            check_json (gate_check "second" [gate_issue "fixture failed" "fixture"])]))
+    , MkPair String Bool "native-ci/report-refuse-hidden-null-gate"
+        (sibling_test_host_reject_value "gates"
+          (JArr [check_json (gate_check "first" []), JNull]))
+    , MkPair String Bool "native-ci/report-refuse-nonboolean-gate-blocking"
+        (all Json (sibling_test_host_reject_gate_value "blocking")
+          [JNull, JNum "1", JStr "true", JArr [], JObj []])
+    , MkPair String Bool "native-ci/report-refuse-nonarray-gate-metrics"
+        (all Json (sibling_test_host_reject_gate_value "metrics")
+          [JNull, JBool True, JNum "1", JStr "metrics", JObj []])
+    , MkPair String Bool "native-ci/report-refuse-malformed-metric"
+        (all Json sibling_test_host_reject_metric
+          [ JNull, JBool True, JNum "1", JStr "metric", JArr [], JObj []
+          , JObj [json_kv "name" (JStr "rows")]
+          , JObj [json_kv "value" (JStr "1")]
+          , JObj [json_kv "name" JNull, json_kv "value" (JStr "1")]
+          , JObj [json_kv "name" (JStr "rows"), json_kv "value" (JNum "1")]
+          , JObj [json_kv "name" (JStr "rows"), json_kv "value" (JStr "1"),
+              json_kv "value" JNull] ])
+    , MkPair String Bool "native-ci/report-refuse-pass-with-gate-issues"
+        (sibling_test_host_reject_gate_value "issues"
+          (issues_json [gate_issue "fixture failed" "fixture"]))
+    , MkPair String Bool "native-ci/report-refuse-nonarray-gate-issues"
+        (all Json (sibling_test_host_reject_gate_value "issues")
+          [JNull, JBool True, JNum "0", JStr "[]", JObj []])
+    , MkPair String Bool "native-ci/report-refuse-summary-issues"
+        (sibling_test_host_reject_value "issues"
+          (issues_json [gate_issue "fixture failed" "fixture"]))
+    , MkPair String Bool "native-ci/report-refuse-nonarray-summary-issues"
+        (all Json (sibling_test_host_reject_value "issues")
+          [JNull, JBool True, JNum "0", JStr "[]", JObj []])
+    , MkPair String Bool "native-ci/report-refuse-duplicate-report-field"
+        (notb (host_bound_validation_report_text_ok
+          (json_print (JObj (snoc (Pair String Json) sibling_test_host_fields
+            (json_kv "pass" (JBool False)))))))
+    , MkPair String Bool "native-ci/report-refuse-duplicate-gate-field"
+        (sibling_test_host_reject_gate
+          (JObj (snoc (Pair String Json) sibling_test_host_gate_fields
+            (json_kv "status" (JStr "fail")))))
+    , MkPair String Bool "native-ci/report-refuse-missing-contract-fields"
+        (all String (fun (key : String) =>
+          notb (host_bound_validation_report_text_ok (sibling_test_host_without key)))
+          ["kind", "version", "profile", "execution_backend", "execution_mode", "issues"])
+    , MkPair String Bool "native-ci/report-refuse-wrong-kind"
+        (sibling_test_host_reject_value "kind" (JStr "ouro.ci-gate-report.v1"))
+    , MkPair String Bool "native-ci/report-refuse-wrong-version"
+        (sibling_test_host_reject_value "version" (JStr "2"))
+    , MkPair String Bool "native-ci/report-refuse-wrong-profile"
+        (sibling_test_host_reject_value "profile" (JStr "control-plane"))
+    , MkPair String Bool "native-ci/report-refuse-wrong-backend"
+        (sibling_test_host_reject_value "execution_backend" (JStr "python"))
+    , MkPair String Bool "native-ci/report-refuse-wrong-mode"
+        (sibling_test_host_reject_value "execution_mode" (JStr "subprocess"))
+    , MkPair String Bool "native-ci/report-refuse-malformed-or-trailing"
+        (andb (notb (host_bound_validation_report_text_ok "{"))
+          (notb (host_bound_validation_report_text_ok
+            (str_concat(json_print (JObj sibling_test_host_fields), " trailing")))))
+    , MkPair String Bool "native-ci/zero-without-report-is-failure"
+        sibling_test_host_missing_report
+    , MkPair String Bool "native-ci/failed-child-keeps-full-status"
+        (eq_nat(host_bound_effective_code False True (add 256 3), add 256 3))
+    , MkPair String Bool "native-ci/failure-issue-order"
+        (list_eq String str_eq (host_bound_validation_issues False False "validation")
+          ["inventory consistency validation command failed",
+           "required native validation report missing, malformed, or non-passing: validation"])
+    , MkPair String Bool "native-ci/capture-error-is-failure"
+        (let result : ProcResult := native_host_bound_process_result
+          (Left NativeSiblingError ProcResult
+            (NativeSiblingProcessError("C:/tools/ouro-repo-gate.exe", ProcessCaptureOsError 2))) in
+          andb (eq_nat(proc_code result, 127))
+            (andb (notb (proc_ok result))
+              (str_eq(proc_stderr result,
+                "C:/tools/ouro-repo-gate.exe: captured process OS error=2\n"))))
+    , MkPair String Bool "native-ci/captured-dword-and-bytes-preserved"
+        sibling_test_host_captured_result
     ];
 
 -- @entry main

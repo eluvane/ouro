@@ -18,35 +18,62 @@ if ! command -v "$CC_BIN" >/dev/null 2>&1; then
 fi
 
 FIX="$OUT/ouro-fix"
-rm -f "$FIX" "$FIX.exe"
+# The native builder resolves the destination before installing the image.
+for image in "$FIX" "$FIX.exe"; do
+	if [ -L "$image" ]; then
+		rm -f "$image"
+	fi
+done
 if ! OURO_BUILD_TOOL_MODE=native sh "$ROOT/scripts/build_tool.sh" tools/fix/main.ouro "$FIX" >"$OUT/build.log" 2>&1; then
 	echo "FIX_SUITE: FAIL build" >&2
 	tail -n 20 "$OUT/build.log" >&2
 	exit 1
 fi
-if [ -f "$FIX.exe" ]; then FIX="$FIX.exe"; fi
+fix_suffix=$("$PYTHON" -c 'import os, sys; sys.stdout.write(".exe" if os.name == "nt" else "")')
+FIX="$FIX$fix_suffix"
+if [ ! -x "$FIX" ]; then
+	printf 'FIX_SUITE: FAIL prepared native fixer unavailable: %s\n' "$FIX" >&2
+	exit 1
+fi
 
 # Exercise the production planner, not the legacy raw-proposal golden helper.
-PRECISION="$OUT/fix-precision"
-if ! OURO_BUILD_TOOL_MODE=native sh "$ROOT/scripts/build_tool.sh" tests/fix_precision.ouro "$PRECISION" >"$OUT/precision.build.log" 2>&1; then
-	echo "FIX_SUITE: FAIL precision build" >&2
-	tail -n 20 "$OUT/precision.build.log" >&2
+LAWS="$OUT/fix-laws"
+if ! OURO_BUILD_TOOL_MODE=native sh "$ROOT/scripts/build_tool.sh" tests/fix_laws.ouro "$LAWS" >"$OUT/laws.build.log" 2>&1; then
+	echo "FIX_SUITE: FAIL law build" >&2
+	tail -n 20 "$OUT/laws.build.log" >&2
 	exit 1
 fi
-if [ -f "$PRECISION.exe" ]; then PRECISION="$PRECISION.exe"; fi
-"$PRECISION"
+if [ -f "$LAWS.exe" ]; then LAWS="$LAWS.exe"; fi
+run_law_group() {
+	law_output="$OUT/laws-$1.out"
+	law_status=0
+	{
+		"$LAWS" --group "$1" || law_status=$?
+	} >"$law_output"
+	law_replay_status=0
+	cat "$law_output" || law_replay_status=$?
+	[ "$law_status" -eq 0 ] || return "$law_status"
+	[ "$law_replay_status" -eq 0 ] || return "$law_replay_status"
+	if ! grep -Fx "$2" "$law_output" >/dev/null; then
+		printf 'FIX_SUITE: FAIL law group %s did not print %s\n' "$1" "$2" >&2
+		return 1
+	fi
+}
+run_law_group precision 'PASS retained-comments-remain-stable'
+run_law_group proofs 'PASS empty-transaction-preserves-source'
 
-PROOFS="$OUT/fix-proofs"
-if ! OURO_BUILD_TOOL_MODE=native sh "$ROOT/scripts/build_tool.sh" tests/fix_proofs.ouro "$PROOFS" >"$OUT/proofs.build.log" 2>&1; then
-	echo "FIX_SUITE: FAIL proof build" >&2
-	tail -n 20 "$OUT/proofs.build.log" >&2
+set +e
+"$LAWS" --group unknown >"$OUT/laws-invalid.out" 2>"$OUT/laws-invalid.err"
+laws_status=$?
+set -e
+if [ "$laws_status" -ne 2 ] || [ -s "$OUT/laws-invalid.out" ] ||
+	! grep -F 'usage: fix-laws --group precision|proofs' "$OUT/laws-invalid.err" >/dev/null; then
+	echo "FIX_SUITE: FAIL invalid law group" >&2
 	exit 1
 fi
-if [ -f "$PROOFS.exe" ]; then PROOFS="$PROOFS.exe"; fi
-"$PROOFS"
 
-# Invalid invocation must be rejected before any source is changed. Keep the
-# drifted input and a clean input: conflicting modes used to succeed on clean.
+# Reject invalid arguments before rewriting any file. Conflicting modes must
+# fail for both clean files and files that need a rewrite.
 printf '%s\n' 'def argument_value : Nat :=0;' >"$OUT/arguments.original"
 printf '%s\n' 'def argument_value : Nat := 0;' >"$OUT/arguments-clean.ouro"
 argument_refusal() {
