@@ -73,6 +73,7 @@ if [ "$phase" = all ] || [ "$phase" = fixtures ]; then
 fi
 
 BIN="${OURO_C_BUILD_DIR:-_build/c}/ouro-lint"
+compiler="${BIN%/*}/ouro1"
 # The builder checks the complete source/compiler/build receipt. A short mtime
 # list misses changes to imports and build-owned Windows process metadata.
 if [ "$phase" = clippy ]; then
@@ -81,6 +82,17 @@ if [ "$phase" = clippy ]; then
 elif [ "${OURO_CI_PREPARED_LINT:-}" != 1 ]; then
 	OURO_BUILD_TOOL_MODE=native sh "$ROOT/scripts/build_tool.sh" tools/lint.ouro "$BIN"
 fi
+
+lint_launcher_prepared=${OURO_CI_PREPARED_LINT:-0}
+# The normal launcher check needs cache artifacts. Reuse the published receipt
+# when the suite and the launcher select the same compiler and build directory.
+if [ "${OURO_CACHE:-}" = 0 ] && [ -n "${OURO_C_BUILD_DIR:-}" ] && [ -z "${OURO1_COMPILER:-}" ]; then
+	lint_launcher_prepared=1
+fi
+
+run_suite_lint() {
+	OURO_CI_PREPARED_LINT="$lint_launcher_prepared" sh "$ROOT/scripts/ouro1.sh" lint "$@"
+}
 
 out="${LINT_SUITE_OUT:-$ROOT/_build/tmp/lint_suite}"
 if [ "$lint_stage" != worker ]; then
@@ -98,18 +110,24 @@ if [ "$phase" = all ] || [ "$phase" = fixtures ]; then
 # Batch tool preparation uses the bootstrap compiler and validates each
 # binary against its complete content receipt.
 set --
+if [ "${OURO_CACHE:-}" = 0 ]; then
+	# The lint build already published this worker as a transitive companion.
+	"$PYTHON" "$ROOT/scripts/native_tool_build.py" tools/clippy/structural_main.ouro "$session_worker" \
+		--compiler "$compiler" --verify-published
+else
+	set -- --tool tools/clippy/structural_main.ouro "$session_worker"
+fi
 if [ "$phase" = all ]; then
-	set -- --tool tools/pkg/main.ouro "$pkg"
+	set -- "$@" --tool tools/pkg/main.ouro "$pkg"
 fi
 "$PYTHON" "$ROOT/scripts/native_tool_build.py" \
-	--compiler "${OURO_C_BUILD_DIR:-_build/c}/ouro1" \
+	--compiler "$compiler" \
 	--batch-report "$out/tool-preparation.json" \
 	--tool tests/quality_input_tests.ouro "$quality_inputs" \
 	--tool tests/quality_diagnostic_tests.ouro "$quality_diagnostics" \
 	--tool tests/clippy_semantic/performance.ouro "$semantic_perf" \
 	--tool tests/clippy_semantic/session.ouro "$semantic_session" \
 	--tool tests/clippy_semantic/session_wire.ouro "$semantic_wire" \
-	--tool tools/clippy/structural_main.ouro "$session_worker" \
 	"$@"
 elif [ "$phase" = production ] && [ "$lint_stage" != worker ]; then
 	set --
@@ -117,7 +135,7 @@ elif [ "$phase" = production ] && [ "$lint_stage" != worker ]; then
 		set -- --verify-published
 	fi
 	"$PYTHON" "$ROOT/scripts/native_tool_build.py" \
-		--compiler "${OURO_C_BUILD_DIR:-_build/c}/ouro1" \
+		--compiler "$compiler" \
 		--batch-report "$out/tool-preparation.json" \
 		--tool tools/pkg/main.ouro "$pkg" \
 		"$@"
@@ -156,7 +174,7 @@ out=$(CDPATH='' cd "$out" && pwd)
 (
 	cd "$fixtures"
 	set +e
-	sh "$ROOT/scripts/ouro1.sh" lint --deny bad >"$out/launcher-bad.out" 2>"$out/launcher-bad.err"
+	run_suite_lint --deny bad >"$out/launcher-bad.out" 2>"$out/launcher-bad.err"
 	st=$?
 	set -e
 	if [ "$st" -ne 1 ] ||
@@ -164,13 +182,13 @@ out=$(CDPATH='' cd "$out" && pwd)
 		echo "LINT_SUITE: FAIL launcher missed large-source unbound diagnostic" >&2
 		exit 1
 	fi
-	sh "$ROOT/scripts/ouro1.sh" lint --deny good >"$out/launcher-good.out" 2>"$out/launcher-good.err"
+	run_suite_lint --deny good >"$out/launcher-good.out" 2>"$out/launcher-good.err"
 	if [ -s "$out/launcher-good.out" ] || [ -s "$out/launcher-good.err" ]; then
 		echo "LINT_SUITE: FAIL launcher reported a clean fixture" >&2
 		exit 1
 	fi
 	set +e
-	sh "$ROOT/scripts/ouro1.sh" lint good/_build/ignored.ouro \
+	run_suite_lint good/_build/ignored.ouro \
 		>"$out/launcher-explicit.out" 2>"$out/launcher-explicit.err"
 	st=$?
 	set -e
@@ -218,7 +236,7 @@ boundary="$out/input-boundary"
 mkdir -p "$boundary/empty"
 printf '%s\n' 'import "missing.ouro";' 'def ok : Type := Type;' >"$boundary/bad.ouro"
 printf '%s\n' '-- import "missing.ouro";' 'def ok : Type := Type;' >"$boundary/near-miss.ouro"
-sh "$ROOT/scripts/ouro1.sh" lint --deny "$boundary/near-miss.ouro" \
+run_suite_lint --deny "$boundary/near-miss.ouro" \
 	>"$out/near-miss.out" 2>"$out/near-miss.err"
 test ! -s "$out/near-miss.out"
 test ! -s "$out/near-miss.err"
@@ -229,13 +247,13 @@ OURO_LINT_SEMANTIC_EXE="$out/semantic-must-not-be-started" \
 test ! -s "$out/style-only.out"
 test ! -s "$out/style-only.err"
 set +e
-sh "$ROOT/scripts/ouro1.sh" lint --deny "$boundary/bad.ouro" \
+run_suite_lint --deny "$boundary/bad.ouro" \
 	>"$out/missing-import.out" 2>"$out/missing-import.err"
 missing_status=$?
-sh "$ROOT/scripts/ouro1.sh" lint --deny "$boundary/empty" \
+run_suite_lint --deny "$boundary/empty" \
 	>"$out/empty-scope.out" 2>"$out/empty-scope.err"
 empty_status=$?
-sh "$ROOT/scripts/ouro1.sh" lint --enable-no-such-rule \
+run_suite_lint --enable-no-such-rule \
 	>"$out/unknown-option.out" 2>"$out/unknown-option.err"
 unknown_status=$?
 set -e
@@ -455,7 +473,7 @@ else
 	set -- std compiler tools "$@" \
 		"$production/samples/pkg" samples/bench/core_suite.ouro
 fi
-sh "$ROOT/scripts/ouro1.sh" lint --deny "$@"
+run_suite_lint --deny "$@"
 fi
 
 if [ "$phase" = all ] || [ "$phase" = clippy ]; then

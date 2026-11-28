@@ -37,6 +37,7 @@ for a specific task.
 ## Compiler and trust
 
 - [Architecture](architecture.md) and [feature → test → command map](architecture.md#from-a-feature-to-its-tests)
+- [Systems contract support](architecture.md#systems-contract-support)
 - [Canonical source pipeline](canonical_source.md)
 - [Build and bootstrap](build.md)
 - [Compiler checking](kernel_design.md)

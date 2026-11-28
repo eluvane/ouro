@@ -501,6 +501,8 @@ def main() -> int:
         fakebin = fake_python(tmp, log)
         env = os.environ.copy()
         env["PATH"] = str(fakebin) + os.pathsep + env.get("PATH", "")
+        # An absolute PYTHON setting would bypass the fake interpreter.
+        env["PYTHON"] = "python3"
 
         check = run(["sh", "scripts/ouro1.sh", "check", "std/io.ouro"], env=env)
         if "CHECK_OK" not in check.stdout:

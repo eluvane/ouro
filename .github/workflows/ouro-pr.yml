@@ -44,6 +44,7 @@ jobs:
       editor: ${{ steps.changes.outputs.editor }}
       site: ${{ steps.changes.outputs.site }}
       host_compiler: ${{ steps.changes.outputs.host_compiler }}
+      compiler_groups: ${{ steps.changes.outputs.compiler_groups }}
       python_lint: ${{ steps.changes.outputs.python_lint }}
       shell_lint: ${{ steps.changes.outputs.shell_lint }}
       portable: ${{ steps.changes.outputs.portable }}
@@ -229,7 +230,7 @@ jobs:
 
       - name: Restore cache
         id: ouro-cache
-        if: ${{ needs.paths.outputs.host_compiler == 'true' }}
+        if: ${{ contains(fromJSON(needs.paths.outputs.compiler_groups), matrix.group) }}
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         env:
           SUITE_CACHE_GROUP: ${{ (matrix.group == 'runtime-io' || matrix.group == 'frontend-security') && 'tests' || matrix.group }}
@@ -262,14 +263,14 @@ jobs:
           shellcheck --version
 
       - name: Download host compiler
-        if: ${{ needs.paths.outputs.host_compiler == 'true' }}
+        if: ${{ contains(fromJSON(needs.paths.outputs.compiler_groups), matrix.group) }}
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           name: ${{ needs.host-compiler.outputs.artifact }}
           path: _build/ci
 
       - name: Verify and install host compiler
-        if: ${{ needs.paths.outputs.host_compiler == 'true' }}
+        if: ${{ contains(fromJSON(needs.paths.outputs.compiler_groups), matrix.group) }}
         env:
           COMPILER_SHA256: ${{ needs.host-compiler.outputs.sha256 }}
         run: python3 scripts/ci_gate.py --compiler-artifact import --compiler-sha256 "$COMPILER_SHA256"
@@ -291,7 +292,7 @@ jobs:
           python3 scripts/ci_gate.py --profile pr --group "$CI_GROUP" --changed-paths-json "$CHANGED_PATHS" --selection-key "$SELECTION_KEY" "${selection_options[@]}" --fail-fast --out "_build/ci/pr-$CI_GROUP"
 
       - name: Save cache
-        if: ${{ needs.paths.outputs.host_compiler == 'true' && (github.event_name == 'pull_request' || (github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master'))) && steps.ouro-cache.outputs.cache-hit != 'true' }}
+        if: ${{ contains(fromJSON(needs.paths.outputs.compiler_groups), matrix.group) && (github.event_name == 'pull_request' || (github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master'))) && steps.ouro-cache.outputs.cache-hit != 'true' }}
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
@@ -577,8 +578,12 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Restore cache
-        id: ouro-cache
+      - name: Identify portable compiler inputs
+        id: inputs
+        run: python3 scripts/ci_gate.py --compiler-artifact key >> "$GITHUB_OUTPUT"
+
+      - name: Restore portable compiler and bootstrap evidence
+        id: compiler-cache
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
@@ -588,21 +593,42 @@ jobs:
             _build/bootstrap/*/inputs.json
             _build/bootstrap/*/out/p1/*.c
             _build/bootstrap/*/out/p2/*.c
-          key: ouro-pr-portable-${{ runner.os }}-${{ hashFiles('Ouro.seal', 'scripts/**', 'compiler/**', 'runtime/**', 'tools/**', 'tests/**', 'std/**', 'quality/smith/**', 'docs/generated_artifact_hashes.sha256') }}
+          key: ouro-pr-portable-${{ runner.os }}-${{ runner.arch }}-${{ steps.inputs.outputs.key }}
           restore-keys: |
             ouro-pr-portable-${{ runner.os }}-
             ouro-pr-checks-${{ runner.os }}-
             ouro-pr-${{ runner.os }}-
 
+      - name: Restore portable historical bootstrap stages
+        id: historical-cache
+        if: ${{ github.event.repository.visibility == 'public' && steps.compiler-cache.outputs.cache-hit != 'true' }}
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ runner.temp }}/bootstrap-historical/${{ steps.inputs.outputs.historical_key }}.zip
+          key: ouro-bootstrap-historical-v1-${{ runner.os }}-${{ runner.arch }}-${{ steps.inputs.outputs.historical_key }}-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: |
+            ouro-bootstrap-historical-v1-${{ runner.os }}-${{ runner.arch }}-${{ steps.inputs.outputs.historical_key }}-
+
+      - name: Verify portable historical bootstrap cache origin
+        id: historical-origin
+        if: ${{ steps.historical-cache.outcome == 'success' && steps.historical-cache.outputs.cache-matched-key != '' }}
+        env:
+          HISTORICAL_KEY: ${{ steps.inputs.outputs.historical_key }}
+        run: python3 scripts/ci_historical_cache.py verify >> "$GITHUB_OUTPUT"
+
       - name: Run checks
+        env:
+          COMPILER_CACHE_HIT: ${{ steps.compiler-cache.outputs.cache-hit }}
+          OURO_BOOTSTRAP_HISTORY_SHA256: ${{ steps.historical-origin.outputs.verified_sha256 }}
         run: |
           python3 --version
           python3 -m py_compile scripts/kernel_scale.py scripts/kernel_profile.py scripts/kernel_hardening_suite.py scripts/github_workflow_gate.py scripts/generated_artifact_drift_check.py scripts/cache_parity_suite.py scripts/ci_gate.py scripts/strict_quality_firewall.py
-          python3 scripts/ouro_build.py build --verbosity quiet
+          printf 'Portable compiler exact cache lookup hit=%s\n' "${COMPILER_CACHE_HIT:-false}"
+          python3 scripts/ouro_build.py build --verbosity normal
           python3 scripts/kernel_hardening_suite.py --out _build/portable_compiler
 
       - name: Save portable cache and bootstrap evidence
-        if: ${{ (github.event_name == 'pull_request' || (github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master'))) && steps.ouro-cache.outputs.cache-hit != 'true' }}
+        if: ${{ (github.event_name == 'pull_request' || (github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master'))) && steps.compiler-cache.outputs.cache-hit != 'true' }}
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
@@ -612,7 +638,35 @@ jobs:
             _build/bootstrap/*/inputs.json
             _build/bootstrap/*/out/p1/*.c
             _build/bootstrap/*/out/p2/*.c
-          key: ${{ steps.ouro-cache.outputs.cache-primary-key }}
+          key: ${{ steps.compiler-cache.outputs.cache-primary-key }}
+
+      - name: Export portable compiler evidence
+        id: bundle
+        if: ${{ github.event.repository.visibility == 'public' && github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master') && github.run_attempt == '1' && steps.historical-cache.outcome == 'success' }}
+        run: python3 scripts/ci_gate.py --compiler-artifact export --artifact "$RUNNER_TEMP/portable-compiler.tar.gz" >> "$GITHUB_OUTPUT"
+
+      - name: Identify portable historical bootstrap evidence
+        id: historical-evidence
+        if: ${{ steps.bundle.outcome == 'success' }}
+        env:
+          HISTORICAL_KEY: ${{ steps.inputs.outputs.historical_key }}
+          BUILT_HISTORICAL_SHA256: ${{ steps.bundle.outputs.historical_sha256 }}
+        run: python3 scripts/ci_historical_cache.py attest >> "$GITHUB_OUTPUT"
+
+      - name: Save portable historical bootstrap stages
+        if: ${{ github.event.repository.visibility == 'public' && github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master') && steps.historical-evidence.outputs.name != '' && steps.historical-evidence.outputs.sha256 != steps.historical-origin.outputs.verified_sha256 }}
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ runner.temp }}/bootstrap-historical/${{ steps.inputs.outputs.historical_key }}.zip
+          key: ${{ steps.historical-cache.outputs.cache-primary-key }}
+
+      - name: Publish portable historical bootstrap evidence
+        if: ${{ github.event.repository.visibility == 'public' && github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master') && steps.historical-evidence.outputs.name != '' }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ${{ steps.historical-evidence.outputs.name }}
+          path: ${{ runner.temp }}/bootstrap-historical/attestation.txt
+          if-no-files-found: error
 
       - name: Upload reports
         if: always()

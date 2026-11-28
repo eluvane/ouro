@@ -1,0 +1,446 @@
+-- E1 resource judgment over a closed AST. Callable, action, and branch bodies
+-- return Unit. Aggregates retain usage and region dependencies.
+import "../../../std/listx.ouro",
+  "../../../std/result.ouro";
+
+inductive ResourceBorrowKind : Type :=
+  | ResourceShared : ResourceBorrowKind
+  | ResourceExclusive : ResourceBorrowKind;
+
+inductive ResourceParameter : Type :=
+  | ResourceUnitParameter : ResourceParameter
+  | ResourceOwnerParameter : ResourceParameter;
+
+inductive ResourceSuspension : Type :=
+  | ResourceCallable : Nat -> ResourceParameter -> ResourceSuspension
+  | ResourceSystemAction : ResourceSuspension;
+
+inductive ResourceWrapper : Type :=
+  | ResourceLegacyPure : ResourceWrapper
+  | ResourceLegacyList : ResourceWrapper
+  | ResourceExistential : ResourceWrapper
+  | ResourceErased : ResourceWrapper
+  | ResourceClaimedChecked : ResourceWrapper;
+
+inductive ResourceExpr : Type :=
+  | ResourceUnit : ResourceExpr
+  | ResourceNewOwner : ResourceExpr
+  | ResourceUse : Nat -> ResourceExpr
+  | ResourceLet : Nat -> ResourceExpr -> ResourceExpr -> ResourceExpr
+  | ResourcePair : ResourceExpr -> ResourceExpr -> ResourceExpr
+  | ResourceBranch : ResourceExpr -> ResourceExpr -> ResourceExpr
+  | ResourceBorrow : ResourceBorrowKind -> Nat -> Nat -> ResourceExpr -> ResourceExpr
+  | ResourceReadBorrow : Nat -> ResourceExpr
+  | ResourceSuspend : ResourceSuspension -> ResourceExpr -> ResourceExpr
+  | ResourceApply : ResourceExpr -> ResourceExpr -> ResourceExpr
+  | ResourceRun : ResourceExpr -> ResourceExpr
+  | ResourceMultiShot : ResourceExpr -> ResourceExpr
+  | ResourceWrap : ResourceWrapper -> ResourceExpr -> ResourceExpr
+  | ResourceSnapshot : Nat -> ResourceExpr
+  | ResourceResize : Nat -> ResourceExpr
+  | ResourceRequireSnapshot : Nat -> ResourceExpr -> ResourceExpr;
+
+inductive ResourceFault : Type :=
+  | ResourceBudgetExhausted : ResourceFault
+  | ResourceUnbound : Nat -> ResourceFault
+  | ResourceAlreadyUsed : Nat -> ResourceFault
+  | ResourceBorrowConflict : Nat -> ResourceFault
+  | ResourceScopeEscape : Nat -> ResourceFault
+  | ResourceExpectedOwner : Nat -> ResourceFault
+  | ResourceExpectedBorrow : Nat -> ResourceFault
+  | ResourceExpectedUnit : ResourceFault
+  | ResourceExpectedCallable : ResourceFault
+  | ResourceExpectedAction : ResourceFault
+  | ResourceArgumentMismatch : ResourceFault
+  | ResourceBranchMismatch : Nat -> ResourceFault
+  | ResourceLegacyActionPayload : ResourceFault
+  | ResourceUnrestrictedArgument : ResourceFault
+  | ResourceMultiShotCapture : ResourceFault
+  | ResourceExpectedSnapshot : ResourceFault
+  | ResourceSnapshotOwnerMismatch : Nat -> ResourceFault
+  | ResourceStaleSnapshot : Nat -> ResourceFault
+  | ResourceUntrustedWrapper : ResourceFault;
+
+private record ResourceUsage : Type where
+  resource_affine : Bool;
+  resource_regions : List Nat;
+end;
+
+private inductive ResourceValue : Type :=
+  | ResourceUnitValue : ResourceValue
+  | ResourceOwnerValue : Nat -> Nat -> ResourceValue
+  | ResourceBorrowValue : ResourceBorrowKind -> Nat -> ResourceValue
+  | ResourceAggregateValue : ResourceUsage -> ResourceValue
+  | ResourceClaimValue : ResourceUsage -> ResourceValue
+  | ResourceCallableValue : ResourceParameter -> ResourceUsage -> ResourceValue
+  | ResourceSystemValue : ResourceUsage -> ResourceValue
+  | ResourceLegacyValue : ResourceValue -> ResourceValue
+  | ResourceSnapshotValue : Nat -> Nat -> ResourceValue;
+
+private record ResourceBinding : Type where
+  resource_name : Nat;
+  resource_value : ResourceValue;
+  resource_moved : Bool;
+  resource_loan : Maybe ResourceBorrowKind;
+end;
+
+private record ResourceStep : Type where
+  resource_fuel : Nat;
+  resource_bindings : List ResourceBinding;
+  resource_result : ResourceValue;
+end;
+
+private record ResourceScan : Type where
+  resource_scan_fuel : Nat;
+  resource_free_names : List Nat;
+end;
+
+private record ResourceCaptures : Type where
+  resource_outer : List ResourceBinding;
+  resource_inner : List ResourceBinding;
+  resource_captured_usage : ResourceUsage;
+end;
+
+private def ResourceResult (A : Type) : Type := Either ResourceFault A;
+
+private def resource_scan_without (name : Nat) (scan : ResourceScan) : ResourceScan :=
+    MkResourceScan (ResourceScan_resource_scan_fuel scan) (filter Nat (neb_nat name) (ResourceScan_resource_free_names scan));
+
+private def resource_scan_prepend (name : Nat) (scan : ResourceScan) : ResourceScan :=
+    MkResourceScan (ResourceScan_resource_scan_fuel scan) (Cons Nat name (ResourceScan_resource_free_names scan));
+
+private def resource_scan_then (first : Maybe ResourceScan) (next : Nat -> Maybe ResourceScan)
+    : Maybe ResourceScan :=
+    maybe_bind ResourceScan ResourceScan first (fun (left : ResourceScan) =>
+      mapMaybe ResourceScan ResourceScan
+        (fun (right : ResourceScan) => MkResourceScan (ResourceScan_resource_scan_fuel right)
+          (append Nat (ResourceScan_resource_free_names left) (ResourceScan_resource_free_names right)))
+        (next (ResourceScan_resource_scan_fuel left)));
+
+private def resource_scan : ResourceExpr -> Nat -> Maybe ResourceScan :=
+  fix scan (expr : ResourceExpr) (fuel : Nat) : Maybe ResourceScan :=
+    match fuel with
+    | Z => Nothing ResourceScan
+    | S remaining =>
+        let scan_leaf : List Nat -> Maybe ResourceScan :=
+            fun (names : List Nat) => Just ResourceScan (MkResourceScan remaining names) in
+        match expr with
+        | ResourceUnit => scan_leaf ([] : List Nat)
+        | ResourceNewOwner => scan_leaf ([] : List Nat)
+        | ResourceUse name => scan_leaf ([name] : List Nat)
+        | ResourceLet name value body => resource_scan_then (scan value remaining)
+            (fun (next : Nat) => mapMaybe ResourceScan ResourceScan
+              (resource_scan_without name) (scan body next))
+        | ResourcePair left right => resource_scan_then (scan left remaining) (fun (next : Nat) => scan right next)
+        | ResourceBranch left right => resource_scan_then (scan left remaining) (fun (next : Nat) => scan right next)
+        | ResourceBorrow _ owner name body => mapMaybe ResourceScan ResourceScan
+            (fun (found : ResourceScan) => resource_scan_prepend owner (resource_scan_without name found))
+            (scan body remaining)
+        | ResourceReadBorrow name => scan_leaf ([name] : List Nat)
+        | ResourceSuspend mode body => match mode with
+            | ResourceCallable parameter _ => mapMaybe ResourceScan ResourceScan
+                (resource_scan_without parameter) (scan body remaining)
+            | ResourceSystemAction => scan body remaining
+            end
+        | ResourceApply callable argument => resource_scan_then (scan callable remaining)
+            (fun (next : Nat) => scan argument next)
+        | ResourceRun action => scan action remaining
+        | ResourceMultiShot callable => scan callable remaining
+        | ResourceWrap _ value => scan value remaining
+        | ResourceSnapshot name => scan_leaf ([name] : List Nat)
+        | ResourceResize name => scan_leaf ([name] : List Nat)
+        | ResourceRequireSnapshot name evidence => mapMaybe ResourceScan ResourceScan
+            (resource_scan_prepend name) (scan evidence remaining)
+        end
+    end;
+
+private def resource_plain_usage : ResourceUsage := MkResourceUsage False [];
+
+private def resource_merge_usage (left : ResourceUsage) (right : ResourceUsage) : ResourceUsage :=
+    MkResourceUsage (orb (ResourceUsage_resource_affine left) (ResourceUsage_resource_affine right))
+      (foldr Nat (List Nat) (fun (region : Nat) (regions : List Nat) =>
+        if any Nat (eq_nat region) regions then regions else Cons Nat region regions)
+        (ResourceUsage_resource_regions right) (ResourceUsage_resource_regions left));
+
+private def resource_value_usage (value : ResourceValue) : ResourceUsage :=
+    match value with
+    | ResourceUnitValue => resource_plain_usage
+    | ResourceOwnerValue _ _ => MkResourceUsage True []
+    | ResourceBorrowValue kind region => MkResourceUsage
+        (match kind with | ResourceShared => False | ResourceExclusive => True end) [region]
+    | ResourceAggregateValue usage => usage
+    | ResourceClaimValue usage => usage
+    | ResourceCallableValue _ usage => usage
+    | ResourceSystemValue usage => MkResourceUsage True (ResourceUsage_resource_regions usage)
+    | ResourceLegacyValue _ => resource_plain_usage
+    | ResourceSnapshotValue _ _ => resource_plain_usage
+    end;
+
+private def resource_core_compatible (usage : ResourceUsage) : Bool :=
+    andb (notb (ResourceUsage_resource_affine usage)) (nullb Nat (ResourceUsage_resource_regions usage));
+
+private def resource_lookup (name : Nat) (bindings : List ResourceBinding) : Maybe ResourceBinding :=
+    find ResourceBinding (fun (binding : ResourceBinding) => eq_nat (ResourceBinding_resource_name binding) name) bindings;
+
+private def resource_replace (replacement : ResourceBinding) : List ResourceBinding -> List ResourceBinding :=
+  fix replace (bindings : List ResourceBinding) : List ResourceBinding :=
+    match bindings with
+    | Nil => Nil ResourceBinding
+    | Cons binding rest =>
+        if eq_nat (ResourceBinding_resource_name binding) (ResourceBinding_resource_name replacement) then Cons ResourceBinding replacement rest
+        else Cons ResourceBinding binding (replace rest)
+    end;
+
+private def resource_bind (name : Nat) (value : ResourceValue) (bindings : List ResourceBinding)
+    : List ResourceBinding :=
+    Cons ResourceBinding (MkResourceBinding name value False (Nothing ResourceBorrowKind)) bindings;
+
+private def resource_live (A : Type) (name : Nat) (bindings : List ResourceBinding)
+    (next : ResourceBinding -> ResourceResult A) : ResourceResult A :=
+    match resource_lookup name bindings with
+    | Nothing => Left ResourceFault A (ResourceUnbound name)
+    | Just binding => if (ResourceBinding_resource_moved binding) then Left ResourceFault A (ResourceAlreadyUsed name)
+        else next binding
+    end;
+
+private def resource_take (A : Type) (name : Nat) (bindings : List ResourceBinding)
+    (next : ResourceValue -> List ResourceBinding -> ResourceResult A) : ResourceResult A :=
+    resource_live A name bindings (fun (binding : ResourceBinding) =>
+      match (ResourceBinding_resource_loan binding) with
+      | Just _ => Left ResourceFault A (ResourceBorrowConflict name)
+      | Nothing =>
+          let usage : ResourceUsage := resource_value_usage (ResourceBinding_resource_value binding) in
+          next (ResourceBinding_resource_value binding)
+            (if (ResourceUsage_resource_affine usage) then
+               resource_replace (MkResourceBinding name (ResourceBinding_resource_value binding) True (ResourceBinding_resource_loan binding)) bindings
+             else bindings)
+      end);
+
+private def resource_captures : List Nat -> ResourceCaptures -> ResourceResult ResourceCaptures :=
+  fix collect (names : List Nat) (captures : ResourceCaptures) : ResourceResult ResourceCaptures :=
+    match names with
+    | Nil => Right ResourceFault ResourceCaptures captures
+    | Cons name rest => match resource_lookup name (ResourceCaptures_resource_inner captures) with
+        | Just _ => collect rest captures
+        | Nothing => resource_take ResourceCaptures name (ResourceCaptures_resource_outer captures)
+            (fun (value : ResourceValue) (outer : List ResourceBinding) =>
+              collect rest (MkResourceCaptures outer (resource_bind name value (ResourceCaptures_resource_inner captures))
+                (resource_merge_usage (ResourceCaptures_resource_captured_usage captures) (resource_value_usage value))))
+        end
+    end;
+
+private def resource_ok (fuel : Nat) (bindings : List ResourceBinding) (value : ResourceValue)
+    : ResourceResult ResourceStep :=
+    Right ResourceFault ResourceStep (MkResourceStep fuel bindings value);
+
+private def resource_fault (fault : ResourceFault) : ResourceResult ResourceStep :=
+    Left ResourceFault ResourceStep fault;
+
+private def resource_then (step : ResourceResult ResourceStep)
+    (next : ResourceStep -> ResourceResult ResourceStep) : ResourceResult ResourceStep :=
+    result_bind ResourceFault ResourceStep ResourceStep step next;
+
+private def resource_unit_then (step : ResourceResult ResourceStep)
+    (next : ResourceStep -> ResourceResult ResourceStep) : ResourceResult ResourceStep :=
+    resource_then step (fun (checked : ResourceStep) =>
+      if let ResourceUnitValue := (ResourceStep_resource_result checked : ResourceValue)
+      then next checked else resource_fault ResourceExpectedUnit);
+
+private def resource_drop (bindings : List ResourceBinding) : List ResourceBinding :=
+    match bindings with
+    | Nil => Nil ResourceBinding
+    | Cons _ rest => rest
+    end;
+
+private def resource_same_state (left : ResourceBinding) (right : ResourceBinding) : Bool :=
+    let moved_right : Bool := ResourceBinding_resource_moved right in
+    andb (if ResourceBinding_resource_moved left then moved_right else notb moved_right)
+      (if let ResourceOwnerValue origin version := (ResourceBinding_resource_value left : ResourceValue) then
+         if let ResourceOwnerValue other_origin other_version := (ResourceBinding_resource_value right : ResourceValue)
+         then andb (eq_nat origin other_origin) (eq_nat version other_version)
+         else False
+       else True);
+
+private def resource_disagree : List ResourceBinding -> List ResourceBinding -> Maybe Nat :=
+  fix compare (left : List ResourceBinding) (right : List ResourceBinding) : Maybe Nat :=
+    match left, right with
+    | Nil, Nil => Nothing Nat
+    | Cons binding _, Nil => Just Nat (ResourceBinding_resource_name binding)
+    | Nil, Cons binding _ => Just Nat (ResourceBinding_resource_name binding)
+    | Cons first first_rest, Cons second second_rest =>
+        if andb (eq_nat (ResourceBinding_resource_name first) (ResourceBinding_resource_name second)) (resource_same_state first second)
+        then compare first_rest second_rest else Just Nat (ResourceBinding_resource_name first)
+    end;
+
+private def resource_can_borrow (kind : ResourceBorrowKind) (loan : Maybe ResourceBorrowKind) : Bool :=
+    match loan with
+    | Nothing => True
+    | Just active => match active, kind with
+        | ResourceShared, ResourceShared => True
+        | ResourceShared, ResourceExclusive => False
+        | ResourceExclusive, ResourceShared => False
+        | ResourceExclusive, ResourceExclusive => False
+        end
+    end;
+
+private def resource_with_owner (access : ResourceBorrowKind) (name : Nat) (bindings : List ResourceBinding)
+    (next : ResourceBinding -> Nat -> Nat -> ResourceResult ResourceStep) : ResourceResult ResourceStep :=
+    resource_live ResourceStep name bindings (fun (binding : ResourceBinding) =>
+      if let ResourceOwnerValue origin version := (ResourceBinding_resource_value binding : ResourceValue) then
+        if resource_can_borrow access (ResourceBinding_resource_loan binding) then next binding origin version
+        else resource_fault (ResourceBorrowConflict name)
+      else resource_fault (ResourceExpectedOwner name));
+
+private def resource_wrap (wrapper : ResourceWrapper) (step : ResourceStep) : ResourceResult ResourceStep :=
+    let usage : ResourceUsage := resource_value_usage (ResourceStep_resource_result step) in
+    let finish (value : ResourceValue) : ResourceResult ResourceStep :=
+        resource_ok (ResourceStep_resource_fuel step) (ResourceStep_resource_bindings step) value in
+    match wrapper with
+    | ResourceLegacyPure => if resource_core_compatible usage then finish (ResourceLegacyValue (ResourceStep_resource_result step))
+        else resource_fault ResourceLegacyActionPayload
+    | ResourceLegacyList => if resource_core_compatible usage then finish (ResourceAggregateValue usage)
+        else resource_fault ResourceUnrestrictedArgument
+    | ResourceExistential => finish (ResourceAggregateValue usage)
+    | ResourceErased => finish (ResourceAggregateValue usage)
+    | ResourceClaimedChecked => finish (ResourceClaimValue usage)
+    end;
+
+private def resource_suspension_scan (mode : ResourceSuspension) (scan : ResourceScan) : ResourceScan :=
+    match mode with
+    | ResourceCallable name _ => resource_scan_without name scan
+    | ResourceSystemAction => scan
+    end;
+
+private def resource_suspension_bindings (mode : ResourceSuspension) (origin : Nat) (captures : ResourceCaptures)
+    : List ResourceBinding :=
+    match mode with
+    | ResourceSystemAction => (ResourceCaptures_resource_inner captures)
+    | ResourceCallable name parameter => resource_bind name
+        (match parameter with
+         | ResourceUnitParameter => ResourceUnitValue
+         | ResourceOwnerParameter => ResourceOwnerValue origin 0
+         end) (ResourceCaptures_resource_inner captures)
+    end;
+
+private def resource_suspension_value (mode : ResourceSuspension) (usage : ResourceUsage) : ResourceValue :=
+    match mode with
+    | ResourceSystemAction => ResourceSystemValue usage
+    -- A scoped callable is once even when each captured shared borrow can be copied.
+    | ResourceCallable _ parameter => ResourceCallableValue parameter
+        (MkResourceUsage (notb (resource_core_compatible usage)) (ResourceUsage_resource_regions usage))
+    end;
+
+private def resource_argument_matches (parameter : ResourceParameter) (argument : ResourceValue) : Bool :=
+    match parameter with
+    | ResourceUnitParameter => if let ResourceUnitValue := (argument : ResourceValue) then True else False
+    | ResourceOwnerParameter => if let ResourceOwnerValue _ _ := (argument : ResourceValue) then True else False
+    end;
+
+private def resource_require_snapshot (name : Nat) (step : ResourceStep) : ResourceResult ResourceStep :=
+    let value : ResourceValue := ResourceStep_resource_result step in
+    -- Only the snapshot operation records an owner identity and version. Check
+    -- both at the use site. A claim carries only its payload's usage.
+    if let ResourceSnapshotValue observed_origin observed_version := (value : ResourceValue) then
+      resource_with_owner ResourceShared name (ResourceStep_resource_bindings step)
+        (fun (_ : ResourceBinding) (origin : Nat) (version : Nat) =>
+          if neb_nat origin observed_origin then resource_fault (ResourceSnapshotOwnerMismatch name)
+          else if neb_nat version observed_version then resource_fault (ResourceStaleSnapshot name)
+          else resource_ok (ResourceStep_resource_fuel step) (ResourceStep_resource_bindings step) ResourceUnitValue)
+    else if let ResourceClaimValue _ := (value : ResourceValue) then resource_fault ResourceUntrustedWrapper
+    else resource_fault ResourceExpectedSnapshot;
+
+-- The remaining budget is a fresh token at each visited node. Check both
+-- branch arms and suspended bodies within the same budget.
+private def resource_judge : ResourceExpr -> Nat -> List ResourceBinding -> ResourceResult ResourceStep :=
+  fix judge (expr : ResourceExpr) (fuel : Nat) (bindings : List ResourceBinding) : ResourceResult ResourceStep :=
+    match fuel with
+    | Z => resource_fault ResourceBudgetExhausted
+    | S remaining => match expr with
+        | ResourceUnit => resource_ok remaining bindings ResourceUnitValue
+        | ResourceNewOwner => resource_ok remaining bindings (ResourceOwnerValue remaining 0)
+        | ResourceUse name => resource_take ResourceStep name bindings
+            (fun (value : ResourceValue) (after : List ResourceBinding) => resource_ok remaining after value)
+        | ResourceLet name value body => resource_then (judge value remaining bindings)
+            (fun (initial : ResourceStep) => resource_then
+              (judge body (ResourceStep_resource_fuel initial) (resource_bind name (ResourceStep_resource_result initial) (ResourceStep_resource_bindings initial)))
+              (fun (final : ResourceStep) => resource_ok (ResourceStep_resource_fuel final)
+                (resource_drop (ResourceStep_resource_bindings final)) (ResourceStep_resource_result final)))
+        | ResourcePair first second => resource_then (judge first remaining bindings)
+            (fun (left : ResourceStep) => resource_then (judge second (ResourceStep_resource_fuel left) (ResourceStep_resource_bindings left))
+              (fun (right : ResourceStep) => resource_ok (ResourceStep_resource_fuel right) (ResourceStep_resource_bindings right)
+                (ResourceAggregateValue (resource_merge_usage (resource_value_usage (ResourceStep_resource_result left))
+                  (resource_value_usage (ResourceStep_resource_result right))))))
+        | ResourceBranch first second => resource_unit_then (judge first remaining bindings)
+            (fun (left : ResourceStep) => resource_unit_then (judge second (ResourceStep_resource_fuel left) bindings)
+              (fun (right : ResourceStep) =>
+                match resource_disagree (ResourceStep_resource_bindings left) (ResourceStep_resource_bindings right) with
+                | Nothing => Right ResourceFault ResourceStep right
+                | Just name => resource_fault (ResourceBranchMismatch name)
+                end))
+        | ResourceBorrow kind owner name body => resource_with_owner kind owner bindings
+            (fun (binding : ResourceBinding) (_ : Nat) (_ : Nat) =>
+              let locked : List ResourceBinding := resource_replace
+                  (MkResourceBinding owner (ResourceBinding_resource_value binding) False (Just ResourceBorrowKind kind)) bindings in
+              resource_then (judge body remaining
+                (resource_bind name (ResourceBorrowValue kind remaining) locked))
+                (fun (final : ResourceStep) =>
+                  let usage : ResourceUsage := resource_value_usage (ResourceStep_resource_result final) in
+                  if any Nat (eq_nat remaining) (ResourceUsage_resource_regions usage) then resource_fault (ResourceScopeEscape name)
+                  else resource_ok (ResourceStep_resource_fuel final) (resource_replace binding
+                    (resource_drop (ResourceStep_resource_bindings final))) (ResourceStep_resource_result final)))
+        | ResourceReadBorrow name => resource_live ResourceStep name bindings (fun (binding : ResourceBinding) =>
+            if let ResourceBorrowValue _ _ := (ResourceBinding_resource_value binding : ResourceValue)
+            then resource_ok remaining bindings ResourceUnitValue else resource_fault (ResourceExpectedBorrow name))
+        | ResourceSuspend mode body => match resource_scan body remaining with
+            | Nothing => resource_fault ResourceBudgetExhausted
+            | Just scanned =>
+                let free : ResourceScan := resource_suspension_scan mode scanned in
+                match resource_captures (ResourceScan_resource_free_names free) (MkResourceCaptures bindings [] resource_plain_usage) with
+                | Left fault => resource_fault fault
+                -- Move affine captures at construction. Check the body with
+                -- only the captured bindings and its parameter, if present.
+                | Right captures => resource_unit_then
+                    (judge body remaining (resource_suspension_bindings mode remaining captures))
+                    (fun (final : ResourceStep) => resource_ok (ResourceStep_resource_fuel final) (ResourceCaptures_resource_outer captures)
+                      (resource_suspension_value mode (ResourceCaptures_resource_captured_usage captures)))
+                end
+            end
+        | ResourceApply callable argument => resource_then (judge callable remaining bindings)
+            (fun (checked : ResourceStep) =>
+              if let ResourceCallableValue parameter _ := (ResourceStep_resource_result checked : ResourceValue) then
+                resource_then
+                  (judge argument (ResourceStep_resource_fuel checked) (ResourceStep_resource_bindings checked))
+                  (fun (actual : ResourceStep) => if resource_argument_matches parameter (ResourceStep_resource_result actual)
+                    then resource_ok (ResourceStep_resource_fuel actual) (ResourceStep_resource_bindings actual) ResourceUnitValue
+                    else resource_fault ResourceArgumentMismatch)
+              else resource_fault ResourceExpectedCallable)
+        | ResourceRun action => resource_then (judge action remaining bindings)
+            (fun (checked : ResourceStep) =>
+              let value : ResourceValue := ResourceStep_resource_result checked in
+              let finish (result : ResourceValue) : ResourceResult ResourceStep :=
+                  resource_ok (ResourceStep_resource_fuel checked) (ResourceStep_resource_bindings checked) result in
+              if let ResourceSystemValue _ := (value : ResourceValue) then finish ResourceUnitValue
+              else if let ResourceLegacyValue payload := (value : ResourceValue) then finish payload
+              else resource_fault ResourceExpectedAction)
+        | ResourceMultiShot callable => resource_then (judge callable remaining bindings)
+            (fun (checked : ResourceStep) =>
+              if let ResourceCallableValue _ usage := (ResourceStep_resource_result checked : ResourceValue) then
+                if resource_core_compatible usage
+                  then Right ResourceFault ResourceStep checked else resource_fault ResourceMultiShotCapture
+              else resource_fault ResourceExpectedCallable)
+        | ResourceWrap wrapper value => resource_then (judge value remaining bindings) (resource_wrap wrapper)
+        | ResourceSnapshot name => resource_with_owner ResourceShared name bindings
+            (fun (_ : ResourceBinding) (origin : Nat) (version : Nat) =>
+              resource_ok remaining bindings (ResourceSnapshotValue origin version))
+        | ResourceResize name => resource_with_owner ResourceExclusive name bindings
+            (fun (binding : ResourceBinding) (origin : Nat) (version : Nat) => resource_ok remaining
+              (resource_replace (MkResourceBinding name (ResourceOwnerValue origin (S version)) False
+                (ResourceBinding_resource_loan binding)) bindings)
+              ResourceUnitValue)
+        | ResourceRequireSnapshot name evidence => resource_then (judge evidence remaining bindings)
+            (resource_require_snapshot name)
+        end
+    end;
+
+def resource_model_check (fuel : Nat) (expr : ResourceExpr) : Either ResourceFault Unit :=
+    result_to_unit ResourceFault ResourceStep (resource_judge expr fuel []);

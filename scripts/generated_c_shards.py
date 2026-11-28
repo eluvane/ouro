@@ -52,16 +52,20 @@ def read_text(path: Path) -> str:
     return path.read_text(encoding="utf-8", errors="surrogateescape")
 
 
-def _read_normalized_source(path: Path, chunk_bytes: int, *, retain_text: bool) -> Tuple[str, dict]:
+def _read_normalized_source(path: Path, chunk_bytes: int, *, retain_text: bool,
+                            expected_raw_sha256: str | None = None) -> Tuple[str, dict]:
     if chunk_bytes <= 0:
         raise ValueError("generated C read size must be positive")
     digest = hashlib.sha256()
+    raw_digest = hashlib.sha256() if expected_raw_sha256 is not None else None
     byte_count = 0
     decoder = codecs.getincrementaldecoder("utf-8")(errors="surrogateescape") if retain_text else None
     parts: list[str] = []
     previous_cr = False
     with path.open("rb") as source:
         while data := source.read(chunk_bytes):
+            if raw_digest is not None:
+                raw_digest.update(data)
             # The prior chunk already emitted LF for a trailing CR.
             if previous_cr and data.startswith(b"\n"):
                 data = data[1:]
@@ -72,6 +76,8 @@ def _read_normalized_source(path: Path, chunk_bytes: int, *, retain_text: bool) 
             byte_count += len(data)
             if decoder is not None:
                 parts.append(decoder.decode(data))
+    if raw_digest is not None and raw_digest.hexdigest() != expected_raw_sha256:
+        raise ValueError(f"{path}: generated C raw digest changed")
     if decoder is not None:
         parts.append(decoder.decode(b"", final=True))
     return "".join(parts), {
@@ -81,12 +87,14 @@ def _read_normalized_source(path: Path, chunk_bytes: int, *, retain_text: bool) 
     }
 
 
-def read_source_text_digest(path: Path, *, chunk_bytes: int = 1024 * 1024) -> Tuple[str, dict]:
-    return _read_normalized_source(path, chunk_bytes, retain_text=True)
+def read_source_text_digest(path: Path, *, chunk_bytes: int = 1024 * 1024,
+                            expected_raw_sha256: str | None = None) -> Tuple[str, dict]:
+    return _read_normalized_source(path, chunk_bytes, retain_text=True, expected_raw_sha256=expected_raw_sha256)
 
 
-def read_normalized_source_digest(path: Path, *, chunk_bytes: int = 1024 * 1024) -> dict:
-    return _read_normalized_source(path, chunk_bytes, retain_text=False)[1]
+def read_normalized_source_digest(path: Path, *, chunk_bytes: int = 1024 * 1024,
+                                  expected_raw_sha256: str | None = None) -> dict:
+    return _read_normalized_source(path, chunk_bytes, retain_text=False, expected_raw_sha256=expected_raw_sha256)[1]
 
 
 def write_text_if_changed(path: Path, text: str) -> str:

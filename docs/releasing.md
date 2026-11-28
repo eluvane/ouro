@@ -115,9 +115,10 @@ Release validation defaults to the complete `pr` profile used by ordinary CI
 on `main`, with the same manual-only lint exclusion. It does not select only
 checks affected by the latest commit. Extended `manual`, `kernel`, and
 `stage-loop` profiles remain available through the dispatch `run_profile` input.
-Toolchain archive builds run independently of validation. After validation
-succeeds, the metadata job runs the project gate and writes the release
-manifest. Assembly waits for both the metadata job and the toolchain matrix,
+Each toolchain archive job builds a compiler with compact sources on its target
+host and runs alongside validation. After validation succeeds, the metadata job
+verifies the shared validation compiler, runs the project gate, and writes the
+release manifest. Assembly waits for both the metadata job and the toolchain matrix,
 verifies the archive inventory, and writes `SHA256SUMS` before uploading the
 release files. Draft and snapshot publication depend on successful assembly.
 

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 from pathlib import Path
 import re
@@ -18,7 +19,7 @@ import frontend_regen as REGEN
 import pack_frontend as PACKER
 import native_tool_build as NATIVE
 import scoped_host_exports as exports
-from frontend_regen import _source_scope_contracts
+from frontend_regen import _ScopeBindingChecks, _source_scope_contracts, _tu_scope_bindings
 from pack_frontend import _base_ver, _static_definition_family_counts, _static_symbol_starts
 from scoped_host_export_consumers import current_native_scoped_original
 from scoped_host_exports import _declarations, _read_export_tables
@@ -793,8 +794,8 @@ class SourceNameCompareScopeControls(unittest.TestCase):
                     units=closure, digests=inputs)
                 expected_key = REGEN.tu_key("pa", module, root, closure, inputs, "16000")
                 with (patch.object(REGEN.subprocess, "run", side_effect=emit_mock) as calls,
-                      patch.object(REGEN, "source_name_compare_binding",
-                                   wraps=REGEN.source_name_compare_binding) as scope,
+                      patch.object(_ScopeBindingChecks, "source_name_compare", autospec=True,
+                                   side_effect=_ScopeBindingChecks.source_name_compare) as scope,
                       patch.object(REGEN, "lower_ctor_lookup_binding",
                                    wraps=REGEN.lower_ctor_lookup_binding) as ctor):
                     cold = REGEN.emit_one(**options)
@@ -1204,7 +1205,7 @@ class LowerLocalLookupSourceControls(unittest.TestCase):
                     directory, cfg, inputs, record, binary, metadata, key = self.warm_native_record(repo, text)
                     files = (directory / "tool.gen.c", binary, metadata)
                     previous = [path.read_bytes() for path in files]
-                    with patch.object(NATIVE, "verify_generated_tool_source"):
+                    with patch.object(NATIVE, "_verify_generated_tool_source_snapshot"):
                         self.assertTrue(NATIVE.build_artifacts_current(directory, cfg, inputs, record, binary))
                         self.assertIsNotNone(NATIVE.complete_tool(binary, metadata, key, directory, cfg, inputs))
                     self.assertEqual(NATIVE.build_artifacts_current(directory, cfg, inputs, record, binary), valid)
@@ -1402,6 +1403,75 @@ class LookupCtorSourceControls(unittest.TestCase):
         seed.write_text("# SOURCE seed identity\n", encoding="utf-8")
         return graph, seed
 
+    def test_tu_bindings_share_one_fresh_ordered_closure(self):
+        owners = (PACKER.MODULE_LOOKUP_OWNER, PACKER.LOWER_LOCAL_LOOKUP_OWNER,
+                  PACKER.SOURCE_NAME_COMPARE_OWNER)
+        graph = REGEN.collect_units_many(owners)
+        source_paths = {unit for units in graph.values() for unit in units}
+        helpers = ("scripts/scoped_host_exports.py", "scripts/structural_quality_legacy.py")
+        runtime = "runtime/frontend_link.c"
+        root = "entry.ouro"
+        with tempfile.TemporaryDirectory() as temporary:
+            repo = Path(temporary).resolve()
+            for name in (*sorted(source_paths), *helpers, runtime):
+                target = repo / name
+                target.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copyfile(REPO / name, target)
+            entry = repo / root
+            original = ('import "' + '", "'.join(owners) + '";\n').encode()
+            entry.write_bytes(original)
+            parser = REGEN.SMC.cached_import_parser()
+            with (patch.object(REGEN, "ROOT", repo),
+                  patch.object(REGEN, "rel", lambda path: path.relative_to(repo).as_posix())):
+                closures, inputs = REGEN.capture_unit_inputs([root], parse_bytes=parser)
+                units = closures[root]
+                inputs.update({name: REGEN.digest(repo / name) for name in helpers})
+                inputs["frontend_runtime"] = REGEN.digest(repo / runtime)
+
+                def bindings(current_units):
+                    return _tu_scope_bindings(root, current_units, inputs, historical_bridge=False, parse_bytes=parser)
+
+                with (patch.object(REGEN.SMC, "collect_units", wraps=REGEN.SMC.collect_units) as walk,
+                      patch.object(REGEN, "import_targets", wraps=REGEN.import_targets) as imports,
+                      patch.object(Path, "read_bytes", autospec=True, side_effect=Path.read_bytes) as reads):
+                    selected = bindings(units)
+                    self.assertTrue(all(binding["selected"] for binding in selected.values()))
+                walk.assert_called_once()
+                self.assertCountEqual([call.args[0] for call in imports.call_args_list], units)
+                self.assertEqual(sum(call.args[0] == entry for call in reads.call_args_list), 1)
+                self.assertEqual(selected, {
+                    "module_lookup": REGEN.module_lookup_binding(root, units, inputs),
+                    "lower_local_lookup": REGEN.lower_local_lookup_binding(root, units, inputs),
+                    "source_name_compare_scope": REGEN.source_name_compare_binding(root, units, inputs),
+                    "elem_scope": REGEN.elem_scope_binding(root, units, inputs),
+                    "prelude_arithmetic": REGEN.prelude_arithmetic_binding(root, units, inputs),
+                })
+
+                reversed_units = units[::-1]
+                with self.assertRaisesRegex(RuntimeError, "module lookup canonical source closure changed"):
+                    REGEN.module_lookup_binding(root, reversed_units, inputs)
+                with self.assertRaisesRegex(TypeError, "_collect_current_units"):
+                    REGEN.module_lookup_binding(root, reversed_units, inputs, _collect_current_units=lambda: reversed_units)
+
+                for invalid_units in ([unit for unit in units if unit != PACKER.ELEM_OWNER],
+                                      [*units[:-1], PACKER.ELEM_OWNER, root]):
+                    with self.assertRaisesRegex(RuntimeError, "module lookup canonical source closure changed"):
+                        bindings(invalid_units)
+                metadata = entry.stat()
+                reordered = ('import "' + '", "'.join(reversed(owners)) + '";\n').encode()
+                entry.write_bytes(reordered)
+                os.utime(entry, ns=(metadata.st_atime_ns, metadata.st_mtime_ns))
+                with self.assertRaisesRegex(RuntimeError, "module lookup canonical source closure changed"):
+                    bindings(units)
+                entry.write_bytes(original)
+                source = repo / PACKER.SOURCE_NAME_COMPARE_OWNER
+                source.write_bytes(source.read_bytes() + b"\n-- Changed source input\n")
+                with self.assertRaisesRegex(RuntimeError, "source name compare scope source input changed or is missing"):
+                    bindings(units)
+                source.rename(source.with_suffix(".missing"))
+                with self.assertRaisesRegex(SystemExit, r"FRONTEND_REGEN: FAIL missing compiler/source_name_index\.ouro"):
+                    bindings(units)
+
     def test_contracts_hash_the_bytes_used_by_shape_checks(self):
         with tempfile.TemporaryDirectory() as temporary:
             repo = Path(temporary).resolve()
@@ -1491,7 +1561,7 @@ class LookupCtorSourceControls(unittest.TestCase):
             with patch.object(REGEN, "ROOT", repo), \
                     patch.object(REGEN, "rel", lambda path: path.relative_to(repo).as_posix()), \
                     patch.object(REGEN, "collect_units_many", return_value=graph), \
-                    patch.object(REGEN, "lower_local_lookup_binding", return_value={"selected": False}), \
+                    patch.object(_ScopeBindingChecks, "lower_local_lookup", return_value={"selected": False}), \
                     patch.object(REGEN, "ouro1_cmd", return_value=["SOURCE-mocked-compiler"]):
                 _units, inputs, full = REGEN.all_frontend_inputs(seed, "16000")
                 for name in ("compiler/lower_env.ouro", "compiler/pipeline_abi.ouro"):

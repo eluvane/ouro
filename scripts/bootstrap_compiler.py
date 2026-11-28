@@ -13,6 +13,7 @@ import json
 import os
 from pathlib import Path
 import shutil
+import stat
 import sys
 import sysconfig
 import tempfile
@@ -692,23 +693,23 @@ def chain(work: Path, snapshot: dict, build, *, historical_cache: Path | None = 
     return report
 
 
-def _installed_compiler_digest(binary: Path, receipt: Path, selected: dict) -> str | None:
-    data = read_json_object_or_none(receipt)
+def _installed_compiler_digest(binary: Path, data: dict | None, selected: dict) -> str | None:
     if data is None or data.get("kind") != KIND or data.get("key") != hash_json(selected) or data.get("selected") != selected:
         return None
     try:
         work = Path(data["work"])
         report_bytes = (work / "report.json").read_bytes()
         report = json.loads(report_bytes.decode("utf-8"))
+        comparison = report.get("complete_generated_c_comparison") if isinstance(report, dict) else None
         if (binary.is_file() and binary.stat().st_size > 4096 and sha256_file(binary) == data["binary_sha256"]
                 and isinstance(report, dict) and report.get("kind") == KIND
                 and report.get("pass") is True and report.get("key") == data["key"]
                 and report.get("binary_sha256") == data["binary_sha256"]
                 and repo_support.sha256_bytes(report_bytes) == data["report_sha256"]
                 and sha256_file(work / "inputs.json") == report["inputs_sha256"]
+                and isinstance(comparison, dict) and comparison.keys() == {"driver_u.c", "backend_u.c"}
                 and all(sha256_file(work / "out/p1" / name) == row["p1_sha256"] == row["p2_sha256"] == sha256_file(work / "out/p2" / name)
-                        for name, row in report["complete_generated_c_comparison"].items())
-                and set(report["complete_generated_c_comparison"]) == {"driver_u.c", "backend_u.c"}):
+                        for name, row in comparison.items())):
             return data["binary_sha256"]
     except (OSError, KeyError, TypeError, ValueError):
         return None
@@ -716,7 +717,7 @@ def _installed_compiler_digest(binary: Path, receipt: Path, selected: dict) -> s
 
 
 def installed_current(binary: Path, receipt: Path, selected: dict) -> bool:
-    return _installed_compiler_digest(binary, receipt, selected) is not None
+    return _installed_compiler_digest(binary, read_json_object_or_none(receipt), selected) is not None
 
 
 def local_bootstrap_cache(root: Path) -> Path | None:
@@ -741,42 +742,73 @@ def verify_current_inputs(root: Path, selected: dict) -> None:
 
 
 def copy_verified_compiler(root: Path, selected: dict, *, source: Path, source_build: Path,
-                           output: Path, output_build: Path) -> dict | None:
+                           output: Path, output_build: Path, optional_source: bool = False) -> dict | None:
     source_receipt = source.with_name("ouro1.bootstrap.json")
-    if source.resolve() != source or source_receipt.resolve() != source_receipt:
+    try:
+        if source.resolve() != source or source_receipt.resolve() != source_receipt:
+            return None
+        record = read_json_object_or_none(source_receipt)
+        if record is None or not isinstance(record.get("work"), str):
+            return None
+        work = Path(record["work"])
+        if work.parent != source_build / "bootstrap" or any(
+                (work / name).resolve() != work / name for name in CURRENT_EVIDENCE):
+            return None
+    except (OSError, RuntimeError, ValueError):
         return None
-    record = read_json_object_or_none(source_receipt)
-    if record is None or not isinstance(record.get("work"), str):
-        return None
-    work = Path(record["work"])
-    if work.parent != source_build / "bootstrap" or any(
-            (work / name).resolve() != work / name for name in CURRENT_EVIDENCE):
-        return None
-    if not installed_current(source, source_receipt, selected):
+    if _installed_compiler_digest(source, record, selected) is None:
         return None
     evidence = output_build / "bootstrap"
     if evidence.resolve() != evidence or output.parent.resolve() != output.parent:
         fail("shared bootstrap copy requires regular output directories")
     evidence.mkdir(parents=True, exist_ok=True)
-    copied = Path(tempfile.mkdtemp(prefix=record["key"][:12] + "-", dir=evidence))
-    for name in CURRENT_EVIDENCE:
-        target = copied / name
-        target.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(work / name, target)
     output.parent.mkdir(parents=True, exist_ok=True)
-    result = {**record, "work": str(copied)}
-    with tempfile.TemporaryDirectory(prefix=".compiler-", dir=output.parent) as temporary:
-        staging = Path(temporary)
-        binary = staging / output.name
-        receipt = staging / source_receipt.name
-        shutil.copy2(source, binary)
-        write_json_atomic(receipt, result)
-        if not installed_current(binary, receipt, selected):
-            return None
-        verify_current_inputs(root, selected)
-        # The receipt is the publication point. A partial copy cannot certify another binary.
-        os.replace(binary, output)
-        os.replace(receipt, output.with_name(source_receipt.name))
+    copied = Path(tempfile.mkdtemp(prefix=record["key"][:12] + "-", dir=evidence))
+    published = False
+    try:
+        result = {**record, "work": str(copied)}
+        with tempfile.TemporaryDirectory(prefix=".compiler-", dir=output.parent) as temporary:
+            staging = Path(temporary)
+            binary = staging / output.name
+            receipt = staging / source_receipt.name
+            files = [(work / name, copied / name) for name in CURRENT_EVIDENCE]
+            files.append((source, binary))
+            for original, target in files:
+                target.parent.mkdir(parents=True, exist_ok=True)
+                try:
+                    shutil.copy2(original, target)
+                except FileNotFoundError:
+                    return None
+                except PermissionError as error:
+                    # A Windows sharing error can omit the source path.
+                    if not optional_source or error.filename == str(target):
+                        raise
+                    return None
+            write_json_atomic(receipt, result)
+            # The default checkout can replace its compiler or evidence during the copy.
+            if not installed_current(binary, receipt, selected):
+                return None
+            verify_current_inputs(root, selected)
+            # The receipt is the publication point. A partial copy cannot certify another binary.
+            os.replace(binary, output)
+            os.replace(receipt, output.with_name(source_receipt.name))
+            published = True
+    finally:
+        if not published:
+            if copied.resolve() != copied:
+                fail(f"bootstrap copy evidence path changed before cleanup: {copied}")
+
+            def retry_unlink(remove, path, error_info):
+                error = error_info[1]
+                if isinstance(error, FileNotFoundError):
+                    return
+                if os.name != "nt" or remove is not os.unlink or not isinstance(error, PermissionError):
+                    raise error
+                # copy2 preserves the read-only attribute on Windows.
+                os.chmod(path, stat.S_IREAD | stat.S_IWRITE)
+                remove(path)
+
+            shutil.rmtree(copied, onerror=retry_unlink)
     return result
 
 
@@ -814,8 +846,9 @@ def ensure_current_compiler(cfg, build, root: Path = ROOT, *, compact_sources: b
     selected = current_inputs(root, cfg, build, compact_sources=compact_sources)
     build_dir = cfg.path("build_dir")
     output = cfg.path("c_build_dir") / "ouro1"
+    receipt = output.with_name("ouro1.bootstrap.json")
     cache_enabled = cfg.get_bool("cache_enabled")
-    installed_digest = (_installed_compiler_digest(output, output.with_name("ouro1.bootstrap.json"), selected)
+    installed_digest = (_installed_compiler_digest(output, read_json_object_or_none(receipt), selected)
                         if cache_enabled else None)
     if installed_digest is not None:
         build.log(cfg, "BOOTSTRAP: current compiler unchanged; checked successor reused")
@@ -836,8 +869,16 @@ def ensure_current_compiler(cfg, build, root: Path = ROOT, *, compact_sources: b
             if restored is not None:
                 build.log(cfg, "BOOTSTRAP: checked successor restored from shared local cache")
                 return {"cache": "hit", "binary": str(output), "binary_sha256": restored["binary_sha256"]}
-            result = build_current_compiler(cfg, build, root, selected,
-                                            historical_cache=historical_cache, historical_sha256=None)
+            checkout_build = shared.parent
+            restored = copy_verified_compiler(root, selected, source=checkout_build / "c/ouro1",
+                                              source_build=checkout_build, output=output, output_build=build_dir,
+                                              optional_source=True)
+            if restored is None:
+                result = build_current_compiler(cfg, build, root, selected,
+                                                historical_cache=historical_cache, historical_sha256=None)
+            else:
+                build.log(cfg, "BOOTSTRAP: checked successor restored from the default checkout build")
+                result = {"cache": "hit", "binary": str(output), "binary_sha256": restored["binary_sha256"]}
             try:
                 if copy_verified_compiler(root, selected, source=output, source_build=build_dir,
                                           output=cached, output_build=entry) is None:

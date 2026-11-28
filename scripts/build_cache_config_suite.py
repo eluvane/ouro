@@ -1048,6 +1048,72 @@ raise SystemExit(native.main())
     assert {str(path): path.read_bytes() for path in cache_root.glob("*/tool.gen.json")} == before_receipts
 
 
+def test_native_tool_generated_source_reads(tmp: Path) -> None:
+    import native_tool_build as native
+    from frontend_lower_lookup_test import LOCAL_COMPOSED_UNITS, LowerLocalLookupSourceControls
+
+    fixture = LowerLocalLookupSourceControls()
+    _, _, installed = fixture.native_installed_source()
+    crlf = installed.replace("\n", "\r\n")
+    raw, normalized = crlf.encode("utf-8"), installed.encode("utf-8")
+    repo = tmp / "native-source-reads"
+
+    def relative(path):
+        return Path(path).relative_to(repo).as_posix()
+
+    with (patch.object(native, "ROOT", repo), patch.object(native.build, "ROOT", repo),
+          patch.object(native.build, "rel", relative), patch.object(native.build.GCS, "ROOT", repo),
+          patch.object(native.build.GCS, "rel", relative),
+          patch.object(native.build, "choose_cc", return_value="SOURCE-cc"),
+          patch.object(native.frontend, "collect_units", return_value=list(LOCAL_COMPOSED_UNITS))):
+        directory, cfg, inputs, record, binary, _, _ = fixture.warm_native_record(repo, crlf)
+        generated = directory / "tool.gen.c"
+        saved = generated.stat()
+        opens = []
+
+        def open_path(path, mode="r", *args, _open=Path.open, **kwargs):
+            if path == generated and mode == "rb":
+                opens.append(path)
+            return _open(path, mode, *args, **kwargs)
+
+        def replace_source(contents):
+            generated.write_bytes(contents)
+            os.utime(generated, ns=(saved.st_atime_ns, saved.st_mtime_ns))
+
+        def check(expected, reads, *, current_inputs=inputs, current_record=record):
+            opens.clear()
+            assert native.build_artifacts_current(directory, cfg, current_inputs, current_record, binary) is expected
+            assert opens == [generated] * reads
+
+        def replace_source_during_link(*args, _link=native.build.link_stamp_digest, **kwargs):
+            result = _link(*args, **kwargs)
+            replace_source(normalized)
+            return result
+
+        plain_inputs = {**inputs, "sources": {path: digest for path, digest in inputs["sources"].items()
+                                             if path != native.packer.LOWER_LOCAL_LOOKUP_OWNER}}
+        with (patch.object(Path, "open", open_path),
+              patch.object(native.packer, "hook_lower_local_lookup",
+                           wraps=native.packer.hook_lower_local_lookup) as verify_hook):
+            check(True, 2)
+            check(True, 2, current_inputs=plain_inputs)
+            verify_hook.assert_called_once()
+
+            replace_source(normalized)
+            check(False, 1)
+            check(True, 2, current_record={**record, "generated_sha256": native.sha256_bytes(normalized)})
+
+            changed = raw.replace(b"ouro_rt.h", b"ouro_st.h", 1)
+            assert changed != raw
+            replace_source(changed)
+            check(False, 1, current_record={**record, "generated_sha256": native.sha256_bytes(changed)})
+
+            replace_source(raw)
+            with patch.object(native.build, "link_stamp_digest", side_effect=replace_source_during_link) as link:
+                check(False, 2)
+                link.assert_called_once()
+
+
 def test_native_tool_shard_cache(tmp: Path) -> None:
     """The real shard/object owners must gate fake-compiler preparation reuse."""
     repo = tmp / "repo_tool_shards"
@@ -5620,6 +5686,65 @@ def test_prepared_lint_host_selection(tmp: Path) -> None:
     assert "bootstrap-requested" not in result.stderr, result
 
 
+def test_uncached_lint_reuses_suite_preparation(tmp: Path) -> None:
+    repo = tmp / "uncached-lint-preparation"
+    scripts = repo / "scripts"
+    scripts.mkdir(parents=True)
+    for name in ("lint_suite.sh", "python.sh"):
+        shutil.copyfile(ROOT / "scripts" / name, scripts / name)
+    for directory in ("samples/pkg/app", "std", "runtime", "tests/clippy_semantic", "out"):
+        (repo / directory).mkdir(parents=True)
+    for name in ("scripts/tool_preparation_suite.py", "scripts/bench_suite.py", "tests/clippy_semantic/session_protocol.py"):
+        (repo / name).write_text("pass\n", encoding="utf-8")
+    (scripts / "build_tool.sh").write_text('#!/bin/sh\nprintf "%s\\n" "$1" >> "$BUILD_LOG"\n', encoding="utf-8")
+    (scripts / "ouro1.sh").write_text(
+        '#!/bin/sh\nprintf "%s\\n" "$OURO_CI_PREPARED_LINT" "$@"\nexit 25\n', encoding="utf-8")
+    (scripts / "native_tool_build.py").write_text(
+        'import json, os, sys\nfrom pathlib import Path\n'
+        'with Path(os.environ["NATIVE_TOOL_LOG"]).open("a", encoding="utf-8") as log:\n'
+        '    print(json.dumps(sys.argv[1:]), file=log)\n'
+        'status = "VERIFY_STATUS" if "--verify-published" in sys.argv else "BATCH_STATUS"\n'
+        'raise SystemExit(int(os.environ[status]))\n', encoding="utf-8")
+    package = repo / "out/ouro-pkg"
+    package.write_text('#!/bin/sh\ntest "$1" = install\n', encoding="utf-8")
+    package.chmod(0o755)
+    builds, native = repo / "builds.log", repo / "native-tools.jsonl"
+    env = isolated_env()
+    env.update(PYTHON=sys.executable, BUILD_LOG=str(builds), NATIVE_TOOL_LOG=str(native),
+               LINT_SUITE_OUT="out", OURO_CI_PREPARED_LINT="0", OURO_CI_LINT_STAGE="", VERIFY_STATUS="0")
+    launcher = ["sh", "scripts/lint_suite.sh"]
+    for cache, directory, compiler, prepared in (("0", "_build/c", "", "1"), ("1", "_build/c", "", "0"),
+                                                  ("0", "_build/c", "alternate", "0"), ("0", "", "", "0")):
+        builds.unlink(missing_ok=True)
+        native.unlink(missing_ok=True)
+        env.update(OURO_CACHE=cache, OURO_C_BUILD_DIR=directory, OURO1_COMPILER=compiler, BATCH_STATUS="0")
+        result = subprocess.run([*launcher, "--phase=production", "--shard=1/4"], cwd=repo, env=env,
+                                text=True, capture_output=True, timeout=15, check=False)
+        assert result.returncode == 25, result
+        assert result.stdout.splitlines()[1:7] == [prepared, "lint", "--deny", "--shard", "1/4", "std"], result
+        assert builds.read_text(encoding="utf-8").splitlines() == ["tools/lint.ouro"]
+        options = json.loads(native.read_text(encoding="utf-8"))
+        assert options[4:6] == ["--tool", "tools/pkg/main.ouro"] and options[7:] == [], options
+    for cache, verify_status in (("0", "23"), ("0", "0"), ("1", "0")):
+        builds.unlink(missing_ok=True)
+        native.unlink(missing_ok=True)
+        env.update(OURO_CACHE=cache, OURO_C_BUILD_DIR="_build/c", VERIFY_STATUS=verify_status, BATCH_STATUS="24")
+        result = subprocess.run([*launcher, "--phase=fixtures"], cwd=repo, env=env,
+                                text=True, capture_output=True, timeout=15, check=False)
+        assert result.returncode == (23 if verify_status == "23" else 24) and result.stdout == "", result
+        assert builds.read_text(encoding="utf-8").splitlines() == ["tools/lint.ouro"]
+        checks = [json.loads(line) for line in native.read_text(encoding="utf-8").splitlines()]
+        entry, output = "tools/clippy/structural_main.ouro", "_build/c/ouro-clippy-structural"
+        if cache == "0":
+            assert checks[0] == [entry, output, "--compiler", "_build/c/ouro1", "--verify-published"], checks
+            assert len(checks) == (1 if verify_status == "23" else 2), checks
+            if verify_status == "0":
+                assert entry not in checks[1] and "tools/pkg/main.ouro" not in checks[1], checks
+        else:
+            assert len(checks) == 1 and checks[0][-3:] == ["--tool", entry, output], checks
+            assert "tools/pkg/main.ouro" not in checks[0], checks
+
+
 def test_memory_preparation_failure(tmp: Path) -> None:
     import memory_budget_suite as memory
     from ourosmith.limits import RunResult
@@ -5953,6 +6078,7 @@ def main() -> int:
         test_tool_suite_keeps_installed_images_for_native_verification(tmp, "fix", "tools/fix/main.ouro")
         test_runtime_io_host_selection(tmp)
         test_prepared_lint_host_selection(tmp)
+        test_uncached_lint_reuses_suite_preparation(tmp)
         test_source_replace_report_protocol(tmp)
         test_frontend_native_async_protocol(tmp)
         test_retired_toolchain_contract(tmp)
@@ -5981,6 +6107,7 @@ def main() -> int:
         test_native_sleep_imports()
         test_native_tool_cache(tmp)
         test_native_tool_emission_resume(tmp)
+        test_native_tool_generated_source_reads(tmp)
         test_native_tool_shard_cache(tmp)
         test_native_tool_companion(tmp)
     print("BUILD_CACHE_CONFIG_SUITE: PASS")

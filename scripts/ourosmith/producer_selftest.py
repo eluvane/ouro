@@ -567,7 +567,9 @@ class ProducerTests(unittest.TestCase):
         with self.fixture() as fixture:
             calls = []
             scheduled = host.scheduled_tool_builds()
-            barrier = Barrier(sum(not task.dependencies for task, _, _ in scheduled), timeout=10)
+            ready = [task.name for task, _, _ in scheduled if not task.dependencies]
+            barrier = Barrier(len(ready), timeout=10)
+            hosted_barrier = Barrier(2, timeout=10)
 
             def build(command, log, **kwargs):
                 self.assertEqual(Path(command[2]), ROOT / "scripts/native_tool_build.py")
@@ -584,28 +586,35 @@ class ProducerTests(unittest.TestCase):
                     return "injected companion failure" if name == "ouro-fix-check" else None
                 if log.parent.name == "parallel" and not task.dependencies:
                     barrier.wait()
+                if log.parent.name == "hosted" and task.name in ready[:2]:
+                    self.assertEqual((allocation.jobs, allocation.memory_mib), (1, 3072))
+                    hosted_barrier.wait()
                 fixture.installed(name, target, task.name, companions=False)
                 return None
 
             cfg = ouro_build.ResolvedConfig(
                 dict(ouro_build.DEFAULTS, build_dir=fixture.directory, cache_dir=fixture.directory / "cache"), {})
             with patch.object(host, "build_config", return_value=cfg), \
-                 patch.object(host, "job_count", side_effect=(1, 20, 1, 20)), \
-                 patch.object(host, "available_memory_mib", return_value=32768), \
+                 patch.object(host, "job_count", side_effect=(1, 20, 2, 1, 20)), \
+                 patch.object(host, "available_memory_mib", side_effect=(32768, 32768, 6144, 32768, 32768)), \
                  patch.object(host, "build_command", side_effect=build):
                 first = host.prepare_tools(fixture.directory / "first", fixture.compiler)
                 second = host.prepare_tools(fixture.directory / "parallel", fixture.compiler)
+                hosted = host.prepare_tools(fixture.directory / "hosted", fixture.compiler)
                 for workers in (1, 20):
                     with self.assertRaisesRegex(ValueError, "ouro-fix-check: injected companion failure"):
                         host.prepare_tools(fixture.directory / f"failure-{workers}", fixture.compiler)
             self.assertEqual(first, second)
+            self.assertEqual(first, hosted)
             self.assertGreater(len(scheduled), len(host.TOOLS))
-            for phase, workers in (("first", 1), ("parallel", 20)):
+            for phase, workers in (("first", 1), ("parallel", 20), ("hosted", 2)):
                 report = json.loads((fixture.directory / phase / "tool-schedule.json").read_text(encoding="utf-8"))
                 self.assertEqual([row["entry"] for row in report["builds"]], [task.name for task, _, _ in scheduled])
                 self.assertEqual(report["peak_jobs"], workers)
                 self.assertEqual(report["not_run"], [])
                 self.assertEqual(len({work for _, log, work in calls if log.parent.name == phase}), len(scheduled))
+                if phase == "hosted":
+                    self.assertEqual((report["peak_tasks"], report["peak_memory_mib"]), (2, 6144))
             blocked = {"tools/fmt.ouro", "tools/fix/main.ouro"}
             expected = [task.name for task, _, _ in scheduled if task.name not in blocked]
             for workers in (1, 20):

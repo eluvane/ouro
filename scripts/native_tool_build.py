@@ -17,7 +17,8 @@ import time
 import unicodedata
 from contextlib import ExitStack, nullcontext
 from pathlib import Path
-from typing import TYPE_CHECKING
+from types import MappingProxyType
+from typing import TYPE_CHECKING, NamedTuple
 
 import frontend_regen as frontend
 import ouro_build as build
@@ -33,13 +34,15 @@ from scoped_host_exports import ScopedExportIndex
 from selfhost_module_cache import cached_import_parser, quoted_import_targets
 
 if TYPE_CHECKING:
-    from collections.abc import Callable
+    from collections.abc import Callable, Mapping
 
 ROOT = Path(__file__).resolve().parents[1]
 KIND = "ouro.native-tool-build.v1"
 # Match the memory estimates in the CI and Smith native-tool allocations.
 C_BUILD_BASE_MEMORY_MIB = 2560
 C_WORKER_MEMORY_MIB = 512
+COMPILER_SHARD_C_WORKERS_ENV = "OURO_CI_COMPILER_SHARD_C_WORKERS"
+COMPILER_SHARD_C_MEMORY_MIB = C_BUILD_BASE_MEMORY_MIB + 2 * C_WORKER_MEMORY_MIB
 RUNTIME = ("runtime/ouro_rt.c", "runtime/ouro_io.c", "runtime/ouro_prog_main.c",
            "runtime/frontend_link.c")
 BUILD_INPUTS = (
@@ -739,19 +742,31 @@ def read_current_shard_manifest(path: Path, expected_hash: str) -> dict | None:
     return data if isinstance(data, dict) else None
 
 
-def verify_generated_tool_source(generated: Path, inputs: dict, expected_sources: dict, *,
-                                 parse_bytes: frontend.ImportBytesParser | None = None) -> None:
-    """Recheck the retained source and installed export view."""
-    source_hashes = inputs["sources"]
+class _GeneratedToolSourceSnapshot(NamedTuple):
+    text: str | None
+    digest: Mapping[str, str | int]
+
+
+def _read_generated_tool_source(generated: Path, source_hashes: dict, *,
+                                expected_raw_sha256: str | None = None) -> _GeneratedToolSourceSnapshot:
     if packer.LOWER_LOCAL_LOOKUP_OWNER in source_hashes:
-        text, digest = build.GCS.read_source_text_digest(generated)
+        text, digest = build.GCS.read_source_text_digest(generated, expected_raw_sha256=expected_raw_sha256)
     else:
         text = None
-        digest = build.GCS.read_normalized_source_digest(generated, chunk_bytes=256 * 1024)
+        digest = build.GCS.read_normalized_source_digest(
+            generated, chunk_bytes=256 * 1024, expected_raw_sha256=expected_raw_sha256)
+    return _GeneratedToolSourceSnapshot(text, MappingProxyType(digest))
+
+
+def _verify_generated_tool_source_snapshot(source_snapshot: _GeneratedToolSourceSnapshot, inputs: dict,
+                                            expected_sources: dict, *,
+                                            parse_bytes: frontend.ImportBytesParser | None = None) -> None:
+    text, digest = source_snapshot
     if expected_sources != {"backend": digest}:
         raise RuntimeError("generated tool source digest changed")
     if text is None:
         return
+    source_hashes = inputs["sources"]
     entry = inputs["entry"]
     units = (frontend.collect_units(entry) if parse_bytes is None
              else frontend.collect_units_many([entry], parse_bytes=parse_bytes)[entry])
@@ -775,6 +790,13 @@ def verify_generated_tool_source(generated: Path, inputs: dict, expected_sources
     packer.hook_lower_local_lookup(text, units, units, entry, sources, installed=True, static_index=static_index)
 
 
+def verify_generated_tool_source(generated: Path, inputs: dict, expected_sources: dict, *,
+                                 parse_bytes: frontend.ImportBytesParser | None = None) -> None:
+    """Recheck the retained source and installed export view."""
+    snapshot = _read_generated_tool_source(generated, inputs["sources"])
+    _verify_generated_tool_source_snapshot(snapshot, inputs, expected_sources, parse_bytes=parse_bytes)
+
+
 def build_artifacts_current(directory: Path, cfg: build.ResolvedConfig, inputs: dict,
                             record: dict, binary: Path, *, isolated: bool = False,
                             parse_bytes: frontend.ImportBytesParser | None = None) -> bool:
@@ -787,19 +809,21 @@ def build_artifacts_current(directory: Path, cfg: build.ResolvedConfig, inputs: 
         shards = built["generated_c_shards"]
         generated_hash = record["generated_sha256"]
         manifest_hash = record["shard_manifest_sha256"]
-        if (sha256_file(generated) != generated_hash
+        if (not isinstance(generated_hash, str)
                 or shards["manifest_path"] != build.rel(manifest)
                 or hash_json(shards["settings"]) != hash_json(SHARD_SETTINGS)
                 or shards["generator_hash"] != build.GCS.generator_digest(SHARD_SETTINGS)):
             return False
+        source_snapshot = _read_generated_tool_source(generated, inputs["sources"], expected_raw_sha256=generated_hash)
         ok, _reason = build.GCS.manifest_valid(read_current_shard_manifest(manifest, manifest_hash),
             generator_hash=shards["generator_hash"], source_digests=shards["sources"], plan_meta=shards["shards"])
         if not ok:
             return False
         try:
-            verify_generated_tool_source(generated, inputs, shards["sources"], parse_bytes=parse_bytes)
+            _verify_generated_tool_source_snapshot(source_snapshot, inputs, shards["sources"], parse_bytes=parse_bytes)
         except RuntimeError:
             return False
+        del source_snapshot
         sources = []
         for item in shards["shards"]:
             path = (ROOT / item["path"]).resolve()
@@ -854,6 +878,7 @@ def build_artifacts_current(directory: Path, cfg: build.ResolvedConfig, inputs: 
             expected_stamp_fields={"target": "native-tool", "compiler_id": inputs["cc"], "command": command})
         if output_hash is None or link["output_sha256"] != output_hash:
             return False
+        # Reopen both files to detect changes during shard, object, and link validation.
         return sha256_file(generated) == generated_hash and sha256_file(manifest) == manifest_hash
     except (OSError, ValueError, KeyError, TypeError, AttributeError):
         return False
@@ -876,7 +901,20 @@ def complete_tool(binary: Path, metadata: Path, key: str, directory: Path,
     return None
 
 
-def _c_worker_count(cfg: build.ResolvedConfig, *, explicit_jobs: bool) -> int:
+def _compiler_shard_c_workers() -> int | None:
+    workers = os.environ.get(COMPILER_SHARD_C_WORKERS_ENV)
+    if workers is None:
+        return None
+    memory = available_memory_mib() if MEMORY_ENV in os.environ else None
+    if (workers != "2" or os.environ.get(JOBS_ENV) != workers
+            or memory is None or memory < COMPILER_SHARD_C_MEMORY_MIB):
+        raise ValueError(f"compiler shard C workers require two scheduler slots and {COMPILER_SHARD_C_MEMORY_MIB} MiB")
+    return 2
+
+
+def _c_worker_count(cfg: build.ResolvedConfig, *, explicit_jobs: bool, compiler_shard_workers: int | None = None) -> int:
+    if compiler_shard_workers is not None and not explicit_jobs:
+        return compiler_shard_workers
     jobs = build.jobs_value(cfg)
     if MEMORY_ENV not in os.environ and (explicit_jobs or jobs == 1):
         return jobs
@@ -1078,7 +1116,8 @@ def _build_tool(args: argparse.Namespace, cfg: build.ResolvedConfig, *,
                         output=linked,
                         object_dir=tool_object_dir(cfg, inputs, directory, isolated=isolated),
                         include_dirs=[ROOT / "runtime"], extra_cflags=EXTRA_CFLAGS,
-                        jobs=_c_worker_count(cfg, explicit_jobs=getattr(args, "jobs", None) is not None),
+                        jobs=_c_worker_count(cfg, explicit_jobs=getattr(args, "jobs", None) is not None,
+                                             compiler_shard_workers=getattr(args, "compiler_shard_c_workers", None)),
                         generated_c_shards=shard_report,
                     )
                     if process_manifest:
@@ -1215,6 +1254,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.verify_published and args.prepared_companions is not None:
         parser.error("--verify-published cannot be combined with --prepared-companions")
     try:
+        args.compiler_shard_c_workers = _compiler_shard_c_workers() if getattr(args, "jobs", None) is None else None
         requests = build_requests(args)
     except ValueError as exc:
         parser.error(str(exc))

@@ -1,0 +1,242 @@
+import "resource_model.ouro",
+  "../../compiler_startup_test_support.ouro";
+
+private def resource_test_owner : Nat := 10;
+private def resource_test_other : Nat := 11;
+private def resource_test_first_ref : Nat := 20;
+private def resource_test_second_ref : Nat := 21;
+private def resource_test_callable : Nat := 30;
+private def resource_test_parameter : Nat := 31;
+private def resource_test_proof : Nat := 40;
+
+private def resource_test_with_owner (body : ResourceExpr) : ResourceExpr :=
+    ResourceLet resource_test_owner ResourceNewOwner body;
+
+private def resource_test_then (first : ResourceExpr) (second : ResourceExpr) : ResourceExpr :=
+    ResourceLet 0 first second;
+
+private def resource_test_discard (value : ResourceExpr) : ResourceExpr :=
+    resource_test_then value ResourceUnit;
+
+private def resource_test_closure (parameter : ResourceParameter) (body : ResourceExpr) : ResourceExpr :=
+    ResourceSuspend (ResourceCallable resource_test_parameter parameter) body;
+
+private def resource_test_capturing : ResourceExpr :=
+    resource_test_closure ResourceUnitParameter
+      (resource_test_then (ResourceUse resource_test_owner) (ResourceUse resource_test_parameter));
+
+private def resource_test_read_first : ResourceExpr := ResourceReadBorrow resource_test_first_ref;
+
+private def resource_test_apply (argument : ResourceExpr) : ResourceExpr :=
+    ResourceApply (ResourceUse resource_test_callable) argument;
+
+private def resource_test_run : ResourceExpr := ResourceRun (ResourceUse resource_test_callable);
+
+private def resource_test_check_proof : ResourceExpr :=
+    ResourceRequireSnapshot resource_test_owner (ResourceUse resource_test_proof);
+
+private def resource_test_at (label : String) (name : Nat) : String :=
+    prim_string_concat label (prim_string_concat " " (prim_string_of_nat name));
+
+private def resource_test_observed (fuel : Nat) (expr : ResourceExpr) : String :=
+    match resource_model_check fuel expr with
+    | Right _ => "accepted"
+    | Left fault => match fault with
+        | ResourceBudgetExhausted => "budget exhausted"
+        | ResourceUnbound name => resource_test_at "unbound" name
+        | ResourceAlreadyUsed name => resource_test_at "already used" name
+        | ResourceBorrowConflict name => resource_test_at "borrow conflict" name
+        | ResourceScopeEscape name => resource_test_at "scope escape" name
+        | ResourceExpectedOwner name => resource_test_at "expected owner" name
+        | ResourceExpectedBorrow name => resource_test_at "expected borrow" name
+        | ResourceExpectedUnit => "expected unit"
+        | ResourceExpectedCallable => "expected callable"
+        | ResourceExpectedAction => "expected action"
+        | ResourceArgumentMismatch => "argument mismatch"
+        | ResourceBranchMismatch name => resource_test_at "branch mismatch" name
+        | ResourceLegacyActionPayload => "legacy action payload"
+        | ResourceUnrestrictedArgument => "unrestricted argument"
+        | ResourceMultiShotCapture => "multi-shot capture"
+        | ResourceExpectedSnapshot => "expected snapshot"
+        | ResourceSnapshotOwnerMismatch name => resource_test_at "snapshot owner mismatch" name
+        | ResourceStaleSnapshot name => resource_test_at "stale snapshot" name
+        | ResourceUntrustedWrapper => "untrusted wrapper"
+        end
+    end;
+
+private def resource_test_expect_at (fuel : Nat) (title : String) (expected : String) (expr : ResourceExpr)
+    : StartupTest :=
+    let observed : String := resource_test_observed fuel expr in
+    StartupTestOf title (prim_string_eq expected observed)
+      (prim_string_concat (prim_string_concat "expected " expected)
+        (prim_string_concat ", observed " observed));
+
+private def resource_test_expect : String -> String -> ResourceExpr -> StartupTest :=
+    resource_test_expect_at 64;
+
+private def resource_test_accept (title : String) (expr : ResourceExpr) : StartupTest :=
+    resource_test_expect title "accepted" expr;
+
+private def resource_test_pass_owners (second : Nat) : ResourceExpr :=
+    resource_test_with_owner (ResourceLet resource_test_other ResourceNewOwner
+      (ResourceLet resource_test_callable
+        (resource_test_closure ResourceOwnerParameter
+          (resource_test_discard (ResourceUse resource_test_parameter)))
+        (resource_test_then (resource_test_apply (ResourceUse resource_test_owner))
+          (resource_test_apply (ResourceUse second)))));
+
+private def resource_test_shared (body : ResourceExpr) : ResourceExpr :=
+    resource_test_with_owner (ResourceBorrow ResourceShared resource_test_owner resource_test_first_ref body);
+
+private def resource_test_duplicate_owner : ResourceExpr :=
+    resource_test_with_owner (ResourcePair (ResourceUse resource_test_owner) (ResourceUse resource_test_owner));
+
+private def resource_test_with_snapshot (body : ResourceExpr) : ResourceExpr :=
+    resource_test_with_owner
+      (ResourceLet resource_test_proof (ResourceSnapshot resource_test_owner) body);
+
+private def resource_test_laws : List StartupTest :=
+    [ resource_test_expect "pair cannot move one owner twice" "already used 10"
+        resource_test_duplicate_owner
+    , resource_test_expect "owner capture makes closure affine" "already used 30"
+        (resource_test_with_owner (ResourceLet resource_test_callable resource_test_capturing
+          (ResourcePair (ResourceUse resource_test_callable) (ResourceUse resource_test_callable))))
+    , resource_test_expect "legacy pure cannot make a replayable owner action" "legacy action payload"
+        (resource_test_with_owner (ResourceLet resource_test_callable
+          (ResourceWrap ResourceLegacyPure (ResourceUse resource_test_owner))
+          (resource_test_then resource_test_run resource_test_run)))
+    , resource_test_expect "a returned unit action cannot conceal its borrow capture" "scope escape 20"
+        (resource_test_shared (ResourceSuspend ResourceSystemAction resource_test_read_first))
+    , resource_test_expect "a branch cannot move an owner on only one path" "branch mismatch 10"
+        (resource_test_with_owner (ResourceBranch
+          (resource_test_discard (ResourceUse resource_test_owner)) ResourceUnit))
+    , resource_test_expect "legacy list cannot instantiate an affine element" "unrestricted argument"
+        (resource_test_with_owner (ResourceWrap ResourceLegacyList (ResourceUse resource_test_owner)))
+    , resource_test_expect "existential packaging cannot let a borrow escape" "scope escape 20"
+        (resource_test_shared (ResourceWrap ResourceExistential (ResourceUse resource_test_first_ref)))
+    , resource_test_expect "erased metadata cannot let a borrow escape" "scope escape 20"
+        (resource_test_shared (ResourceWrap ResourceErased (ResourceUse resource_test_first_ref)))
+    , resource_test_expect "resize invalidates a snapshot of the same owner" "stale snapshot 10"
+        (resource_test_with_snapshot
+          (resource_test_then (ResourceResize resource_test_owner) resource_test_check_proof))
+    , resource_test_expect "multi-shot continuation cannot hold an owner" "multi-shot capture"
+        (resource_test_with_owner (ResourceMultiShot resource_test_capturing))
+    , resource_test_expect "a user claim does not authorize a checked operation" "untrusted wrapper"
+        (resource_test_with_owner (ResourceRequireSnapshot resource_test_owner
+          (ResourceWrap ResourceClaimedChecked ResourceUnit)))
+    , resource_test_accept "two shared borrows can read together"
+        (resource_test_shared (ResourceBorrow ResourceShared resource_test_owner resource_test_second_ref
+          (resource_test_then resource_test_read_first (ResourceReadBorrow resource_test_second_ref))))
+    , resource_test_accept "two exclusive borrows can run in sequence"
+        (resource_test_with_owner (resource_test_then
+          (ResourceBorrow ResourceExclusive resource_test_owner resource_test_first_ref resource_test_read_first)
+          (resource_test_then
+            (ResourceBorrow ResourceExclusive resource_test_owner resource_test_first_ref resource_test_read_first)
+            (ResourceUse resource_test_owner))))
+    , resource_test_accept "owner capture allows one call"
+        (resource_test_with_owner (ResourceLet resource_test_callable resource_test_capturing
+          (resource_test_apply ResourceUnit)))
+    , resource_test_expect "closure capture moves the original owner" "already used 10"
+        (resource_test_with_owner (ResourceLet resource_test_callable resource_test_capturing
+          (ResourcePair (resource_test_apply ResourceUnit) (ResourceUse resource_test_owner))))
+    , resource_test_accept "a callable without affine captures is reusable"
+        (ResourceLet resource_test_callable (ResourceMultiShot
+          (resource_test_closure ResourceUnitParameter (ResourceUse resource_test_parameter)))
+          (resource_test_then (resource_test_apply ResourceUnit) (resource_test_apply ResourceUnit)))
+    , resource_test_accept "reusable callable can take distinct owners" (resource_test_pass_owners resource_test_other)
+    , resource_test_expect "reusable callable cannot take the same owner twice" "already used 10"
+        (resource_test_pass_owners resource_test_owner)
+    , resource_test_accept "a borrowed action can run inside its scope"
+        (resource_test_shared (ResourceRun (ResourceSuspend ResourceSystemAction resource_test_read_first)))
+    , resource_test_expect "a system action cannot run twice" "already used 30"
+        (ResourceLet resource_test_callable (ResourceSuspend ResourceSystemAction ResourceUnit)
+          (resource_test_then resource_test_run resource_test_run))
+    , resource_test_expect "an owner captured by a system action permits one run" "already used 30"
+        (resource_test_with_owner (ResourceLet resource_test_callable
+          (ResourceSuspend ResourceSystemAction (resource_test_discard (ResourceUse resource_test_owner)))
+          (resource_test_then resource_test_run resource_test_run)))
+    , resource_test_accept "legacy pure can run twice with an unrestricted payload"
+        (ResourceLet resource_test_callable (ResourceWrap ResourceLegacyPure ResourceUnit)
+          (resource_test_then resource_test_run resource_test_run))
+    , resource_test_accept "matched branches may both move an owner"
+        (resource_test_with_owner (ResourceBranch
+          (resource_test_discard (ResourceUse resource_test_owner))
+          (resource_test_discard (ResourceUse resource_test_owner))))
+    , resource_test_expect "branch join preserves owner version" "branch mismatch 10"
+        (resource_test_with_owner (ResourceBranch (ResourceResize resource_test_owner) ResourceUnit))
+    , resource_test_expect "a shared borrow prevents an overlapping exclusive borrow" "borrow conflict 10"
+        (resource_test_shared (ResourceBorrow ResourceExclusive resource_test_owner resource_test_second_ref ResourceUnit))
+    , resource_test_expect "an exclusive borrow prevents a second access through its owner" "borrow conflict 10"
+        (resource_test_with_owner (ResourceBorrow ResourceExclusive resource_test_owner resource_test_first_ref
+          (ResourceSnapshot resource_test_owner)))
+    , resource_test_expect "an exclusive borrow cannot move twice" "already used 20"
+        (resource_test_with_owner (ResourceBorrow ResourceExclusive resource_test_owner resource_test_first_ref
+          (ResourcePair (ResourceUse resource_test_first_ref) (ResourceUse resource_test_first_ref))))
+    , resource_test_expect "a borrow cannot move out through a nested action" "scope escape 20"
+        (resource_test_shared (ResourceSuspend ResourceSystemAction
+          (ResourceRun (ResourceSuspend ResourceSystemAction resource_test_read_first))))
+    , resource_test_expect "a callable capturing a shared borrow is once" "already used 30"
+        (resource_test_shared (ResourceLet resource_test_callable
+          (resource_test_closure ResourceUnitParameter resource_test_read_first)
+          (resource_test_then (resource_test_apply ResourceUnit) (resource_test_apply ResourceUnit))))
+    , resource_test_accept "a callable that does not use the borrow may leave the scope"
+        (ResourceLet resource_test_callable (resource_test_shared
+          (resource_test_closure ResourceUnitParameter (ResourceUse resource_test_parameter)))
+          (resource_test_apply ResourceUnit))
+    , resource_test_accept "a callable parameter shadows an outer owner during capture"
+        (resource_test_with_owner (ResourceLet resource_test_callable
+          (ResourceSuspend (ResourceCallable resource_test_owner ResourceUnitParameter)
+            (ResourceUse resource_test_owner))
+          (ResourcePair (resource_test_apply ResourceUnit) (ResourceUse resource_test_owner))))
+    , resource_test_expect "erased metadata preserves affinity of an owner" "already used 40"
+        (resource_test_with_owner (ResourceLet resource_test_proof
+          (ResourceWrap ResourceErased (ResourceUse resource_test_owner))
+          (ResourcePair (ResourceUse resource_test_proof) (ResourceUse resource_test_proof))))
+    , resource_test_accept "snapshot remains valid for the same owner after move"
+        (resource_test_with_snapshot (ResourceLet resource_test_other (ResourceUse resource_test_owner)
+          (ResourceRequireSnapshot resource_test_other (ResourceUse resource_test_proof))))
+    , resource_test_accept "fresh snapshot authorizes the resized owner"
+        (resource_test_with_owner (resource_test_then (ResourceResize resource_test_owner)
+          (ResourceLet resource_test_proof (ResourceSnapshot resource_test_owner) resource_test_check_proof)))
+    , resource_test_expect "snapshot for a different owner is rejected" "snapshot owner mismatch 11"
+        (resource_test_with_snapshot (ResourceLet resource_test_other ResourceNewOwner
+          (ResourceRequireSnapshot resource_test_other (ResourceUse resource_test_proof))))
+    , resource_test_expect "an unbound name in a closure is rejected" "unbound 10" resource_test_capturing
+    , resource_test_expect "an argument must match the callable parameter" "argument mismatch"
+        (ResourceApply (resource_test_closure ResourceOwnerParameter ResourceUnit) ResourceUnit)
+    , resource_test_expect_at 2 "node budget covers both operands" "budget exhausted"
+        (ResourcePair ResourceUnit ResourceUnit)
+    , resource_test_expect_at 3 "exact node budget accepts both operands" "accepted"
+        (ResourcePair ResourceUnit ResourceUnit)
+    , resource_test_expect_at 4 "an incomplete duplicate-owner check reports the budget" "budget exhausted"
+        resource_test_duplicate_owner
+    , resource_test_expect_at 5 "a complete duplicate-owner check reports the use" "already used 10"
+        resource_test_duplicate_owner
+    ];
+
+private def resource_test_local_scopes : Nat -> ResourceExpr -> ResourceExpr :=
+  fix nest (count : Nat) (body : ResourceExpr) : ResourceExpr :=
+    match count with
+    | Z => body
+    | S rest => resource_test_then ResourceUnit (nest rest body)
+    end;
+
+private def resource_generated_program (depth : Nat) (owner : Nat) (second_use : Nat) : ResourceExpr :=
+    ResourceLet owner ResourceNewOwner (ResourceLet (S owner) ResourceNewOwner
+      (resource_test_local_scopes depth (ResourcePair (ResourceUse owner) (ResourceUse second_use))));
+
+private def resource_generated_laws : Nat -> Nat -> List StartupTest :=
+  fix generate (count : Nat) (owner : Nat) : List StartupTest :=
+    match count with
+    | Z => []
+    | S rest => append StartupTest
+        [ resource_test_accept (resource_test_at "generated distinct owners" owner)
+            (resource_generated_program rest owner (S owner))
+        , resource_test_expect (resource_test_at "generated duplicated owner" owner)
+            (resource_test_at "already used" owner) (resource_generated_program rest owner owner)
+        ] (generate rest (add owner 2))
+    end;
+
+-- @entry main
+def main : IO Unit :=
+    startup_test_run (append StartupTest resource_test_laws (resource_generated_laws 4 100));

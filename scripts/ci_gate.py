@@ -18,20 +18,24 @@ import tarfile
 import tempfile
 import time
 import zlib
-from contextlib import ExitStack
+from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass, replace
 from functools import cache, lru_cache, partial
 from pathlib import Path
+from threading import Lock
 from typing import TYPE_CHECKING, Any, Optional, Sequence
 
 from ci_sample_paths import WORKFLOW_STDLIB_GOLDEN, sample_listing_contract_failures, sample_routes
-from compiler_shards import COMPILER_SHARDS, SHARD_MEMORY_MIB
+from compiler_shards import COMPILER_SHARDS, SHARD_MEMORY_MIB, SHARD_PREWARM_ENV, SHARD_PREWARM_MEMORY_MIB
 from local_scheduler import Allocation, CheckoutSnapshot, Task, available_memory_mib, bounded_jobs, configured_jobs, run_tasks
+from native_tool_build import (
+    C_BUILD_BASE_MEMORY_MIB, C_WORKER_MEMORY_MIB, COMPILER_SHARD_C_MEMORY_MIB, COMPILER_SHARD_C_WORKERS_ENV,
+)
 from repo_support import bind_relative_path, bool_env, hash_json, sha256_bytes, sha256_file, write_json_atomic
 from selfhost_module_cache import cached_import_parser
 
 if TYPE_CHECKING:
-    from collections.abc import Callable
+    from collections.abc import Callable, Iterator
 
     from selfhost_module_cache import ImportBytesParser
 
@@ -191,8 +195,16 @@ PROFILE_GROUPS = {
 }
 
 SHA40 = re.compile(r"[0-9a-fA-F]{40}\Z")
+SAMPLE_README_PATHS = (
+    "samples/bioinformatics/README.md",
+    "samples/demo/README.md",
+    "samples/examples/README.md",
+    "samples/scientific/README.md",
+    "samples/tutorial/README.md",
+)
 REPOSITORY_PATH_GATES = {
     ".shellcheckrc": ("shell-lint",),
+    **dict.fromkeys(SAMPLE_README_PATHS, ("docs-examples", "structural-quality")),
     "quality/ruff.toml": ("python-lint",),
     "quality/kernel_budgets.json": ("kernel-hardening", "python-syntax", "host-bound-inventory"),
     "quality/kernel_baseline.json": ("kernel-hardening", "python-syntax"),
@@ -278,6 +290,10 @@ PR_PATH_GATES = {
     "tools/fmt.ouro": TEXT_TOOL_GATES,
     "tools/fmt_paths.ouro": TEXT_TOOL_GATES,
     "tools/fmt_pipeline.ouro": TEXT_TOOL_GATES,
+    **dict.fromkeys(
+        ("tools/fix/main.ouro", "tools/fix/pipeline.ouro", "tools/fix/plan.ouro", "tools/fix/scan.ouro"),
+        tuple(name for name in TEXT_TOOL_GATES if name != "language-speed-simplicity"),
+    ),
     "tools/fix/": TEXT_TOOL_GATES,
     "tools/analyze/": TEXT_TOOL_GATES,
     "tools/pkg/": ("pkg", "release-package-check", "test", "lint", "memory-budget"),
@@ -295,12 +311,29 @@ FIXTURE_GATES = {
     "tests/fix_precision.ouro": ("fix",),
     "tests/fix_proofs.ouro": ("fix",),
     "tests/pkg_scanner_tests.ouro": ("pkg", "test"),
+    "tests/quality_diagnostic_tests.ouro": ("lint-fixtures",),
+    "tests/quality_input_tests.ouro": ("lint-fixtures",),
 }
 ISOLATED_COMPILER_FIXTURES = {
     "tests/native_live_tests.ouro", "tests/native_pe_tests.ouro", "tests/compiler_checked_program_tests.ouro",
     "tests/compiler_file_helper_tests.ouro", "tests/compiler_fs_predicate_binding_tests.ouro",
+    "tests/compiler_file_binding_tests.ouro", "tests/native_source_debug_tests.ouro",
+    "tests/compiler/diagnostics/compiler_positive_tests.ouro", "tests/compiler_source_packet_tests.ouro",
+    "tests/source_span_tests.ouro", "tests/compiler/systems/memory_model_tests.ouro",
+    "tests/compiler/systems/resource_model_tests.ouro",
+}
+ISOLATED_COMPILER_IMPORTS = {
+    "tests/compiler/systems/memory_model.ouro": "tests/compiler/systems/memory_model_tests.ouro",
+    "tests/compiler/systems/resource_model.ouro": "tests/compiler/systems/resource_model_tests.ouro",
 }
 HOST_ONLY_GATES = frozenset(("python-syntax", "python-lint", "shell-lint", "ci-runner-selftest", "api-baseline-drift"))
+# These gates can run without the shared PR artifact. Some build their own fixtures.
+PR_COMPILER_FREE_GATES = HOST_ONLY_GATES | {
+    "config-show", "generated-artifact-hashes", "hygiene", "release-package-check",
+    "build-cache-config", "selfhost-module-cache", "generated-c-shard-cache",
+    "stage-loop-c-object-cache", "stage-loop-frontend-regeneration",
+    "c-static-analysis", "smith-selftest", "structural-quality",
+}
 LOCAL_LIGHTWEIGHT_GATES = HOST_ONLY_GATES | {"config-show", "generated-artifact-hashes", "hygiene", "release-package-check"}
 LOCAL_PRIVATE_BUILDS = {"build-cache-config", "selfhost-module-cache", "generated-c-shard-cache",
                         "stage-loop-c-object-cache", "stage-loop-frontend-regeneration", "selfhost-bootstrap-evidence"}
@@ -355,7 +388,7 @@ class PathSelection:
 
     @property
     def host_compiler(self) -> bool:
-        return self.docs or bool(set(self.gates) - HOST_ONLY_GATES)
+        return self.docs or self.kernel or bool(set(self.gates) - PR_COMPILER_FREE_GATES)
 
     @property
     def dependency(self) -> bool:
@@ -473,12 +506,22 @@ def valid_changed_path(path: str) -> bool:
     return not (":" in path or "\0" in path or {"", ".", ".."}.intersection(path.split("/")))
 
 
+def is_regular_repo_file(path: str) -> bool:
+    source = ROOT / path
+    try:
+        return source.is_file() and source.resolve(strict=True) == source
+    except (OSError, RuntimeError):
+        return False
+
+
 def file_gates(path: str, samples: dict[str, set[str]], compiler_fixtures: dict[str, str], *,
                documentation: bool,
                fixture_gates: Callable[[str], set[str] | None] | None = None) -> set[str] | None:
     if path in CONTROL_PATH_GATES:
         return {*CONTROL_BASE_GATES, *CONTROL_PATH_GATES[path]}
     if path in REPOSITORY_PATH_GATES:
+        if path in SAMPLE_README_PATHS and not is_regular_repo_file(path):
+            return None
         if path in {"quality/kernel_baseline.json", "quality/kernel_budgets.json"} and not (ROOT / path).is_file():
             return None
         return set(REPOSITORY_PATH_GATES[path])
@@ -521,20 +564,17 @@ def file_gates(path: str, samples: dict[str, set[str]], compiler_fixtures: dict[
         return fixture
     if path in FIXTURE_GATES and (ROOT / path).is_file():
         return {"structural-quality", *FIXTURE_GATES[path]}
-    if path in compiler_fixtures and (ROOT / path).is_file():
+    if path in compiler_fixtures:
+        if not is_regular_repo_file(path):
+            return None
         if path.endswith(".golden"):
             return {compiler_fixtures[path]}
-        if path in ISOLATED_COMPILER_FIXTURES:
-            return {"structural-quality", compiler_fixtures[path]}
+        return {"structural-quality", compiler_fixtures[path]}
     if not path.endswith(".ouro") or path == "tools/fix/lex.ouro":
         return None
     for pattern, names in PR_PATH_GATES.items():
         if path == pattern or (pattern.endswith("/") and path.startswith(pattern)):
-            source = ROOT / path
-            try:
-                if not source.is_file() or source.resolve(strict=True) != source:
-                    return None
-            except (OSError, RuntimeError):
+            if not is_regular_repo_file(path):
                 return None
             return {*PR_BASE_GATES, *names}
     return None
@@ -548,10 +588,13 @@ def classify_paths(paths: Sequence[str]) -> PathSelection:
         return full_path_selection("invalid changed path")
     samples = sample_routes(normalized, ROOT)
     fixtures = {}
-    if any(path in ISOLATED_COMPILER_FIXTURES or (path.startswith("tests/") and path.endswith(".golden"))
-           for path in normalized):
+    fixture_inputs = {path for path in normalized if path in ISOLATED_COMPILER_FIXTURES
+                      or path in ISOLATED_COMPILER_IMPORTS or (path.startswith("tests/") and path.endswith(".golden"))}
+    if fixture_inputs:
         try:
-            fixtures = compiler_fixture_input_gates(ROOT)
+            owners = compiler_fixture_input_gates(ROOT)
+            fixtures = {path: owners[owner] for path in fixture_inputs
+                        if (owner := ISOLATED_COMPILER_IMPORTS.get(path, path)) in owners}
         except (OSError, ValueError):
             pass
     selected: set[str] = set()
@@ -571,8 +614,7 @@ def classify_paths(paths: Sequence[str]) -> PathSelection:
             if path.startswith(("tests/clippy_", "tools/clippy/")) or path in {
                     "scripts/lint_suite.sh", "tools/lint.ouro", "tools/lint_worker.ouro"}:
                 selected.update(PR_LINT_PHASES)
-            elif path in {"tests/quality_input_tests.ouro", "tests/quality_diagnostic_tests.ouro",
-                          "scripts/bench_suite.py", "scripts/ouro1.sh", "scripts/tool_preparation_suite.py"}:
+            elif path == "scripts/ouro1.sh" or "lint-fixtures" in FIXTURE_GATES.get(path, ()):
                 selected.add("lint-fixtures")
             elif path == "quality/clippy_grade_rules.json":
                 selected.add("lint-clippy")
@@ -666,9 +708,12 @@ def affected_compiler_gates(paths: Sequence[str], root: Path = ROOT) -> set[str]
         path = pending.pop()
         if path in imports:
             continue
-        source_path = (root / path).resolve()
-        if not source_path.is_relative_to(root):
+        source_path = root / path
+        resolved = source_path.resolve(strict=True)
+        if not resolved.is_relative_to(root):
             raise ValueError("compiler fixture import escapes the repository")
+        if resolved != source_path:
+            raise ValueError(f"noncanonical compiler fixture import: {path}")
         source = source_path.read_text(encoding="utf-8")
         dependencies = [normalize_path(target) for target in quoted_import_targets(source, path)]
         import_tokens, _comments = lex(source, "ouro", only_lexeme="import", collect_comments=False)
@@ -686,6 +731,10 @@ def affected_compiler_gates(paths: Sequence[str], root: Path = ROOT) -> set[str]
     for path in TopologicalSorter(imports).static_order():
         if not changed.isdisjoint(imports[path]):
             changed.add(path)
+    for path in sorted(changed.intersection(ISOLATED_COMPILER_IMPORTS)):
+        fixture = ISOLATED_COMPILER_IMPORTS[path]
+        if fixture not in owners or path not in imports[fixture]:
+            raise ValueError(f"compiler fixture {fixture} no longer imports {path}")
     if runner in changed:
         return {f"compiler-checking-{shard}" for shard in range(1, COMPILER_SHARDS + 1)}
     return {owners[path] for path in changed if path in owners}
@@ -877,10 +926,12 @@ def plan_paths(paths: Sequence[str]) -> PathSelection:
     if not selection.core:
         return selection
     affected: set[str] = set()
-    if selection.host_compiler and any(f"compiler-checking-{shard}" not in selection.gates for shard in range(1, COMPILER_SHARDS + 1)):
+    # A compiler fixture may depend on an input whose own gate does not use the artifact.
+    scan_dependencies = selection.docs or bool(set(selection.gates) - HOST_ONLY_GATES)
+    if scan_dependencies and any(f"compiler-checking-{shard}" not in selection.gates for shard in range(1, COMPILER_SHARDS + 1)):
         try:
-            affected = affected_compiler_gates(selection.paths)
-        except (OSError, ValueError, SystemExit, RecursionError) as exc:
+            affected = affected_compiler_gates(selection.paths, ROOT)
+        except (OSError, ValueError, SystemExit, RuntimeError) as exc:
             affected.update(set(selection.gates).intersection(PR_LINT_PHASES))
             selection = replace(full_path_selection(f"compiler dependency inventory unavailable: {exc}"), paths=selection.paths)
     lint_sources = ()
@@ -960,7 +1011,12 @@ def bool_text(value: bool) -> str:
     return "true" if value else "false"
 
 
-def write_github_output(path: Path, selection: PathSelection, matrix: dict[str, list[dict[str, str]]]) -> None:
+def write_github_output(path: Path, selection: PathSelection, matrix: dict[str, list[dict[str, str]]], *,
+                        groups: dict[str, tuple[str, ...]]) -> None:
+    selected = set(selection.gates)
+    planned = [row["group"] for row in matrix["include"]]
+    compiler_groups = [group for group in planned
+                       if group != "lint" and selected.intersection(groups[group]) - PR_COMPILER_FREE_GATES]
     with path.open("a", encoding="utf-8") as output:
         for name in ("core", "docs", "kernel", "editor", "site", "host_compiler", "dependency", "portable"):
             output.write(f"{name}={bool_text(getattr(selection, name))}\n")
@@ -968,6 +1024,7 @@ def write_github_output(path: Path, selection: PathSelection, matrix: dict[str, 
             output.write(f"{gate.replace('-', '_')}={bool_text(gate in selection.gates)}\n")
         output.write(f"mode={selection.mode}\n")
         output.write("matrix=" + json.dumps(matrix, separators=(",", ":")) + "\n")
+        output.write("compiler_groups=" + json.dumps(compiler_groups, separators=(",", ":")) + "\n")
         output.write("changed_paths=" + json.dumps(selection.paths, separators=(",", ":")) + "\n")
         output.write(f"selection_key={selection_key(selection)}\n")
 
@@ -1003,7 +1060,7 @@ def run_path_selection(base: str, head: str, github_output: str, *, full: bool =
     print(f"CI_PATHS {details}")
     if github_output:
         try:
-            write_github_output(Path(github_output), selection, matrix)
+            write_github_output(Path(github_output), selection, matrix, groups=groups)
         except OSError as exc:
             print(f"CI_PATHS: FAIL cannot write GitHub output: {exc}", file=sys.stderr)
             return 1
@@ -1245,6 +1302,7 @@ def run_compiler_artifact(action: str, archive: Path, expected_sha256: str) -> i
 HOST_SUITE_GATES = {
     "scripts/analyze_core_checks.py": ("analyze-precision", "smith-selftest"),
     "scripts/analyze_precision_suite.sh": ("analyze-precision",),
+    "scripts/bench_suite.py": ("lint-fixtures",),
     "scripts/bootstrap_compiler_test.py": ("build-cache-config",),
     "scripts/bootstrap_inputs_test.py": ("build-cache-config",),
     "scripts/build_cache_config_suite.py": (
@@ -1260,16 +1318,26 @@ HOST_SUITE_GATES = {
     "scripts/fix_check_suite.py": ("fix",),
     "scripts/fix_suite.sh": ("fix",),
     "scripts/fmt_suite.sh": ("fmt", "memory-budget"),
+    "scripts/frontend_arithmetic_test.py": ("build-cache-config",),
     "scripts/frontend_host_suite.py": ("frontend-security", "build-cache-config"),
     "scripts/frontend_lower_lookup_test.py": ("build-cache-config", "stage-loop-frontend-regeneration"),
     "scripts/frontend_native_async.py": ("frontend-security", "build-cache-config"),
     "scripts/frontend_native_fs_create.py": ("frontend-security", "build-cache-config"),
+    "scripts/frontend_native_process.py": ("frontend-security", "build-cache-config"),
+    "scripts/frontend_security_suite.sh": ("frontend-security", "build-cache-config"),
     "scripts/fs_read_suite.py": ("runtime-io", "analyze-precision", "frontend-security", "build-cache-config"),
+    "scripts/fs_read_suite_test.py": ("runtime-io", "frontend-security"),
     "scripts/fs_replace_suite.py": (
         "fmt", "fix", "runtime-io", "analyze-precision", "frontend-security", "build-cache-config", "memory-budget",
     ),
+    "scripts/fs_write_suite.py": ("runtime-io",),
+    "scripts/fs_write_suite_test.py": ("runtime-io",),
     "scripts/generated_c_shard_cache_suite.py": ("generated-c-shard-cache",),
     "scripts/hygiene.sh": ("hygiene",),
+    "scripts/kernel_hardening_suite.py": ("kernel-hardening",),
+    "scripts/kernel_profile.py": ("kernel-hardening",),
+    "scripts/kernel_profile_test.py": ("kernel-hardening",),
+    "scripts/kernel_scale_test.py": ("kernel-hardening",),
     "scripts/language_speed_simplicity_suite.py": ("language-speed-simplicity",),
     "scripts/lsp_suite.sh": ("lsp", "build-cache-config"),
     "scripts/memory_budget_suite.py": ("build-cache-config", "memory-budget"),
@@ -1282,6 +1350,7 @@ HOST_SUITE_GATES = {
     "scripts/stage_loop_generated_c_object_cache_suite.py": ("stage-loop-c-object-cache",),
     "scripts/structural_quality_suite.py": ("structural-quality-suite",),
     "scripts/test_selfhost_bootstrap_evidence.py": ("build-cache-config",),
+    "scripts/tool_preparation_suite.py": ("lint-fixtures",),
 }
 
 
@@ -1545,6 +1614,16 @@ def pr_matrix_contract_failures(section: str) -> list[str]:
         "          - group: lint\n"
     ):
         failures.append("Linux PR matrix must consume every routed group except the standalone lint group")
+    membership = "contains(fromJSON(needs.paths.outputs.compiler_groups), matrix.group)"
+    save_conditions = (" && (github.event_name == 'pull_request' || (github.event_name == 'push' &&"
+                       " (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master')))"
+                       " && steps.ouro-cache.outputs.cache-hit != 'true'")
+    for name in ("Restore cache", "Download host compiler", "Verify and install host compiler", "Save cache"):
+        steps = re.findall(rf"^      - name: {name}\n(.*?)(?=^      - |\Z)", section, re.MULTILINE | re.DOTALL)
+        conditions = [re.findall(r"^        if: (.*)$", step, re.MULTILINE) for step in steps]
+        expected = membership + (save_conditions if name == "Save cache" else "")
+        if conditions != [["${{ " + expected + " }}"]]:
+            failures.append("PR matrix lost compiler group routing for " + name)
     run_checks = re.findall(r"^      - name: Run checks\n(.*?)(?=^      - |\Z)", section, re.MULTILINE | re.DOTALL)
     if [step.rstrip() for step in run_checks] != [(
         "        env:\n"
@@ -1682,6 +1761,48 @@ def release_workflow_contract_failures(content: str) -> list[str]:
     ):
         if required not in content:
             failures.append("Release lost complete profile routing: " + required)
+    producer = workflow_job(content, "host-compiler")
+    validation = workflow_job(content, "release-validation")
+    metadata = workflow_job(content, "release-gates-and-package")
+    toolchain = workflow_job(content, "toolchain")
+    due = "    if: ${{ needs.groups.outputs.due == 'true' }}\n"
+    if any(required not in producer for required in (
+        "    needs: groups\n" + due,
+        "    runs-on: ubuntu-latest\n",
+        "    permissions:\n      contents: read\n",
+        "      sha256: ${{ steps.bundle.outputs.sha256 }}\n",
+        "      artifact: ${{ steps.bundle.outputs.artifact }}\n",
+        'run: python3 scripts/ci_gate.py --compiler-artifact key >> "$GITHUB_OUTPUT"\n',
+        "uses: actions/cache/restore@",
+        "key: ouro-host-compiler-v1-${{ runner.os }}-${{ runner.arch }}-${{ steps.inputs.outputs.key }}\n",
+        "      - name: Build and verify host compiler\n        env:\n",
+        "python3 scripts/ouro_build.py build --verbosity normal\n",
+        'python3 scripts/ci_gate.py --compiler-artifact export >> "$GITHUB_OUTPUT"\n',
+        "artifact=release-host-compiler-${{ github.run_id }}-${{ github.run_attempt }}",
+        "name: ${{ steps.bundle.outputs.artifact }}\n",
+        "path: _build/ci/host-compiler.tar.gz\n",
+    )) or any(value in producer for value in ("restore-keys:", "actions/cache/save@")):
+        failures.append("Release must restore by exact compiler identity, verify, and export the compiler")
+    install = (
+        "          name: ${{ needs.host-compiler.outputs.artifact }}\n"
+        "          path: _build/ci\n\n"
+        "      - name: Verify and install host compiler\n"
+        "        env:\n"
+        "          COMPILER_SHA256: ${{ needs.host-compiler.outputs.sha256 }}\n"
+        '        run: python3 scripts/ci_gate.py --compiler-artifact import --compiler-sha256 "$COMPILER_SHA256"\n\n'
+    )
+    for section, needs, gate in (
+        (validation, "    needs: [groups, host-compiler]\n" + due, "Run checks"),
+        (metadata, "    needs: [host-compiler, release-validation]\n", "Check project"),
+    ):
+        if needs not in section or install + f"      - name: {gate}\n" not in section:
+            failures.append("Release must verify the producer's compiler before " + gate)
+    if (re.search(r"^    if:", metadata, re.MULTILINE)
+            or "continue-on-error:" in producer + validation + metadata):
+        failures.append("Release metadata must require the compiler producer and all validation groups")
+    if ("    needs: groups\n" + due not in toolchain
+            or '"$PYTHON" scripts/ouro_build.py build --compact-sources --verbosity quiet\n' not in toolchain):
+        failures.append("Release toolchain archives must build independently with compact sources")
     return failures
 
 
@@ -1766,10 +1887,15 @@ def run_self_tests(all_gates: Sequence[Gate]) -> int:
     failures: list[str] = []
     failures.extend(summary_contract_failures())
     failures.extend(scheduler_contract_failures())
+    failures.extend(smith_allocation_contract_failures(all_gates))
+    failures.extend(compiler_shard_allocation_contract_failures(all_gates))
+    failures.extend(compiler_preparation_memory_contract_failures())
+    failures.extend(setup_progress_contract_failures())
     for gate in ("compiler-scale", *sorted(LOCAL_SERIAL_BUILD_GATES)):
         failures.extend(serial_gate_reservation_contract_failures(gate))
     failures.extend(preparation_contract_failures())
     failures.extend(routing_contract_failures())
+    failures.extend(pr_compiler_group_contract_failures())
     failures.extend(pr_test_group_contract_failures(all_gates))
     failures.extend(area_selection_contract_failures())
     failures.extend(dependency_selection_contract_failures())
@@ -1827,10 +1953,14 @@ def run_self_tests(all_gates: Sequence[Gate]) -> int:
         else:
             if profile == "pr":
                 failures.extend(pr_matrix_contract_failures(section))
+                if "      compiler_groups: ${{ steps.changes.outputs.compiler_groups }}\n" not in workflow_job(content, "paths"):
+                    failures.append("PR Paths lost the compiler group list")
                 if "    runs-on: ubuntu-latest\n" not in section:
                     failures.append("PR matrix must run on Linux")
                 for original, replacement in (
                     ("          - group: lint\n", "          - group: lint\n          - group: analyzer-lint\n"),
+                    ("contains(fromJSON(needs.paths.outputs.compiler_groups), matrix.group)",
+                     "needs.paths.outputs.host_compiler == 'true'"),
                     ("      - name: Run checks\n", "      - name: Run checks\n        if: ${{ false }}\n"),
                     ("          selection_options=()\n", "          exit 0\n          selection_options=()\n"),
                     ("          SELECTION_KEY: ${{ needs.paths.outputs.selection_key }}\n",
@@ -1927,9 +2057,20 @@ def run_self_tests(all_gates: Sequence[Gate]) -> int:
         ("fromJSON(needs.groups.outputs.matrix).include.*.group",
          "fromJSON(needs.groups.outputs.matrix)"),
         ("        exclude:\n          - group: lint\n", ""),
+        ("--compiler-artifact export", "--compiler-artifact key"),
+        ("actions/cache/restore@", "actions/cache/save@"),
+        ("${{ steps.inputs.outputs.key }}", "${{ github.sha }}"),
+        ("needs: [groups, host-compiler]", "needs: groups"),
+        ("needs: [host-compiler, release-validation]", "needs: host-compiler"),
+        ("name: ${{ needs.host-compiler.outputs.artifact }}", "name: release-host-compiler"),
+        ("COMPILER_SHA256: ${{ needs.host-compiler.outputs.sha256 }}", "COMPILER_SHA256: ''"),
+        ("      - name: Verify and install host compiler\n",
+         "      - name: Verify and install host compiler\n        if: ${{ false }}\n"),
+        ("      - name: Check project\n", "      - name: Verify optional project\n"),
+        ("build --compact-sources --verbosity quiet", "build --verbosity quiet"),
     ):
         if not release_workflow_contract_failures(release_workflow.replace(before, after, 1)):
-            failures.append("Release profile routing regression was accepted: " + before)
+            failures.append("Release workflow regression was accepted: " + before)
     for group in ("checks-parity", "checks-quality"):
         if NIGHTLY_GROUPS.get(group) != PR_GROUPS[group]:
             failures.append("nightly/manual must retain the isolated " + group + " group")
@@ -2029,6 +2170,57 @@ def run_self_tests(all_gates: Sequence[Gate]) -> int:
     return 0
 
 
+def pr_compiler_group_contract_failures() -> list[str]:
+    import contextlib
+    import io
+    from unittest.mock import patch
+
+    failures = []
+    checks_only = {"include": [{"group": "checks"}]}
+    mixed = {"include": [{"group": group} for group in ("checks", "smith", "analysis")]}
+    full = selection_matrix(full_path_selection("test full route"), groups=ROUTED_PR_GROUPS)
+    fallback = selection_matrix(plan_paths([]), groups=PULL_REQUEST_GROUPS)
+    with tempfile.TemporaryDirectory(prefix="ci-compiler-routing-") as temporary:
+        output = Path(temporary) / "github-output"
+        for paths, forced, matrix, compiler_groups, compiler in (
+            (["quality/ruff.toml"], False, checks_only, [], False),
+            (["scripts/c_static_analysis_suite.py"], False, mixed, ["checks"], True),
+            (["docs/getting_started.md"], False, {"include": []}, [], True),
+            (None, True, full, [row["group"] for row in full["include"] if row["group"] != "lint"], True),
+            (None, False, fallback, [row["group"] for row in fallback["include"] if row["group"] != "lint"], True),
+        ):
+            output.write_text("", encoding="utf-8")
+            with (patch(__name__ + ".changed_paths", return_value=(paths, "test diff")),
+                  patch.dict(os.environ, {"GITHUB_STEP_SUMMARY": ""}),
+                  contextlib.redirect_stdout(io.StringIO())):
+                status = run_path_selection("a" * 40, "b" * 40, str(output), full=forced)
+            values = dict(line.split("=", 1) for line in output.read_text(encoding="utf-8").splitlines())
+            if (status or json.loads(values["matrix"]) != matrix
+                    or json.loads(values["compiler_groups"]) != compiler_groups
+                    or values["host_compiler"] != bool_text(compiler)):
+                failures.append(f"PR compiler group output differs for {paths=}, {forced=}")
+            if matrix != mixed:
+                continue
+            for group, required in (("analysis", "c-static-analysis"), ("smith", "smith-selftest"),
+                                    ("checks", "host-bound-inventory")):
+                printed = io.StringIO()
+                with contextlib.redirect_stdout(printed):
+                    status = main(["--profile", "pr", "--group", group, "--list",
+                                   "--changed-paths-json", values["changed_paths"],
+                                   "--selection-key", values["selection_key"]])
+                names = [line.split()[1] for line in printed.getvalue().splitlines() if line.startswith("BLOCKING ")]
+                if status or required not in names or (group != "checks" and names != [required]):
+                    failures.append("PR compiler optimization lost the selected gate in " + group)
+    independent = PathSelection("changed", True, False, False, False, ("input.txt",), gates=("structural-quality",))
+    if independent.host_compiler or not replace(independent, kernel=True).host_compiler:
+        failures.append("PR compiler producer must cover independent kernel validation")
+    with (patch(__name__ + ".classify_paths", return_value=independent),
+          patch(__name__ + ".affected_compiler_gates", return_value={"compiler-checking-2"})):
+        if "compiler-checking-2" not in plan_paths(independent.paths).gates:
+            failures.append("Compiler-free PR gate hid an imported fixture input")
+    return failures
+
+
 def routing_contract_failures() -> list[str]:
     import contextlib
     import io
@@ -2124,7 +2316,7 @@ def routing_contract_failures() -> list[str]:
     }:
         failures.append("release/control-plane change selected unrelated matrix groups")
     for pattern, expected in PR_PATH_GATES.items():
-        path = {"tools/analyze/": "tools/analyze/ast.ouro", "tools/fix/": "tools/fix/main.ouro",
+        path = {"tools/analyze/": "tools/analyze/ast.ouro", "tools/fix/": "tools/fix/candidate_check.ouro",
                 "tools/pkg/": "tools/pkg/model.ouro"}.get(pattern, pattern)
         selected = classify_paths([path])
         required = set(PR_BASE_GATES) | set(expected)
@@ -2138,6 +2330,10 @@ def routing_contract_failures() -> list[str]:
             mixed = classify_paths([path, broad])
             if set(mixed.gates) != full or not mixed.portable:
                 failures.append(f"mixed route omitted full coverage: {path}, {broad}")
+    for path in ("tools/fix/main.ouro", "tools/fix/pipeline.ouro", "tools/fix/plan.ouro", "tools/fix/scan.ouro"):
+        expected = {*PR_BASE_GATES, *TEXT_TOOL_GATES} - {"language-speed-simplicity"}
+        if set(classify_paths([path]).gates) != expected:
+            failures.append(f"fixer command must retain its other affected checks: {path}")
     for path, tools in (("tools/doc/model.ouro", {"doc", "lsp"}), ("tools/doc/selftest.ouro", {"doc"})):
         if set(classify_paths([path]).gates) & {"doc", "lsp"} != tools:
             failures.append(f"documentation change lost its consumers: {path}")
@@ -2268,6 +2464,26 @@ def routing_contract_failures() -> list[str]:
                     failures.append(f"import token projection changed diagnostic: {exc}")
             else:
                 failures.append(f"import token projection accepted unsupported source: {body}")
+        support = "tests/compiler/systems/memory_model.ouro"
+        systems_fixture = "tests/compiler/systems/memory_model_tests.ouro"
+        owner = root / systems_fixture
+        owner.parent.mkdir(parents=True)
+        (root / support).write_text("def model : Nat := 0;\n", encoding="utf-8")
+        owner.write_text('import "memory_model.ouro";\n', encoding="utf-8")
+        (root / "tests/shared.ouro").write_text('import "../tools/lsp_model.ouro";\n', encoding="utf-8")
+        system_row = f'MkSuiteFixture "systems_memory_model" "{systems_fixture}" Z SuiteGoldenNone,\n'
+        inventory.write_text(literal_inventory.replace(rows[-1], system_row + rows[-1]), encoding="utf-8")
+        with (patch(__name__ + ".ROOT", root), patch(__name__ + ".lint_changed_sources", return_value=[])):
+            expected = {"structural-quality", compiler_fixture_input_gates(root)[systems_fixture]}
+            if set(plan_paths([support]).gates) != expected:
+                failures.append("compiler support file lost its registered consumer")
+            owner.write_text("def value : Nat := 0;\n", encoding="utf-8")
+            if set(plan_paths([support]).gates) != full:
+                failures.append("compiler support file lost its import without full validation")
+            owner.write_text('import "memory_model.ouro";\n', encoding="utf-8")
+            (root / support).unlink()
+            if set(plan_paths([support]).gates) != full:
+                failures.append("deleted compiler support file narrowed validation")
         inventory.write_text(inventory.read_text(encoding="utf-8") + "unknown_inventory_expression", encoding="utf-8")
         try:
             compiler_fixture_roots(root)
@@ -2286,7 +2502,7 @@ def routing_contract_failures() -> list[str]:
                 failures.append("timed-out diff did not request full validation")
         output = root / "outputs"
         selected = classify_paths(['site/a\ncore=true.ts'])
-        write_github_output(output, selected, selection_matrix(selected))
+        write_github_output(output, selected, selection_matrix(selected), groups=PULL_REQUEST_GROUPS)
         values = dict(line.split("=", 1) for line in output.read_text(encoding="utf-8").splitlines())
         if values["core"] != "false" or json.loads(values["changed_paths"]) != list(selected.paths):
             failures.append("filename escaped the GitHub output record")
@@ -2475,6 +2691,21 @@ def area_selection_contract_failures() -> list[str]:
     site = plan_paths(["site/package.json"])
     if not site.site or site.editor or site.core or site.dependency or site.host_compiler:
         failures.append("site package changed its workflow-scan or host-compiler ownership")
+    for path in SAMPLE_README_PATHS:
+        selected = classify_paths([path])
+        if (set(selected.gates) != {"docs-examples", "structural-quality"} or selected.docs
+                or selected.kernel or selected.portable):
+            failures.append(f"sample README must select Markdown and structural checks: {path}")
+    with tempfile.TemporaryDirectory() as temp:
+        root = Path(temp).resolve()
+        (root / SAMPLE_README_PATHS[1]).mkdir(parents=True)
+        with patch(__name__ + ".ROOT", root):
+            for path in SAMPLE_README_PATHS[:2]:
+                if not classify_paths([path]).portable:
+                    failures.append(f"missing or non-file sample README must use full validation: {path}")
+    for path in ("tests/quality_input_tests.ouro", "tests/quality_diagnostic_tests.ouro"):
+        if set(classify_paths([path]).gates) != {"structural-quality", "lint-fixtures"}:
+            failures.append(f"quality regression must select its fixture phase: {path}")
     with patch(__name__ + ".affected_compiler_gates", return_value=set()):
         clippy_cases = (
             (["tests/clippy_semantic/session_wire.ouro"], {"lint-fixtures"}),
@@ -2508,10 +2739,17 @@ def area_selection_contract_failures() -> list[str]:
 
     host_suite_policy = {"python-syntax", "python-lint", "structural-quality", "host-bound-inventory"}
     host_suite_cases = (
+        ("scripts/bench_suite.py", {"lint-fixtures"}),
+        ("scripts/frontend_arithmetic_test.py", {"build-cache-config"}),
         ("scripts/frontend_lower_lookup_test.py", {"build-cache-config", "stage-loop-frontend-regeneration"}),
+        ("scripts/frontend_native_process.py", {"frontend-security", "build-cache-config"}),
         ("scripts/fs_read_suite.py", {"runtime-io", "analyze-precision", "frontend-security", "build-cache-config"}),
+        ("scripts/fs_read_suite_test.py", {"runtime-io", "frontend-security"}),
+        ("scripts/fs_write_suite.py", {"runtime-io"}),
+        ("scripts/fs_write_suite_test.py", {"runtime-io"}),
         ("scripts/memory_budget_suite.py", {"build-cache-config", "memory-budget"}),
         ("scripts/scoped_host_exports_test.py", {"build-cache-config", "stage-loop-frontend-regeneration"}),
+        ("scripts/tool_preparation_suite.py", {"lint-fixtures"}),
     )
     full_gates = set(full_path_selection("test").gates)
     for path, suites in host_suite_cases:
@@ -2520,8 +2758,19 @@ def area_selection_contract_failures() -> list[str]:
                 or selected.kernel or selected.portable):
             failures.append("host suite change must select its consumers and policy gates: " + path)
         mixed_compiler = classify_paths([path, "compiler/lexer.ouro"])
-        if set(mixed_compiler.gates) != full_gates or not mixed_compiler.kernel or not mixed_compiler.portable:
+        if (set(mixed_compiler.gates) != full_gates | suites.intersection(PR_LINT_PHASES)
+                or not mixed_compiler.kernel or not mixed_compiler.portable):
             failures.append("mixed compiler and host suite change must retain full validation: " + path)
+
+    frontend = classify_paths(["scripts/frontend_security_suite.sh"])
+    if (set(frontend.gates) != {"shell-lint", "structural-quality", "host-bound-inventory",
+                              "frontend-security", "build-cache-config"} or frontend.portable):
+        failures.append("frontend security launcher must select its suite and build-cache contract")
+    for path in ("scripts/kernel_hardening_suite.py", "scripts/kernel_profile.py",
+                 "scripts/kernel_profile_test.py", "scripts/kernel_scale_test.py"):
+        selected = classify_paths([path])
+        if set(selected.gates) != host_suite_policy | {"kernel-hardening"} or not selected.kernel or not selected.portable:
+            failures.append(f"kernel hardening input must retain Linux, Portable and kernel-extra: {path}")
 
     budgets = classify_paths(["quality/kernel_budgets.json"])
     if (not budgets.portable or not budgets.kernel or set(budgets.gates) != {
@@ -2548,7 +2797,7 @@ def area_selection_contract_failures() -> list[str]:
     with tempfile.TemporaryDirectory(prefix="ouro-area-routing-") as temporary:
         root = Path(temporary).resolve()
         output = root / "outputs"
-        write_github_output(output, mixed, selection_matrix(mixed))
+        write_github_output(output, mixed, selection_matrix(mixed), groups=PULL_REQUEST_GROUPS)
         values = dict(line.split("=", 1) for line in output.read_text(encoding="utf-8").splitlines())
         if any(values.get(name) != "true" for name in ("site", "editor", "host_compiler")):
             failures.append("GitHub outputs lost a selected project or host compiler")
@@ -2666,13 +2915,28 @@ def area_selection_contract_failures() -> list[str]:
     inventory = compiler_fixture_roots(ROOT)
     owners = {path: f"compiler-checking-{shard}" for shard in range(1, COMPILER_SHARDS + 1)
               for path in compiler_shard_entries(inventory, shard)}
-    cases = ("tests/native_live_tests.ouro", "tests/native_pe_tests.ouro", "tests/compiler_checked_program_tests.ouro",
-             "tests/compiler_file_helper_tests.ouro", "tests/compiler_fs_predicate_binding_tests.ouro")
-    for path in cases:
+    leaves = ("tests/native_live_tests.ouro", "tests/native_pe_tests.ouro", "tests/compiler_checked_program_tests.ouro",
+              "tests/compiler_file_helper_tests.ouro", "tests/compiler_fs_predicate_binding_tests.ouro",
+              "tests/compiler_file_binding_tests.ouro", "tests/native_source_debug_tests.ouro",
+              "tests/compiler/diagnostics/compiler_positive_tests.ouro", "tests/compiler_source_packet_tests.ouro",
+              "tests/source_span_tests.ouro", "tests/compiler/systems/memory_model_tests.ouro",
+              "tests/compiler/systems/resource_model_tests.ouro")
+    cases = (
+        *((path, path) for path in leaves),
+        ("tests/compiler/systems/memory_model.ouro", "tests/compiler/systems/memory_model_tests.ouro"),
+        ("tests/compiler/systems/resource_model.ouro", "tests/compiler/systems/resource_model_tests.ouro"),
+        ("tests/compiler_source_packet_tests.golden", "tests/compiler_source_packet_tests.ouro"),
+    )
+    for path, fixture in cases:
         route = classify_paths([path])
-        shards = {name for name in route.gates if name.startswith("compiler-checking-")}
-        if path not in owners or shards != {owners.get(path)} or route.portable or route.kernel:
-            failures.append("isolated compiler fixture must run its inventory shard: " + path)
+        policy = {"structural-quality"} if path.endswith(".ouro") else set()
+        if fixture not in owners or set(route.gates) != {owners[fixture], *policy} or route.portable or route.kernel:
+            failures.append("isolated compiler input must run its inventory shard and policy: " + path)
+    for path in ("tests/compiler_abi_tests.ouro", "tests/compiler/diagnostics/compiler_fault_tests.ouro",
+                 "tests/compiler/systems/unregistered_tests.ouro"):
+        route = classify_paths(["tests/compiler_source_packet_tests.ouro", path])
+        if set(route.gates) != set(full_path_selection("selftest").gates) or not route.portable or not route.kernel:
+            failures.append("shared or unknown compiler fixture lost full validation: " + path)
 
     sidecars = classify_paths(["samples/demo/01_hello.stdin", "samples/demo/01_hello.golden"])
     if {name for name in sidecars.gates if name.startswith("samples-")} != {"samples-1"} or sidecars.portable:
@@ -2864,6 +3128,7 @@ def summary_contract_failures() -> list[str]:
     with tempfile.TemporaryDirectory(prefix="summary-contract-", dir=parent) as temporary:
         out = Path(temporary)
         summary = out / "ci-summary.json"
+        setup = out / "ci-setup.json"
         gate = Gate("summary-protocol", ["unexecuted-protocol-command"], ("pr",))
         row = {"name": gate.name, "blocking": True, "status": "pass", "returncode": 0}
         args = ["--profile", "pr", "--out", str(out)]
@@ -2874,6 +3139,7 @@ def summary_contract_failures() -> list[str]:
             for interruption in (OSError("cannot start"), KeyboardInterrupt(),
                                  subprocess.TimeoutExpired(gate.cmd, 1)):
                 summary.write_text('{"pass":true}\n', encoding="utf-8")
+                setup.write_text('{"phases":[]}\n', encoding="utf-8")
                 with patch(__name__ + ".run_gate", side_effect=interruption):
                     try:
                         main(args)
@@ -2884,6 +3150,8 @@ def summary_contract_failures() -> list[str]:
                 if summary.exists():
                     failures.append("interrupted gate retained a stale success summary")
                     summary.unlink()
+                if setup.exists():
+                    failures.append("single-workspace run retained a stale setup journal")
             with patch(__name__ + ".run_gate", return_value=row):
                 if main(args) != 0:
                     failures.append("completed positive gate failed")
@@ -2933,9 +3201,11 @@ def summary_contract_failures() -> list[str]:
                             or not lines or not lines[0].startswith("CI_GATE_SUMMARY ") or lines[1:] != expected):
                         failures.append(f"incorrect blocking PR annotation or summary on {hosted=}, {event=}, {fail_fast=}")
             previous = summary.read_bytes()
+            previous_setup = b'{"phases":[]}\n'
+            setup.write_bytes(previous_setup)
             with patch(__name__ + ".run_gate") as run:
                 main([*args, "--list"])
-                if run.called or summary.read_bytes() != previous:
+                if run.called or summary.read_bytes() != previous or setup.read_bytes() != previous_setup:
                     failures.append("listing gates changed execution evidence")
             summary.unlink()
             summary.mkdir()
@@ -2948,6 +3218,18 @@ def summary_contract_failures() -> list[str]:
                     failures.append("unremovable prior summary did not fail")
                 if run.called or not summary.is_dir():
                     failures.append("summary cleanup failure started gates or removed a directory")
+            summary.rmdir()
+            setup.unlink()
+            setup.mkdir()
+            with patch(__name__ + ".run_gate") as run:
+                try:
+                    main(args)
+                except OSError:
+                    pass
+                else:
+                    failures.append("unremovable prior setup journal did not fail")
+                if run.called or not setup.is_dir() or summary.exists():
+                    failures.append("setup cleanup failure started gates, removed a directory, or published success")
     return failures
 
 
@@ -3037,24 +3319,292 @@ def scheduler_contract_failures() -> list[str]:
                         if not fault or task.name not in {"middle", "leaf"}}
             if results != expected or stats["peak_memory_mib"] > memory:
                 failures.append(f"scheduler changed transitive failure coverage or memory at {jobs} jobs, {memory} MiB")
-    smith = Gate("ouro-smith", ["unexecuted-smith-command"], ("pr",))
-    with (patch(__name__ + ".available_memory_mib") as budget,
-          patch(__name__ + ".run_gate", return_value={"name": smith.name, "status": "pass", "blocking": True}) as run_smith):
-        for hosted, event, jobs, memory, expected in (
-            ("true", "pull_request", 2, 4096, Allocation(2, 4096)),
-            ("true", "pull_request", 2, 4095, Allocation(2, 3584)),
-            ("true", "pull_request", 2, 3500, Allocation(1, 3072)),
-            ("true", "pull_request", 2, None, Allocation(2, 3584)),
-            ("true", "pull_request", 1, 4096, Allocation(1, 3072)),
-            ("true", "merge_group", 2, 4096, Allocation(2, 3584)),
-            ("false", "pull_request", 2, 4096, Allocation(2, 3584)),
+    return failures
+
+
+def smith_allocation_contract_failures(all_gates: Sequence[Gate]) -> list[str]:
+    from unittest.mock import patch
+
+    failures = []
+    by_name = {gate.name: gate for gate in all_gates}
+    with patch(__name__ + ".available_memory_mib") as budget, patch(__name__ + ".run_gate") as run_smith:
+        for name, profile, group, pull_request_mib, preparation_mib, other_event_mib in (
+            ("ouro-smith", "pr", "smith", 4096, 6144, 3584),
+            ("ouro-smith-kernel", "kernel-extra", None, 4096, 4096, 4096),
+            ("ouro-smith-kernel", "kernel", "kernel", 3584, 3584, 3584),
+        ):
+            run_smith.return_value = {"name": name, "status": "pass", "blocking": True}
+            for hosted, event, jobs, memory, expected in (
+                ("true", "pull_request", 2, 6144, Allocation(2, preparation_mib)),
+                ("true", "pull_request", 2, 6143, Allocation(2, pull_request_mib)),
+                ("true", "pull_request", 2, 4096, Allocation(2, pull_request_mib)),
+                ("true", "pull_request", 2, 4095, Allocation(2, 3584)),
+                ("true", "pull_request", 2, 3500, Allocation(1, 3072)),
+                ("true", "pull_request", 2, None, Allocation(2, 3584)),
+                ("true", "pull_request", 1, 6144, Allocation(1, 3072)),
+                ("true", "pull_request", 3, 6144, Allocation(3, 4096)),
+                ("true", "merge_group", 2, 6144, Allocation(2, other_event_mib)),
+                ("true", "push", 2, 6144, Allocation(2, other_event_mib)),
+                ("true", "workflow_dispatch", 2, 6144, Allocation(2, other_event_mib)),
+                ("false", "pull_request", 2, 6144, Allocation(2, 3584)),
+            ):
+                budget.return_value = memory
+                run_smith.reset_mock()
+                with patch.dict(os.environ, {"GITHUB_ACTIONS": hosted, "GITHUB_EVENT_NAME": event}):
+                    schedule_gates([by_name[name]], out=ROOT, profile=profile, group=group, jobs=jobs, fail_fast=False)
+                if run_smith.call_count != 1 or run_smith.call_args.kwargs["allocation"] != expected:
+                    failures.append(f"incorrect Smith allocation on {profile=}, {hosted=}, {event=}, {jobs=}, {memory=}")
+    return failures
+
+
+def compiler_shard_allocation_contract_failures(all_gates: Sequence[Gate]) -> list[str]:
+    import contextlib
+    import io
+    from unittest.mock import patch
+
+    import native_tool_build
+    from local_scheduler import JOBS_ENV, MEMORY_ENV
+
+    failures = []
+    by_name = {gate.name: gate for gate in all_gates}
+    serial = Allocation(1, SHARD_MEMORY_MIB)
+    parallel = Allocation(2, COMPILER_SHARD_C_MEMORY_MIB)
+    prewarm = Allocation(2, SHARD_PREWARM_MEMORY_MIB)
+    matrix_env = {"GITHUB_ACTIONS": "true", "GITHUB_EVENT_NAME": "pull_request", "RUNNER_OS": "Linux"}
+
+    def observe(gate, *, out, workspace, allocation):
+        return {"name": gate.name, "status": "pass", "blocking": True, "command": gate.cmd,
+                "allocation": allocation, "env": env_for(gate, out, workspace, allocation)}
+
+    with (tempfile.TemporaryDirectory(prefix="ci-compiler-shard-") as temporary,
+          patch(__name__ + ".available_memory_mib") as budget,
+          patch(__name__ + ".run_gate", side_effect=observe)):
+        out = Path(temporary)
+        for index, profile, routed, jobs, memory, extra_env, expected in (
+            (1, "pr", True, 2, 3072, {}, serial),
+            (1, "pr", True, 2, 3583, {}, serial),
+            (1, "pr", True, 2, None, {}, serial),
+            (1, "pr", True, 2, 3584, {}, parallel),
+            (1, "pr", True, 2, 6143, {}, parallel),
+            (1, "pr", True, 2, 6144, {}, prewarm),
+            (15, "pr", True, 2, 16384, {}, prewarm),
+            (16, "pr", True, 2, 16384, {}, serial),
+            (1, "pr", True, 1, 16384, {}, serial),
+            (1, "pr", True, 3, 16384, {}, serial),
+            (1, "pr", False, 2, 16384, {}, serial),
+            (1, "pr", True, 2, 16384, {"GITHUB_ACTIONS": "false"}, serial),
+            (1, "pr", True, 2, 16384, {"GITHUB_EVENT_NAME": "push"}, serial),
+            (1, "pr", True, 2, 16384, {"RUNNER_OS": "macOS"}, serial),
+            (1, "nightly", False, 2, 16384, {}, serial),
+        ):
+            gate = by_name[f"compiler-checking-{index}"]
+            budget.return_value = memory
+            with patch.dict(os.environ, {**matrix_env, **extra_env, COMPILER_SHARD_C_WORKERS_ENV: "2",
+                                         SHARD_PREWARM_ENV: "1"}):
+                rows, stats = schedule_gates([gate], out=out, profile=profile, group=f"compiler-{index}",
+                                             jobs=jobs, fail_fast=True, routed_pr=routed)
+            row = rows[gate.name]
+            env = row["env"]
+            expected_workers = "2" if expected.jobs == 2 else None
+            if (row["command"] != gate.cmd or row["allocation"] != expected or stats["peak_jobs"] != expected.jobs
+                    or env.get(COMPILER_SHARD_C_WORKERS_ENV) != expected_workers
+                    or env.get(SHARD_PREWARM_ENV) != ("1" if expected == prewarm else None)
+                    or any(env[name] != "1" for name in ("OURO_JOBS", "OURO_FRONTEND_JOBS", "RAYON_NUM_THREADS"))):
+                failures.append(f"incorrect C allocation for compiler shard {index} at {profile=}, {routed=}, "
+                                f"{jobs=}, {memory=}, {extra_env=}")
+
+    with (patch.object(native_tool_build, "configure_native_stack"),
+          patch.object(native_tool_build, "build_tool", return_value={}) as builder,
+          contextlib.redirect_stderr(io.StringIO())):
+        for workers, slots, memory, explicit, expected in (
+            (None, None, None, (), None),
+            ("2", "2", "3584", (), 2),
+            ("2", "2", "3584", ("--jobs", "1"), None),
+            ("2", "2", "3583", (), False),
+            ("2", "2", None, (), False),
+            ("2", "1", "3584", (), False),
+            ("3", "2", "3584", (), False),
+            ("2", "2", "invalid", (), False),
+        ):
+            variables = zip((COMPILER_SHARD_C_WORKERS_ENV, JOBS_ENV, MEMORY_ENV), (workers, slots, memory), strict=True)
+            builder.reset_mock()
+            with patch.dict(os.environ, {key: value for key, value in variables if value is not None}, clear=True):
+                try:
+                    code = native_tool_build.main(["tools/test/main.ouro", "_build/test", "--compiler", "_build/c/ouro1",
+                                                   *explicit])
+                except SystemExit as exc:
+                    code = exc.code
+            passed = (code == 2 and not builder.called) if expected is False else (
+                code == 0 and builder.call_count == 1
+                and builder.call_args.args[0].compiler_shard_c_workers == expected
+            )
+            if not passed:
+                failures.append(f"native C builder accepted the wrong shard lease at {workers=}, {slots=}, "
+                                f"{memory=}, {explicit=}")
+    return failures
+
+
+def compiler_preparation_memory_contract_failures() -> list[str]:
+    from threading import Barrier
+    from unittest.mock import patch
+
+    failures = []
+    independent = ("python-syntax", "config-show")
+    concurrent = (COMPILER_PREPARATION, *independent)
+    selected = [Gate(name, ["probe"], ("pr",)) for name in ("compiler-scale", *independent)]
+    workspace = ROOT / "_build" / "ci-compiler-memory-test"
+    with (patch.object(Path, "mkdir"), patch.object(tempfile, "mkdtemp", return_value=str(workspace)),
+          patch(__name__ + ".CheckoutSnapshot"), patch(__name__ + ".copy_prepared_compiler"),
+          patch(__name__ + ".SetupProgress") as setup,
+          patch(__name__ + ".preparation_workspace", return_value=workspace / "source"),
+          patch("ouro_build.cache_access"), patch(__name__ + ".available_memory_mib") as budget,
+          patch.dict(os.environ, {"GITHUB_ACTIONS": "false"})):
+        out = workspace / "reports"
+        setup.return_value.path = out / "ci-setup.json"
+        for jobs, memory, expected, overlap in (
+            (1, 6656, Allocation(1, 3072), False),
+            (2, 3072, Allocation(1, 3072), False),
+            (2, None, Allocation(2, 3584), False),
+            (2, 6143, Allocation(2, 3584), False),
+            (2, 6144, Allocation(2, 6144), False),
+            (8, 6655, Allocation(6, 5632), True),
+            (8, 6656, Allocation(6, 6144), True),
+            (10, 8000, Allocation(8, 6656), True),
         ):
             budget.return_value = memory
-            run_smith.reset_mock()
-            with patch.dict(os.environ, {"GITHUB_ACTIONS": hosted, "GITHUB_EVENT_NAME": event}):
-                schedule_gates([smith], out=ROOT, profile="pr", group="smith", jobs=jobs, fail_fast=False)
-            if run_smith.call_count != 1 or run_smith.call_args.kwargs["allocation"] != expected:
-                failures.append(f"incorrect Smith allocation on {hosted=}, {event=}, {jobs=}, {memory=}")
+            barrier = Barrier(len(concurrent)) if overlap else None
+
+            def run(gate, *, allocation, rendezvous=barrier, **_kwargs):
+                if rendezvous is not None and gate.name in concurrent:
+                    rendezvous.wait(timeout=5)
+                return {"name": gate.name, "status": "pass", "blocking": True, "allocation": allocation}
+
+            with patch(__name__ + ".run_gate", side_effect=run):
+                results, stats = schedule_gates(selected, out=out, profile="pr", group=None, jobs=jobs, fail_fast=False)
+            peak_memory = expected.memory_mib + (256 * len(independent) if overlap else 0)
+            if (results[COMPILER_PREPARATION]["allocation"] != expected
+                    or any(results[name]["allocation"] != Allocation(1, 256) for name in independent)
+                    or stats["peak_jobs"] > jobs or stats["peak_memory_mib"] != peak_memory
+                    or (overlap and (stats["peak_tasks"] != len(concurrent) or stats["peak_jobs"] != jobs))):
+                failures.append(f"incorrect compiler preparation memory at {jobs=}, {memory=}")
+    return failures
+
+
+def setup_progress_contract_failures() -> list[str]:
+    from contextlib import nullcontext, redirect_stdout
+    from io import StringIO
+    from threading import Barrier
+    from unittest.mock import patch
+
+    failures = []
+    profile = "stage-loop"
+    lanes = {"checks-parity": "parity", "checks-quality": "syntax-quality-firewall"}
+    selected = [Gate(name, ["probe"], (profile,)) for name in lanes.values()]
+    write_report = write_json_atomic
+    with tempfile.TemporaryDirectory(prefix="ci-setup-") as temporary:
+        root = Path(temporary).resolve()
+        out = root / "reports"
+        journal = out / "ci-setup.json"
+        summary = out / "ci-summary.json"
+        (root / "input.txt").write_text("input", encoding="ascii")
+        phases = []
+
+        def write(path, data):
+            write_report(path, data)
+            if path == journal:
+                phases[:] = [dict(row) for row in data["phases"]]
+
+        def require_running(phase, workspace, **fields):
+            if not any(row["phase"] == phase and Path(row["workspace"]).name == workspace
+                       and row["status"] == "running" and "elapsed_s" not in row
+                       and all(row[key] == value for key, value in fields.items()) for row in phases):
+                raise AssertionError(f"no setup start recorded for {phase} in {workspace}")
+
+        def git_output(argv, *, cwd):
+            if argv[1] == "rev-parse":
+                return os.fsencode(root / "nonexistent-index")
+            if cwd == root:
+                require_running("source-freeze", "source")
+                return b"input.txt\0reports/ci-setup.json\0"
+            return b"input.txt\0"
+
+        def concurrent_copies():
+            for lane, gate in lanes.items():
+                require_running("workspace-copy", lane, gate=gate)
+
+        def clone(argv, **_kwargs):
+            workspace = Path(argv[-1])
+            if workspace.name in lanes:
+                rendezvous.wait(timeout=5)
+            workspace.mkdir()
+
+        def install_compiler(_source, destination):
+            if destination.name == "source":
+                if (destination / journal.relative_to(root)).exists():
+                    raise AssertionError("setup journal became an input to the frozen checkout")
+                require_running("evidence-install", "source", evidence=COMPILER_PREPARATION)
+            else:
+                require_running("evidence-install", destination.name,
+                                gate=lanes[destination.name], evidence=COMPILER_PREPARATION)
+
+        def install_tool(_source, target, **_kwargs):
+            workspace = target.parents[2].name
+            fields = {"gate": lanes[workspace]} if workspace in lanes else {}
+            require_running("evidence-install", workspace, evidence=COLLECTOR_PREPARATION, **fields)
+            if fault and workspace == "checks-parity":
+                raise ValueError("malformed collector evidence")
+
+        def run(gate, **_kwargs):
+            return {"name": gate.name, "status": "pass", "blocking": True}
+
+        with (patch(__name__ + ".ROOT", root), patch(__name__ + ".rel", bind_relative_path(root)),
+              patch(__name__ + ".gates", return_value=selected), patch(__name__ + ".validate_groups"),
+              patch(__name__ + ".write_json_atomic", side_effect=write),
+              patch("local_scheduler.subprocess.check_output", side_effect=git_output),
+              patch("local_scheduler.subprocess.run", side_effect=clone),
+              patch("ouro_build.cache_access", return_value=nullcontext()),
+              patch(__name__ + ".copy_prepared_compiler", side_effect=install_compiler),
+              patch(__name__ + ".copy_prepared_tool", side_effect=install_tool),
+              patch(__name__ + ".available_memory_mib", return_value=12288),
+              patch(__name__ + ".run_gate", side_effect=run) as gates_run,
+              patch.dict(os.environ, {"OURO_CACHE": "1", "OURO_SCHEDULER_JOBS": "2", "GITHUB_ACTIONS": "false"})):
+            for fault in (False, True):
+                rendezvous = Barrier(2, action=concurrent_copies)
+                gates_run.reset_mock()
+                printed = StringIO()
+                with redirect_stdout(printed):
+                    try:
+                        code = main(["--profile", profile, "--out", str(out), "--jobs", "2"])
+                    except ValueError as exc:
+                        if not fault or str(exc) != "malformed collector evidence":
+                            raise
+                        code = 1
+                failed = [row for row in phases if row["status"] == "failed"]
+                lines = printed.getvalue().splitlines()
+                if fault:
+                    if (code != 1 or summary.exists() or lines or len(failed) != 1
+                            or failed[0].get("gate") != "parity"
+                            or failed[0].get("evidence") != COLLECTOR_PREPARATION
+                            or any(call.args[0].name == "parity" for call in gates_run.call_args_list)):
+                        failures.append("failed evidence install lost its setup record or ran the gate")
+                elif (code != 0 or not summary.is_file() or len(lines) != 1
+                      or not lines[0].startswith("CI_GATE_SUMMARY ")
+                      or not {"preparation-hash", "preparation-cache", "preparation-copy",
+                              "preparation-verify"} <= {row["phase"] for row in phases}):
+                    failures.append("successful isolated setup lost preparation or changed the gate protocol")
+                if any(row["status"] == "running" or row["elapsed_s"] < 0
+                       or row["finished_s"] < row["started_s"] for row in phases):
+                    failures.append("setup journal lost terminal phase timings")
+            gates_run.reset_mock()
+            with patch(__name__ + ".write_json_atomic", side_effect=OSError("cannot publish setup journal")):
+                try:
+                    main(["--profile", profile, "--out", str(out), "--jobs", "2"])
+                except OSError:
+                    pass
+                else:
+                    failures.append("setup journal write failure did not fail the run")
+            if gates_run.called or summary.exists():
+                failures.append("setup journal write failure started gates or published success")
     return failures
 
 
@@ -3273,18 +3823,19 @@ def preparation_contract_failures() -> list[str]:
         with (patch("local_scheduler.subprocess.check_output", return_value=b"input.txt\0"),
               patch(__name__ + ".ROOT", root), patch.dict(os.environ, {"OURO_CACHE": "1"})):
             snapshot = CheckoutSnapshot(source)
-            initial = preparation_workspace(snapshot)
-            if initial == source or preparation_workspace(snapshot) != initial:
+            setup = SetupProgress(root, "pr", None)
+            initial = preparation_workspace(snapshot, setup)
+            if initial == source or preparation_workspace(snapshot, setup) != initial:
                 failures.append("unchanged inputs did not reuse local preparation")
             (initial / "input.txt").write_text("corrupt", encoding="utf-8")
-            if preparation_workspace(snapshot) != source:
+            if preparation_workspace(snapshot, setup) != source:
                 failures.append("local preparation reused corrupted source inputs")
             tracked.write_text("updated", encoding="utf-8")
-            updated = preparation_workspace(snapshot)
+            updated = preparation_workspace(snapshot, setup)
             if updated in {initial, source} or (updated / "input.txt").read_text(encoding="utf-8") != "updated":
                 failures.append("changed inputs did not get a new local preparation")
             with patch.dict(os.environ, {"OURO_CACHE": "0"}):
-                if preparation_workspace(snapshot) != source:
+                if preparation_workspace(snapshot, setup) != source:
                     failures.append("disabled cache still reused local preparation")
     tasks = [Task("producer", max_jobs=6, memory_mib=1024, preferred_jobs=4),
              Task("independent", max_jobs=1, memory_mib=1024)]
@@ -3302,6 +3853,8 @@ def env_for(gate: Gate, out: Path, workspace: Path, allocation: Allocation) -> d
     env = os.environ.copy()
     env.pop(LINT_STAGE_ENV, None)
     env.pop(LINT_SUBSHARD_ENV, None)
+    env.pop(COMPILER_SHARD_C_WORKERS_ENV, None)
+    env.pop(SHARD_PREWARM_ENV, None)
     env.update(allocation.environment())
     env.setdefault("PYTHON", Path(sys.executable).as_posix())
     env.setdefault("OURO_CI", "1")
@@ -3438,21 +3991,60 @@ def compiler_preparation_gate(profile: str) -> Gate:
                 env=((LOCAL_CACHE_ENV, "1"),))
 
 
-def preparation_workspace(snapshot: CheckoutSnapshot) -> Path:
+class SetupProgress:
+    def __init__(self, out: Path, profile: str, group: str | None):
+        self.path = out / "ci-setup.json"
+        self.path.unlink(missing_ok=True)
+        self.started = time.perf_counter()
+        self.lock = Lock()
+        self.phases: list[dict[str, Any]] = []
+        self.report = {"kind": "ouro.ci-setup-report.v1", "profile": profile, "group": group or "all",
+                       "phases": self.phases}
+
+    @contextmanager
+    def phase(self, name: str, workspace: Path, *, gate: str | None = None,
+              evidence: str | None = None) -> Iterator[None]:
+        workspace_name = rel(workspace)
+        with self.lock:
+            started = time.perf_counter()
+            row = {"phase": name, "workspace": workspace_name, "status": "running",
+                   "started_s": round(started - self.started, 6)}
+            if gate is not None:
+                row["gate"] = gate
+            if evidence is not None:
+                row["evidence"] = evidence
+            self.phases.append(row)
+            write_json_atomic(self.path, self.report)
+        status = "failed"
+        try:
+            yield
+            status = "completed"
+        finally:
+            finished = time.perf_counter()
+            with self.lock:
+                row.update(status=status, finished_s=round(finished - self.started, 6),
+                           elapsed_s=round(finished - started, 6))
+                write_json_atomic(self.path, self.report)
+
+
+def preparation_workspace(snapshot: CheckoutSnapshot, setup: SetupProgress) -> Path:
     from ouro_build import cache_access
 
     if not bool_env(os.environ.get("OURO_CACHE")):
         return snapshot.source
-    key = snapshot.content_key()
+    with setup.phase("preparation-hash", snapshot.source):
+        key = snapshot.content_key()
     workspace = ROOT / "_build" / "ci-host" / key[:16]
-    with cache_access(workspace, exclusive=True):
+    with setup.phase("preparation-cache", workspace), cache_access(workspace, exclusive=True):
         if not workspace.exists():
-            snapshot.copy_to(workspace)
-            (workspace / ".source-key").write_text(key, encoding="ascii")
+            with setup.phase("preparation-copy", workspace):
+                snapshot.copy_to(workspace)
+                (workspace / ".source-key").write_text(key, encoding="ascii")
         if ((workspace / ".source-key").is_file()
-                and (workspace / ".source-key").read_text(encoding="ascii") == key
-                and snapshot.content_key(workspace) == key):
-            return workspace
+                and (workspace / ".source-key").read_text(encoding="ascii") == key):
+            with setup.phase("preparation-verify", workspace):
+                if snapshot.content_key(workspace) == key:
+                    return workspace
     return snapshot.source
 
 
@@ -3538,7 +4130,8 @@ def lint_gate_result(gate: Gate, workers: Sequence[str], results: dict, out: Pat
 
 
 def schedule_gates(selected: Sequence[Gate], *, out: Path, profile: str, group: str | None,
-                   jobs: int, fail_fast: bool) -> tuple[dict[str, Any], dict[str, Any]]:
+                   jobs: int, fail_fast: bool, routed_pr: bool = False) -> tuple[dict[str, Any], dict[str, Any]]:
+    progress = SetupProgress(out, profile, group)
     if profile in {"nightly", "manual"} and group == "lint-production":
         # The aggregate selects shards that each own a checkout.
         group = None
@@ -3551,8 +4144,12 @@ def schedule_gates(selected: Sequence[Gate], *, out: Path, profile: str, group: 
         build_dir.mkdir(exist_ok=True)
         workspace_root = Path(tempfile.mkdtemp(prefix="ci-", dir=build_dir))
         frozen = workspace_root / "source"
-        CheckoutSnapshot(ROOT).copy_to(frozen, git_metadata=True)
-        snapshot = CheckoutSnapshot(frozen)
+        with progress.phase("source-freeze", frozen):
+            # A custom output directory can be inside the checkout.
+            journal = progress.path.resolve()
+            excluded = journal.relative_to(ROOT) if journal.is_relative_to(ROOT) else None
+            CheckoutSnapshot(ROOT, excluded_relative_path=excluded).copy_to(frozen, git_metadata=True)
+            snapshot = CheckoutSnapshot(frozen)
         workspaces = {name: workspace_root / name for name in workspaces}
 
     tasks = []
@@ -3567,6 +4164,12 @@ def schedule_gates(selected: Sequence[Gate], *, out: Path, profile: str, group: 
         lint_users = {name for name in compiler_users if name.startswith("lint-production-")}
     hosted = os.environ.get("GITHUB_ACTIONS") == "true"
     memory_mib = available_memory_mib()
+    parallel_c_gate = None
+    if (routed_pr and hosted and profile == "pr" and os.environ.get("GITHUB_EVENT_NAME") == "pull_request"
+            and os.environ.get("RUNNER_OS") == "Linux" and jobs == 2
+            and group and group.startswith("compiler-") and group != f"compiler-{COMPILER_SHARDS}"
+            and memory_mib is not None and memory_mib >= COMPILER_SHARD_C_MEMORY_MIB):
+        parallel_c_gate = "compiler-checking-" + group.removeprefix("compiler-")
     lint_parts: dict[str, tuple[str, ...]] = {}
     if lint_users and not hosted:
         capacity = jobs if memory_mib is None else min(jobs, memory_mib // SHARD_MEMORY_MIB)
@@ -3582,10 +4185,13 @@ def schedule_gates(selected: Sequence[Gate], *, out: Path, profile: str, group: 
                   LINT_PREPARATION: lint_users, PACKAGE_PREPARATION: lint_users}
     preparations = {}
     if compiler_users:
-        prepared = preparation_workspace(snapshot)
+        from bootstrap_compiler import MEMORY_MIB as BOOTSTRAP_COMMAND_MEMORY_MIB
+
+        prepared = preparation_workspace(snapshot, progress)
         build_gate = compiler_preparation_gate(profile)
         preparations[build_gate.name] = build_gate
-        tasks.append(Task(build_gate.name, base_memory_mib=2560, memory_mib=512, preferred_jobs=6))
+        tasks.append(Task(build_gate.name, base_memory_mib=2560, memory_mib=512, preferred_jobs=6,
+                          preferred_parallel_memory_mib=2 * BOOTSTRAP_COMMAND_MEMORY_MIB))
         for key, users in tool_users.items():
             if users:
                 entry, binary, cache_name = HOST_TOOLS[key]
@@ -3608,6 +4214,10 @@ def schedule_gates(selected: Sequence[Gate], *, out: Path, profile: str, group: 
             continue
         if gate.name in LOCAL_LIGHTWEIGHT_GATES:
             task = Task(gate.name, dependencies, max_jobs=1, memory_mib=256)
+        elif gate.name == parallel_c_gate:
+            task = Task(gate.name, dependencies, max_jobs=2,
+                        base_memory_mib=C_BUILD_BASE_MEMORY_MIB, memory_mib=C_WORKER_MEMORY_MIB,
+                        preferred_parallel_memory_mib=SHARD_PREWARM_MEMORY_MIB)
         elif gate.name in shard_names:
             task = Task(gate.name, dependencies, max_jobs=1, memory_mib=SHARD_MEMORY_MIB)
         elif not hosted and gate.name in {"compiler-scale", "compiler-depth"}:
@@ -3624,11 +4234,15 @@ def schedule_gates(selected: Sequence[Gate], *, out: Path, profile: str, group: 
 
             task = Task(gate.name, dependencies, max_jobs=2,
                         base_memory_mib=POOL_CONTROLLER_MEMORY_MIB, memory_mib=POSIX_WORKER_MEMORY_MIB)
-        elif (hosted and profile == "pr" and group == "smith" and gate.name == "ouro-smith"
-              and os.environ.get("GITHUB_EVENT_NAME") == "pull_request"
-              and jobs == 2 and memory_mib is not None and memory_mib >= 4096):
+        elif (hosted and jobs == 2 and memory_mib is not None and memory_mib >= 4096
+              and ((profile == "kernel-extra" and gate.name == "ouro-smith-kernel")
+                   or (profile == "pr" and group == "smith" and gate.name == "ouro-smith"
+                       and os.environ.get("GITHUB_EVENT_NAME") == "pull_request"))):
+            from ourosmith.host import BUILD_MEMORY_MB
+
             # Each Smith worker reserves 2048 MiB. One slot must still fit 3072 MiB preparation.
-            task = Task(gate.name, dependencies, base_memory_mib=2048, memory_mib=1024)
+            task = Task(gate.name, dependencies, base_memory_mib=2048, memory_mib=1024,
+                        preferred_parallel_memory_mib=2 * BUILD_MEMORY_MB if gate.name == "ouro-smith" else 0)
         else:
             serial = not hosted and gate.name in LOCAL_SERIAL_BUILD_GATES
             task = Task(gate.name, dependencies, max_jobs=1 if serial else None,
@@ -3651,12 +4265,13 @@ def schedule_gates(selected: Sequence[Gate], *, out: Path, profile: str, group: 
             with cache_access(prepared / "_build" / task.name, exclusive=True):
                 row = run_gate(preparations[task.name], out=out, workspace=prepared, allocation=allocation)
                 if row["status"] == "pass" and prepared != frozen:
-                    if task.name == COMPILER_PREPARATION:
-                        copy_prepared_compiler(prepared, frozen)
-                    else:
-                        entry, binary, _ = HOST_TOOLS[task.name]
-                        copy_prepared_tool(prepared / "_build/c" / binary, frozen / "_build/c" / binary,
-                                           entry=entry, compiler=frozen / "_build/c/ouro1")
+                    with progress.phase("evidence-install", frozen, evidence=task.name):
+                        if task.name == COMPILER_PREPARATION:
+                            copy_prepared_compiler(prepared, frozen)
+                        else:
+                            entry, binary, _ = HOST_TOOLS[task.name]
+                            copy_prepared_tool(prepared / "_build/c" / binary, frozen / "_build/c" / binary,
+                                               entry=entry, compiler=frozen / "_build/c/ouro1")
             return row
         if task.name in lint_workers:
             name, index, count = lint_workers[task.name]
@@ -3676,10 +4291,16 @@ def schedule_gates(selected: Sequence[Gate], *, out: Path, profile: str, group: 
         source_gate = lint_setups.get(task.name, task.name)
         workspace = workspaces[groups[source_gate]]
         if snapshot is not None and not workspace.exists():
-            snapshot.copy_to(workspace, git_metadata=True)
+            with progress.phase("workspace-copy", workspace, gate=task.name):
+                snapshot.copy_to(workspace, git_metadata=True)
         gate = by_name[source_gate]
+        if source_gate == parallel_c_gate and allocation.jobs == 2:
+            gate = replace(gate, env=(*gate.env, (COMPILER_SHARD_C_WORKERS_ENV, "2"), ("RAYON_NUM_THREADS", "1")))
+            if allocation.memory_mib >= SHARD_PREWARM_MEMORY_MIB:
+                gate = replace(gate, env=(*gate.env, (SHARD_PREWARM_ENV, "1")))
         if source_gate in compiler_users and not (workspace / "_build/c/ouro1").is_file():
-            copy_prepared_compiler(frozen, workspace)
+            with progress.phase("evidence-install", workspace, gate=task.name, evidence=COMPILER_PREPARATION):
+                copy_prepared_compiler(frozen, workspace)
         gate_environment = dict(gate.env)
         destinations = {COLLECTOR_PREPARATION: "_build/c", LINT_PREPARATION: "_build/c"}
         if source_gate in runner_users:
@@ -3696,8 +4317,9 @@ def schedule_gates(selected: Sequence[Gate], *, out: Path, profile: str, group: 
                 target = workspace / destinations[key] / binary
                 suffix = ".exe" if os.name == "nt" else ""
                 if key != COLLECTOR_PREPARATION or not target.with_name(binary + suffix).is_file():
-                    copy_prepared_tool(frozen / "_build/c" / binary, target,
-                                       entry=entry, compiler=workspace / "_build/c/ouro1")
+                    with progress.phase("evidence-install", workspace, gate=task.name, evidence=key):
+                        copy_prepared_tool(frozen / "_build/c" / binary, target,
+                                           entry=entry, compiler=workspace / "_build/c/ouro1")
         setup_s = round(time.perf_counter() - setup_started, 6)
         if task.name in lint_setups:
             gate = replace(gate, name=task.name, env=(*gate.env, (LINT_STAGE_ENV, "setup")))
@@ -3875,7 +4497,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     for skip in skips:
         print(f"CI_GATE_SKIP {skip['name']} reason={skip['reason']}")
     completed, scheduler = schedule_gates(selected, out=out, profile=args.profile, group=args.group,
-                                          jobs=jobs, fail_fast=args.fail_fast)
+                                          jobs=jobs, fail_fast=args.fail_fast,
+                                          routed_pr=args.changed_paths_json is not None and not args.full)
     results = [completed[gate.name] for gate in selected if gate.name in completed]
     preparation = [completed[name] for name in (COMPILER_PREPARATION, *HOST_TOOLS) if name in completed]
     failures = [row for row in [*preparation, *results] if row["blocking"] and row["status"] == "fail"]

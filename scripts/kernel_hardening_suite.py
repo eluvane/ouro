@@ -56,7 +56,7 @@ def main() -> int:
         if args.repo_gate is None:
             run([sys.executable, '-B', 'scripts/native_tool_build.py', profile.BOUNDARY_ENTRY, str(repo_gate),
                  '--compiler', str(compiler), '--fuel', '16000', '--jobs', '1',
-                 '--build-dir', str(work / 'build'), '--cache-dir', str(out / 'cache'), '--cache',
+                 '--build-dir', str(work / 'build'),
                  '--opt-level', 'O0', '--ccache', 'disabled'],
                 'build-boundary', limits['build_timeout_s'])
         baseline_path = ROOT / 'quality/kernel_baseline.json'
