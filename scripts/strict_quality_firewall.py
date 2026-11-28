@@ -12,7 +12,7 @@ import os
 import sys
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Optional, Sequence
+from typing import Any, Optional, Sequence, TextIO
 
 from repo_support import bind_relative_path, read_json_value
 
@@ -122,6 +122,20 @@ def scan_source(path: Path, text: str, registry: dict[str, dict[str, Any]], prof
     return [_finding_from_json(item) for item in payload]
 
 
+def run_native_cli(argv: Sequence[str], *, executable: Path, stdout: TextIO, stderr: TextIO) -> int:
+    from ourosmith.limits import run_limited
+
+    result = run_limited(
+        [str(executable), *argv],
+        cwd=ROOT, env=native_env(), timeout_s=1800, memory_mb=3072,
+    )
+    stdout.write(result.stdout)
+    stderr.write(result.stderr)
+    if result.returncode is None or (result.returncode == 0 and not result.ok):
+        return 1
+    return int(result.returncode)
+
+
 def main(argv: Optional[Sequence[str]] = None) -> int:
     raw = list(sys.argv[1:] if argv is None else argv)
     if "--structural" in raw:
@@ -144,17 +158,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             report = Path("_build/quality/structural-quality.json")
         return run(ROOT, report if report.is_absolute() else ROOT / report)
 
-    from ourosmith.limits import run_limited
-
-    result = run_limited(
-        [str(_strict_binary()), *raw],
-        cwd=ROOT, env=native_env(), timeout_s=1800, memory_mb=3072,
-    )
-    sys.stdout.write(result.stdout)
-    sys.stderr.write(result.stderr)
-    if result.returncode is None or (result.returncode == 0 and not result.ok):
-        return 1
-    return int(result.returncode)
+    return run_native_cli(raw, executable=_strict_binary(), stdout=sys.stdout, stderr=sys.stderr)
 
 
 if __name__ == "__main__":

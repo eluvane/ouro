@@ -2,10 +2,16 @@
 """Negative report and resource-policy tests for canonical compiler profiling."""
 from copy import deepcopy
 import json
+import os
+from pathlib import Path
 import shutil
+import sys
+from tempfile import TemporaryDirectory
 import unittest
+from unittest.mock import patch
 import uuid
 
+import kernel_hardening_suite as hardening
 import kernel_profile as profile
 from repo_support import configure_native_stack, hash_json
 
@@ -48,6 +54,44 @@ class KernelProfileTests(unittest.TestCase):
 
     def test_complete_observed_protocol_can_pass(self):
         self.assertTrue(self.evaluate()['pass'])
+
+    def test_hardening_boundary_preparation_uses_configured_cache(self):
+        with TemporaryDirectory(prefix='ouro-kernel-hardening-') as temporary:
+            root = Path(temporary).resolve()
+            compiler = root / 'compiler'
+            compiler.touch()
+            prebuilt = root / 'verified-gate'
+            out, cache = root / 'out', root / 'cache'
+            argv = ['kernel_hardening_suite.py', '--compiler', str(compiler), '--out', str(out)]
+            measured = {'pass': True, 'budget_status': {'pass': True}, 'fixtures': len(profile.LAW_NAMES)}
+            destinations = set()
+            for enabled, supplied in (('1', None), ('1', None), ('0', None), ('1', prebuilt)):
+                options = argv if supplied is None else [*argv, '--repo-gate', str(supplied)]
+                with (patch.dict(os.environ, {'OURO_CACHE_DIR': str(cache), 'OURO_CACHE': enabled}),
+                      patch.object(sys, 'argv', options), patch('ourosmith.host.shell', return_value=root / 'sh'),
+                      patch.object(profile, 'execute', return_value=process()) as execute,
+                      patch.object(profile, 'run_profile', return_value=measured) as run_profile,
+                      patch('builtins.print')):
+                    self.assertEqual(hardening.main(), 0)
+                phases = [call.args[2] for call in execute.call_args_list]
+                self.assertEqual(run_profile.call_count, 1)
+                destination = run_profile.call_args.kwargs['boundary']
+                policy_tests = ['profile-policy-tests', 'scale-policy-tests']
+                if supplied is not None:
+                    self.assertEqual(phases, policy_tests)
+                    self.assertEqual(destination, supplied)
+                    continue
+                self.assertEqual(phases, [*policy_tests, 'build-boundary'])
+                command, work, _, env, timeout, memory = execute.call_args.args
+                self.assertEqual(command[3:5], [profile.BOUNDARY_ENTRY, str(destination)])
+                self.assertEqual(destination.parent, work)
+                self.assertNotIn(destination, destinations)
+                destinations.add(destination)
+                self.assertTrue({'--cache-dir', '--cache', '--no-cache'}.isdisjoint(command))
+                self.assertEqual(env['OURO_CACHE_DIR'], cache.as_posix())
+                self.assertEqual(env['OURO_CACHE'], enabled)
+                limits = self.budgets['orchestration']
+                self.assertEqual((timeout, memory), (limits['build_timeout_s'], limits['memory_limit_mib']))
 
     def test_old_budgets_and_memo_domain_cannot_be_reused(self):
         for change in ({'kind': 'ouro.kernel-budgets.v1'}, {'timing_domain': 'python-json-replay'}):

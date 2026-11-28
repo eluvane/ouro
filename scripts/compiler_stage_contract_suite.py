@@ -46,8 +46,8 @@ CASES = (
         "native-recheck-private-constructor",
         95,
         "",
-        'import "../../compiler/native/lower.ouro" as Replay,\n'
-        '  "../../compiler/checked_program.ouro" as Program;\n'
+        'import "../../compiler/native/lower.ouro" as Replay;\n'
+        'import "../../compiler/checked_program.ouro" as Program;\n'
         'def forged (input : Program.CheckedProgram) : Replay.NativeRecheckedProgram :=\n'
         '  Replay.MkNativeRecheckedProgram 500 input;\n',
     ),

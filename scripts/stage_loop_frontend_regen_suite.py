@@ -13,7 +13,10 @@ import stat
 import subprocess
 import sys
 import tempfile
+from contextlib import redirect_stderr, redirect_stdout
+from io import StringIO
 from pathlib import Path
+from unittest.mock import patch
 
 import frontend_regen
 import pack_frontend
@@ -451,6 +454,129 @@ def test_stage_loop_input_fast_path(tmp: Path) -> None:
     assert result["fast_path"] is True and result["pass"] is True
 
 
+def test_stage_loop_seed_staging(tmp: Path) -> None:
+    import stage_loop
+
+    stage0_dir = tmp / "compiler/stage0"
+    stage0_dir.mkdir(parents=True)
+    cdir = tmp / "c"
+    cdir.mkdir()
+    seed = cdir / "ouro1"
+    write_fake_ouro1(seed)
+    work = tmp / "stage_loop"
+    stage0_seed = work / "ouro1_stage0"
+    staged = {stage0_seed: seed}
+    for name in ("driver_u.c", "backend_u.c"):
+        source = stage0_dir / name
+        source.write_text(f"/* {name} */\n", encoding="utf-8")
+        staged[work / f"stage0_{name}"] = source
+    cfg = stage_loop.StageConfig(
+        promote=False, max_stages=2, fuel="16000", pack_strict="1", cc="fixture-cc",
+        c_build_dir=cdir, build_dir=tmp, cache_root=tmp / "cache", cache_enabled=False,
+        work=work, result=work / "result.json", status_pub=work / "status.json", env={},
+        build_cfg=stage_loop.OB.ResolvedConfig({"opt_level": "O0", "reproducible": False}, {}),
+    )
+
+    def emit_backend(prev, out, _err, _cfg, stage):
+        if stage == 1:
+            assert prev == stage0_seed and prev.read_bytes() == seed.read_bytes()
+        shutil.copyfile(stage0_dir / out.name, out)
+        return {}
+
+    def emit_frontend(_prev, out, _err, _stage, _cfg):
+        shutil.copyfile(stage0_dir / out.name, out)
+        return {}
+
+    def build(_frontend, _backend, out, _stage, _cfg):
+        out.write_bytes(b"stage binary")
+        return {}
+
+    samefile = os.path.samefile
+    copy_atomic = stage_loop.copy_atomic
+
+    def partial_symlink(dest, source):
+        if source.name == "backend_u.c":
+            raise OSError("backend symlink unavailable")
+        dest.write_bytes(source.read_bytes())
+
+    def samefile_with_driver_link(left, right):
+        if left == stage0_dir / "driver_u.c" and right == work / "stage0_driver_u.c" and right.is_file():
+            return True
+        return samefile(left, right)
+
+    def copy_changed_seed(source, dest):
+        source.write_bytes(source.read_bytes() + b"\n# updated seed\n")
+        copy_atomic(source, dest)
+
+    log = StringIO()
+    with (
+        redirect_stdout(log),
+        redirect_stderr(log),
+        patch.dict(os.environ, {"OURO_STAGE_FAST_PATH": "1"}),
+        patch.object(stage_loop, "ROOT", tmp),
+        patch.object(stage_loop.freg, "capture_unit_inputs", return_value=({}, {})),
+        patch.object(stage_loop.OB, "compiler_id", return_value="fixture cc"),
+        patch.object(Path, "symlink_to", autospec=True, side_effect=partial_symlink),
+        patch.object(os.path, "samefile", side_effect=samefile_with_driver_link),
+        patch.object(stage_loop, "emit_backend", side_effect=emit_backend),
+        patch.object(stage_loop, "emit_frontend", side_effect=emit_frontend),
+        patch.object(stage_loop, "build_stage_binary", side_effect=build) as builder,
+    ):
+        assert stage_loop.run_loop(cfg) == 0
+        first = stage_loop.load_json(cfg.result)
+        assert first["fixpoint"] is True and first["fast_path"] is False
+        assert [call.args[3] for call in builder.call_args_list] == [1, 2]
+        for dest, source in staged.items():
+            assert dest.read_bytes() == source.read_bytes()
+            dest.unlink()
+
+        builder.reset_mock()
+        assert stage_loop.run_loop(cfg) == 0
+        assert stage_loop.load_json(cfg.result)["fast_path"] is True
+        builder.assert_not_called()
+        assert all(not dest.exists() and not dest.is_symlink() for dest in staged), staged
+
+        (work / "ouro1_stage2").write_bytes(b"damaged stage binary")
+        assert stage_loop.run_loop(cfg) == 0
+        repaired = stage_loop.load_json(cfg.result)
+        assert repaired["fast_path"] is False and repaired["artifacts"] == first["artifacts"]
+        assert [call.args[3] for call in builder.call_args_list] == [2]
+        for dest, source in staged.items():
+            assert dest.read_bytes() == source.read_bytes()
+
+        shutil.copytree(work / "stage2", work / "stage3")
+        shutil.copyfile(work / "ouro1_stage2", work / "ouro1_stage3")
+        builder.reset_mock()
+        for fields in (
+            {"pass": "false"}, {"fixpoint": "false"}, {"stages": "2"},
+            {"stages": "bad"}, {"stages": 3}, {"artifacts": []},
+        ):
+            stage_loop.write_json_atomic(cfg.result, {**first, **fields})
+            assert stage_loop.run_loop(cfg) == 0, fields
+            assert stage_loop.load_json(cfg.result)["fast_path"] is False, fields
+        builder.assert_not_called()
+
+        stamp = work / "stage2/stage.stamp.json"
+        valid_stamp = stage_loop.load_json(stamp)
+        for fields in ({"stage": 2.0}, {"artifacts": []}):
+            stage_loop.write_json_atomic(stamp, {**valid_stamp, **fields})
+            cfg.result.unlink()
+            builder.reset_mock()
+            assert stage_loop.run_loop(cfg) == 0, fields
+            assert [call.args[3] for call in builder.call_args_list] == [2], fields
+
+        builder.reset_mock()
+        with (
+            patch.dict(os.environ, {"OURO_STAGE_FAST_PATH": "0"}),
+            patch.object(stage_loop, "copy_atomic", side_effect=copy_changed_seed),
+        ):
+            assert stage_loop.run_loop(cfg) == 1
+        failure = stage_loop.load_json(cfg.result)
+        assert failure["pass"] is False and failure["failed_at"] == "stage0_seed"
+        builder.assert_not_called()
+        assert "STAGE_LOOP: FAIL seed changed while staging" in log.getvalue()
+
+
 def parser_unit_fixture() -> str:
     parts = []
     for gid, tokens, position in (("2338", "0", "2"), ("2352", "1", "3")):
@@ -619,6 +745,7 @@ def main() -> int:
         test_multi_piece_packer_output(tmp)
         test_frontend_final_and_tu_cache(tmp)
         test_stage_loop_input_fast_path(tmp)
+        test_stage_loop_seed_staging(tmp / "stage_seed_fixture")
     print("STAGE_LOOP_FRONTEND_REGEN_SUITE: PASS")
     return 0
 

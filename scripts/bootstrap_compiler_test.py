@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import copy
 import concurrent.futures
+from contextlib import contextmanager
+import errno
 import io
 import itertools
 import json
@@ -374,18 +376,19 @@ class BootstrapCompilerTests(unittest.TestCase):
                     if expected:
                         self.assertEqual(chain.call_args.kwargs.get("historical_sha256"), pin if action else None)
 
-    def test_local_ci_reuses_verified_compiler_after_unrelated_edit(self):
-        shared = self.root / "_build/ci-bootstrap"
+    @contextmanager
+    def local_bootstrap_fixture(self):
         cc = self.root / "fake-cc"
         cc.write_bytes(b"C compiler fixture")
 
-        def selected(root, _cfg, _build, *, compact_sources):
+        def selected(root, cfg, _build, *, compact_sources):
             self.assertFalse(compact_sources)
             return {"sources": {"compiler.ouro": sha256_file(root / "compiler.ouro")},
                     "cc_executable": str(cc), "cc_sha256": sha256_file(cc), "stage0": {},
                     "archive_sha256": sha256_file(root / inputs.ARCHIVE),
-                     "manifest_sha256": sha256_file(root / inputs.MANIFEST),
-                     "environment": bootstrap.c_toolchain_environment()}
+                    "manifest_sha256": sha256_file(root / inputs.MANIFEST),
+                    "cflags": build.profile_cflags(cfg), "link_flags": build.host_link_flags(),
+                    "environment": bootstrap.c_toolchain_environment()}
 
         histories = []
 
@@ -410,9 +413,8 @@ class BootstrapCompilerTests(unittest.TestCase):
             write_json_atomic(work / "report.json", report)
             return report
 
-        def prepare(attempt, source, readme, *, cache_enabled=True):
-            checkout = self.root / "_build" / f"ci-{attempt}" / "source"
-            checkout.mkdir(parents=True)
+        def prepare(checkout, source="one", readme="old", *, local_ci=False, **overrides):
+            checkout.mkdir(parents=True, exist_ok=True)
             (checkout / "compiler.ouro").write_text(source, encoding="utf-8")
             (checkout / "README.md").write_text(readme, encoding="utf-8")
             for name in (inputs.ARCHIVE, inputs.MANIFEST):
@@ -421,8 +423,9 @@ class BootstrapCompilerTests(unittest.TestCase):
                 path.write_text(name, encoding="utf-8")
             directory = checkout / "_build"
             cfg = build.ResolvedConfig({**build.DEFAULTS, "build_dir": str(directory),
-                                       "c_build_dir": str(directory / "c"), "cache_enabled": cache_enabled}, {})
-            result = bootstrap.ensure_current_compiler(cfg, build, checkout)
+                                       "c_build_dir": str(directory / "c"), "verbosity": "quiet", **overrides}, {})
+            with patch.dict(os.environ, {bootstrap.LOCAL_CACHE_ENV: "1" if local_ci else ""}):
+                result = bootstrap.ensure_current_compiler(cfg, build, checkout)
             output = directory / "c/ouro1"
             receipt = output.with_name("ouro1.bootstrap.json")
             expected = selected(checkout, cfg, build, compact_sources=False)
@@ -431,11 +434,20 @@ class BootstrapCompilerTests(unittest.TestCase):
                              directory / "bootstrap")
             return result
 
-        with (patch.dict(os.environ, {bootstrap.LOCAL_CACHE_ENV: "1", "GITHUB_ACTIONS": ""}),
+        with (patch.dict(os.environ, {"GITHUB_ACTIONS": "", "RUNNER_TEMP": ""}),
               patch.object(inputs, "read_bundle", return_value=({}, {})), patch.object(inputs, "verify_stage0"),
               patch.object(bootstrap, "current_inputs", side_effect=selected),
               patch.object(bootstrap, "freeze", side_effect=lambda _root, _work, snapshot, _cfg: snapshot),
               patch.object(bootstrap, "chain", side_effect=chain)):
+            yield prepare, histories, cc
+
+    def test_local_ci_reuses_verified_compiler_after_unrelated_edit(self):
+        shared = self.root / "_build/ci-bootstrap"
+        with self.local_bootstrap_fixture() as (prepare_checkout, histories, _cc):
+            def prepare(attempt, source, readme, **overrides):
+                checkout = self.root / "_build" / f"ci-{attempt}" / "source"
+                return prepare_checkout(checkout, source, readme, local_ci=True, **overrides)
+
             cold = prepare("first", "one", "old")
             warm = prepare("readme", "one", "new")
             self.assertEqual(warm["cache"], "hit")
@@ -458,6 +470,101 @@ class BootstrapCompilerTests(unittest.TestCase):
             self.assertNotEqual(uncached["binary_sha256"], rebuilt["binary_sha256"])
             self.assertEqual(sha256_file(cached), rebuilt["binary_sha256"])
             self.assertEqual(histories, [shared / "bootstrap-historical"] * 3 + [None])
+
+    def test_local_ci_reuses_verified_default_checkout_compiler(self):
+        checkout_build = self.root / "_build"
+        first = checkout_build / "ci-host" / "0123456789abcdef"
+        second = checkout_build / "ci-next" / "source"
+        with self.local_bootstrap_fixture() as (prepare, histories, _cc), \
+                patch.dict(os.environ, {"SOURCE_DATE_EPOCH": "0"}):
+            installed = prepare(self.root, reproducible=True)
+            source = checkout_build / "c/ouro1"
+            receipt = source.with_name("ouro1.bootstrap.json")
+            original = receipt.read_bytes()
+            restored = prepare(first, readme="new", local_ci=True, reproducible=True)
+            self.assertEqual(restored["cache"], "hit")
+            self.assertEqual(restored["binary_sha256"], installed["binary_sha256"])
+            self.assertEqual(receipt.read_bytes(), original)
+            self.assertEqual(sha256_file(source), installed["binary_sha256"])
+            source.unlink()
+            reused = prepare(second, local_ci=True, reproducible=True)
+            self.assertEqual(reused["cache"], "hit")
+            self.assertEqual(reused["binary_sha256"], installed["binary_sha256"])
+            self.assertEqual(histories, [checkout_build / "bootstrap-historical"])
+
+    def test_local_ci_rebuilds_when_default_checkout_compiler_is_ineligible(self):
+        with self.local_bootstrap_fixture() as (prepare, histories, cc):
+            for cause in ("missing", "sources", "toolchain", "flags", "environment", "binary", "evidence",
+                          "malformed-comparison", "outside-work", "cache-off", "hosted"):
+                with self.subTest(cause=cause):
+                    checkout = self.root / cause
+                    directory = checkout / "_build"
+                    installed = prepare(checkout)
+                    output = directory / "c/ouro1"
+                    receipt = output.with_name("ouro1.bootstrap.json")
+                    work = Path(installed["work"])
+                    if cause == "missing":
+                        receipt.unlink()
+                    elif cause == "toolchain":
+                        cc.write_bytes(b"changed C compiler fixture")
+                    elif cause == "binary":
+                        output.write_bytes(b"damaged compiler fixture" * 300)
+                    elif cause == "evidence":
+                        (work / "out/p1/driver_u.c").write_bytes(b"damaged generated C fixture")
+                    elif cause == "malformed-comparison":
+                        report_path = work / "report.json"
+                        report = json.loads(report_path.read_bytes())
+                        write_json_atomic(report_path, {**report, "complete_generated_c_comparison": []})
+                        write_json_atomic(receipt, {**installed, "report_sha256": sha256_file(report_path)})
+                    elif cause == "outside-work":
+                        outside = work.parent.parent / "outside"
+                        shutil.copytree(work, outside)
+                        write_json_atomic(receipt, {**installed, "work": str(outside)})
+                        self.assertTrue(bootstrap.installed_current(output, receipt, installed["selected"]))
+                    env = {"SOURCE_DATE_EPOCH": "0"} if cause == "environment" else {}
+                    if cause == "hosted":
+                        env["GITHUB_ACTIONS"] = "true"
+                    with patch.dict(os.environ, env):
+                        rebuilt = prepare(directory / "ci-host" / "0123456789abcdef",
+                                          source="two" if cause == "sources" else "one",
+                                          local_ci=True, reproducible=cause == "flags", cache_enabled=cause != "cache-off")
+                    self.assertNotIn("cache", rebuilt)
+                    self.assertNotEqual(rebuilt["binary_sha256"], installed["binary_sha256"])
+                    shared = directory / "ci-bootstrap"
+                    if cause in {"cache-off", "hosted"}:
+                        self.assertIsNone(histories[-1])
+                        self.assertFalse(shared.exists())
+                    else:
+                        self.assertEqual(histories[-1], shared / "bootstrap-historical")
+
+    def test_local_ci_rechecks_checkout_compiler_during_copy(self):
+        with self.local_bootstrap_fixture() as (prepare, histories, _cc):
+            for change in ("removed", "replaced", "changed-evidence", "locked"):
+                with self.subTest(change=change):
+                    checkout = self.root / change
+                    directory = checkout / "_build"
+                    installed = prepare(checkout)
+                    source_to_change = (Path(installed["work"]) / "out/p1/driver_u.c" if change == "changed-evidence"
+                                        else directory / "c/ouro1")
+
+                    def copy_source(source, target, copy_file=shutil.copy2, *, source_to_change=source_to_change, change=change):
+                        if source == source_to_change:
+                            if change == "removed":
+                                source.unlink()
+                            elif change == "locked":
+                                raise PermissionError(errno.EACCES, "fixture compiler is locked", None, 32)
+                            else:
+                                source.write_bytes(b"replacement checkout artifact" * 300)
+                        return copy_file(source, target)
+
+                    ci_checkout = directory / "ci-host" / "0123456789abcdef"
+                    with patch.object(shutil, "copy2", side_effect=copy_source) as copier:
+                        rebuilt = prepare(ci_checkout, local_ci=True)
+                    self.assertIn(source_to_change, [call.args[0] for call in copier.call_args_list])
+                    self.assertNotIn("cache", rebuilt)
+                    self.assertNotEqual(rebuilt["binary_sha256"], installed["binary_sha256"])
+                    self.assertEqual(histories[-1], directory / "ci-bootstrap/bootstrap-historical")
+                    self.assertEqual(list((ci_checkout / "_build/bootstrap").iterdir()), [Path(rebuilt["work"])])
 
     def test_incomplete_or_corrupt_historical_entries_rebuild_before_current_rejection(self):
         cache = self.root / "historical-cache"
@@ -1571,7 +1678,7 @@ class BootstrapCompilerTests(unittest.TestCase):
                 export.assert_called_once_with(ci_gate.ROOT, cfg.path("c_build_dir") / "ouro1", selected, archive,
                                                historical_key=historical_key)
 
-    def test_historical_cache_transport_has_one_protected_writer(self):
+    def test_historical_cache_transport_has_protected_writers(self):
         directory = ci_gate.ROOT / ".github/workflows"
         path = "path: ${{ runner.temp }}/bootstrap-historical/${{ steps.inputs.outputs.historical_key }}.zip"
         prefix = "ouro-bootstrap-historical-v1-${{ runner.os }}-${{ runner.arch }}-${{ steps.inputs.outputs.historical_key }}-"
@@ -1583,6 +1690,7 @@ class BootstrapCompilerTests(unittest.TestCase):
         protected = "github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master')"
         for workflow, job, restore_condition, verify_condition, count in (
             ("ouro-pr", "host-compiler", miss, restored + " && " + matched, 2),
+            ("ouro-pr", "portable-kernel-smoke", miss, restored + " && " + matched, 2),
             ("dependency-review", "dependency-review", "steps.changes.outputs.dependency != 'false' && " + miss, matched, 1),
         ):
             content = (directory / (workflow + ".yml")).read_text(encoding="utf-8")
@@ -1598,6 +1706,7 @@ class BootstrapCompilerTests(unittest.TestCase):
                 verify = next(step for step in steps if "scripts/ci_historical_cache.py verify" in step)
                 build_step = next(step for step in steps if "scripts/ouro_build.py build" in step)
                 self.assertIn("if: ${{ " + verify_condition + " }}", {line.strip() for line in verify.splitlines()})
+                self.assertIn("HISTORICAL_KEY: ${{ steps.inputs.outputs.historical_key }}", verify)
                 self.assertIn("OURO_BOOTSTRAP_HISTORY_SHA256: ${{ steps.historical-origin.outputs.verified_sha256 }}", build_step)
                 self.assertLess(steps.index(restore), steps.index(verify))
                 self.assertLess(steps.index(verify), steps.index(build_step))
@@ -1608,15 +1717,31 @@ class BootstrapCompilerTests(unittest.TestCase):
                     self.assertIn("key: ${{ steps.historical-cache.outputs.cache-primary-key }}", save)
                     attest = next(step for step in steps if "scripts/ci_historical_cache.py attest" in step)
                     publish = next(step for step in steps if "bootstrap-historical/attestation.txt" in step)
-                    self.assertIn("if: ${{ " + protected + " && github.run_attempt == '1' && " + restored + " }}", attest)
+                    export = next(step for step in steps if "--compiler-artifact export" in step)
+                    writer = protected
+                    prepare = "if: ${{ " + protected + " && github.run_attempt == '1' && " + restored + " }}"
+                    if job == "portable-kernel-smoke":
+                        writer = public + " && " + protected
+                        self.assertIn("if: ${{ " + writer + " && github.run_attempt == '1' && " + restored + " }}", export)
+                        self.assertIn(' --artifact "$RUNNER_TEMP/portable-compiler.tar.gz"', export)
+                        self.assertIn("if: ${{ steps.bundle.outcome == 'success' }}", attest)
+                        exact = next(step for step in steps if "id: compiler-cache" in step)
+                        self.assertIn("key: ouro-pr-portable-${{ runner.os }}-${{ runner.arch }}-${{ steps.inputs.outputs.key }}",
+                                      exact)
+                        self.assertIn("python3 -m py_compile ", build_step)
+                        self.assertIn("python3 scripts/kernel_hardening_suite.py --out _build/portable_compiler", build_step)
+                        self.assertNotIn("        if:", build_step)
+                    else:
+                        self.assertIn(prepare, attest)
+                    self.assertIn("HISTORICAL_KEY: ${{ steps.inputs.outputs.historical_key }}", attest)
                     self.assertIn("BUILT_HISTORICAL_SHA256: ${{ steps.bundle.outputs.historical_sha256 }}", attest)
-                    publish_if = "if: ${{ " + protected + " && steps.historical-evidence.outputs.name != ''"
+                    publish_if = "if: ${{ " + writer + " && steps.historical-evidence.outputs.name != ''"
                     self.assertIn(publish_if + " && steps.historical-evidence.outputs.sha256 != "
                                   "steps.historical-origin.outputs.verified_sha256 }}", save)
                     self.assertIn(publish_if + " }}", publish)
                     self.assertIn("name: ${{ steps.historical-evidence.outputs.name }}", publish)
-                    export = next(index for index, step in enumerate(steps) if "--compiler-artifact export" in step)
-                    self.assertLess(export, steps.index(attest))
+                    self.assertLess(steps.index(build_step), steps.index(export))
+                    self.assertLess(steps.index(export), steps.index(attest))
                     self.assertLess(steps.index(attest), steps.index(publish))
 
     def test_pr_verified_caches_save_after_their_gates(self):
@@ -1705,7 +1830,7 @@ class BootstrapCompilerTests(unittest.TestCase):
             with self.subTest(spool_limit=spool_limit, receipt_limit=receipt_limit, fail_capture=fail_capture):
                 receipt_reads = []
 
-                def count_receipt_read(bundle, member, receipt_reads=receipt_reads, fail_capture=fail_capture):
+                def count_receipt_read(bundle, member, *, receipt_reads=receipt_reads, fail_capture=fail_capture):
                     if member.name == receipt_name:
                         receipt_reads.append(bundle.fileobj.tell() <= member.offset_data)
                         if fail_capture and len(receipt_reads) == 1:
@@ -1804,6 +1929,21 @@ class BootstrapCompilerTests(unittest.TestCase):
                                    "c_build_dir": str(output.parent)}, {})
         return output, selected, cfg
 
+    def emit_drift_frontend(self, argv, raw, **report_overrides):
+        out = Path(argv[argv.index("--out") + 1])
+        work = Path(argv[argv.index("--work") + 1])
+        report = Path(argv[argv.index("--report") + 1])
+        self.assertIn("--no-cache", argv)
+        self.assertEqual(out.parent, work.parent)
+        self.assertEqual(out.parent, report.parent)
+        self.assertEqual(list(out.parent.iterdir()), [])
+        out.write_bytes(raw)
+        write_json_atomic(report, {"gate": "frontend_regen", "pass": True, "cache_enabled": False,
+                                   "fast_path": False, "final_cache": "disabled", "output": "updated",
+                                   "seed": argv[argv.index("--ouro1") + 1], "work": str(work), "out": str(out),
+                                   "output_sha256": sha256_file(out), **report_overrides})
+        return out
+
     def test_stage_loop_reuses_the_checkout_build_module(self):
         import stage_loop
 
@@ -1828,11 +1968,8 @@ class BootstrapCompilerTests(unittest.TestCase):
             self.assertEqual(log.parent, work)
             if "--out" in argv:
                 self.assertEqual(Path(argv[argv.index("--ouro1") + 1]), output)
-                self.assertIn("--no-cache", argv)
-                out = Path(argv[argv.index("--out") + 1])
-                out.parent.mkdir(parents=True, exist_ok=True)
                 text = references["driver_u.c"].read_text(encoding="utf-8")
-                out.write_bytes(text.replace("\n", "\r\n").encode("utf-8"))
+                self.emit_drift_frontend(argv, text.replace("\n", "\r\n").encode("utf-8"))
             else:
                 self.assertEqual(argv, ["sh", "scripts/stage_loop.sh"])
                 for name, reference in references.items():
@@ -1853,6 +1990,15 @@ class BootstrapCompilerTests(unittest.TestCase):
         report = json.loads((work / "generated-artifact-drift.json").read_text())
         self.assertTrue(report["pass"])
         self.assertTrue(all(row["pass"] for row in report["details"]["manifest_artifacts"]))
+        frontend = report["details"]["frontend_regeneration"]
+        frontend_out = self.root / frontend["out"]
+        frontend_report = self.root / frontend["report"]
+        self.assertEqual(frontend_out.parent.parent, work / "frontend-regenerated")
+        self.assertEqual(frontend_out.parent, frontend_report.parent)
+        self.assertEqual((frontend_out.name, frontend_report.name), ("driver_u.c", "frontend-regeneration.json"))
+        emitted = json.loads(frontend_report.read_text(encoding="utf-8"))
+        self.assertEqual(emitted["out"], str(frontend_out))
+        self.assertEqual(emitted["output_sha256"], sha256_file(frontend_out))
         comparisons = report["details"]["stage_loop"]["reference_artifact_comparisons"]
         self.assertEqual({row["artifact"] for row in comparisons}, set(references))
         self.assertTrue(all(row["pass"] for row in comparisons))
@@ -1864,29 +2010,46 @@ class BootstrapCompilerTests(unittest.TestCase):
     def test_generated_drift_reads_one_byte_snapshot_per_comparison(self):
         work = self.root / "drift"
         stage_work = self.root / "stage-loop"
-        frontend = work / "frontend-regenerated/driver_u.c"
         references = {name: self.root / name for name in ("driver_u.c", "backend_u.c")}
         stage_artifacts = [stage_work / "stage2" / name for name in references]
         raw = b"a\r\nb\rc\0\xff\r"
         normalized = b"a\nb\nc\0\xff\n"
-        observed = set(references.values()) | {frontend, *stage_artifacts}
+        observed = set(references.values()) | set(stage_artifacts)
         for path in observed:
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_bytes(normalized if path in references.values() else raw)
         write_json_atomic(stage_work / "result.json", {"pass": True, "frontend_eq": True,
                                                        "backend_eq": True, "stages": 2})
-        raw_hash, normalized_hash = sha256_file(frontend), sha256_file(references["driver_u.c"])
+        raw_hash, normalized_hash = sha256_file(stage_artifacts[0]), sha256_file(references["driver_u.c"])
+        frontend = None
         opened = []
 
-        def open_path(path, *args, _open=Path.open, **kwargs):
-            if path in observed:
-                opened.append(path)
-            return _open(path, *args, **kwargs)
+        def regenerate(argv, **_kwargs):
+            nonlocal frontend
+            if "--out" in argv:
+                frontend = self.emit_drift_frontend(argv, raw)
+                observed.add(frontend)
+            else:
+                self.assertEqual(argv, ["sh", "scripts/stage_loop.sh"])
+            return 0
 
-        with patch.object(drift, "run", return_value=0), patch.object(Path, "open", open_path):
+        def open_path(path, mode="r", *args, _open=Path.open, **kwargs):
+            if path in observed and mode == "rb":
+                opened.append(path)
+            return _open(path, mode, *args, **kwargs)
+
+        def read_bytes(path, _read=Path.read_bytes):
+            snapshot = _read(path)
+            if path == frontend:
+                path.write_bytes(b"frontend changed after comparison read")
+            return snapshot
+
+        with patch.object(drift, "run", side_effect=regenerate), patch.object(Path, "open", open_path), \
+             patch.object(Path, "read_bytes", read_bytes):
             issues, frontend_result = drift.frontend_regen_check({}, work, 1, self.root / "ouro1", references)
             self.assertEqual(issues, [])
             self.assertEqual(opened, [frontend, references["driver_u.c"]])
+            self.assertEqual((drift.ROOT / frontend_result["out"]).read_bytes(), raw)
             opened.clear()
             issues, stage_result = drift.stage_loop_check({}, work, stage_work, references)
             self.assertEqual(issues, [])
@@ -1899,6 +2062,122 @@ class BootstrapCompilerTests(unittest.TestCase):
             self.assertEqual(record["reference_promotion_normalized_sha256"], normalized_hash)
         self.assertEqual((frontend_result["bytes"], frontend_result["promotion_normalized_bytes"]),
                          (len(raw), len(normalized)))
+
+    def test_generated_drift_rejects_stale_or_invalid_frontend_evidence(self):
+        work = self.root / "drift"
+        published = work / "frontend-regenerated"
+        previous_work = published / "work"
+        previous_work.mkdir(parents=True)
+        raw = b"current frontend\n"
+        reference = self.root / "reference.c"
+        reference.write_bytes(raw)
+        previous_out = published / "driver_u.c"
+        previous_out.write_bytes(raw)
+        previous_report = published / "frontend-regeneration.json"
+        write_json_atomic(previous_report, {"pass": True, "fast_path": True, "final_cache": "manifest-hit",
+                                            "out": str(previous_out), "output_sha256": sha256_file(previous_out)})
+        stale_report = previous_report.read_bytes()
+        (previous_work / previous_report.name).write_bytes(stale_report)
+        invalid = "missing or invalid frontend regeneration report"
+        not_fresh = "frontend regeneration report did not prove fresh uncached output"
+        invocation_dirs = set()
+        for case, expected_reason in (
+            ("stale", invalid),
+            ("malformed", invalid),
+            ("fast-path", not_fresh),
+            ("wrong-work", not_fresh),
+            ("wrong-hash", "frontend regeneration output does not match its report"),
+        ):
+            def regenerate(argv, *, case=case, **_kwargs):
+                report = Path(argv[argv.index("--report") + 1])
+                self.assertNotIn(report.parent, invocation_dirs)
+                self.assertEqual(list(report.parent.iterdir()), [])
+                invocation_dirs.add(report.parent)
+                if case == "malformed":
+                    report.write_text("{", encoding="utf-8")
+                elif case == "fast-path":
+                    self.emit_drift_frontend(argv, raw, fast_path=True, final_cache="manifest-hit")
+                elif case == "wrong-work":
+                    self.emit_drift_frontend(argv, raw, work=str(previous_work))
+                elif case == "wrong-hash":
+                    self.emit_drift_frontend(argv, raw, output_sha256="0" * 64)
+                return 0
+
+            with self.subTest(case=case), patch.object(drift, "run", side_effect=regenerate):
+                issues, data = drift.frontend_regen_check({}, work, 1, self.root / "ouro1", {"driver_u.c": reference})
+                self.assertEqual([issue["reason"] for issue in issues], [expected_reason])
+                self.assertNotIn("out", data)
+                self.assertNotIn("report", data)
+                self.assertNotIn("reference_sha256", data)
+        self.assertTrue(all(not directory.exists() for directory in invocation_dirs))
+        self.assertEqual(previous_out.read_bytes(), raw)
+        self.assertEqual(previous_report.read_bytes(), stale_report)
+        self.assertEqual((previous_work / previous_report.name).read_bytes(), stale_report)
+
+    def test_generated_drift_publishes_each_frontend_pair_together(self):
+        work = self.root / "drift"
+        directory = work / "frontend-regenerated"
+        seed = self.root / "ouro1"
+        reference = self.root / "reference.c"
+        references = {"driver_u.c": reference}
+        first_bytes = b"first frontend\n"
+        second_bytes = b"second frontend\n"
+        reference.write_bytes(first_bytes)
+
+        def regenerate(argv, **_kwargs):
+            self.emit_drift_frontend(argv, reference.read_bytes())
+            return 0
+
+        with patch.object(drift, "run", side_effect=regenerate):
+            issues, first = drift.frontend_regen_check({}, work, 1, seed, references)
+            self.assertEqual(issues, [])
+            first_out = drift.ROOT / first["out"]
+            first_report = drift.ROOT / first["report"]
+            first_report_bytes = first_report.read_bytes()
+            reference.write_bytes(second_bytes)
+
+            with patch.object(drift.os, "rename", side_effect=PermissionError("cannot publish frontend directory")):
+                issues, failed = drift.frontend_regen_check({}, work, 1, seed, references)
+            self.assertEqual([issue["reason"] for issue in issues], ["could not publish frontend regeneration"])
+            self.assertNotIn("out", failed)
+            self.assertNotIn("report", failed)
+            self.assertEqual(set(directory.iterdir()), {first_out.parent})
+            self.assertEqual(first_out.read_bytes(), first_bytes)
+            self.assertEqual(first_report.read_bytes(), first_report_bytes)
+
+            issues, second = drift.frontend_regen_check({}, work, 1, seed, references)
+            self.assertEqual(issues, [])
+
+        second_out = drift.ROOT / second["out"]
+        second_report = drift.ROOT / second["report"]
+        self.assertNotEqual(first_out.parent, second_out.parent)
+        self.assertEqual(set(directory.iterdir()), {first_out.parent, second_out.parent})
+        for out, report, raw in [(first_out, first_report, first_bytes), (second_out, second_report, second_bytes)]:
+            self.assertEqual(out.parent, report.parent)
+            self.assertEqual(out.read_bytes(), raw)
+            emitted = json.loads(report.read_text(encoding="utf-8"))
+            self.assertEqual(Path(emitted["out"]), out)
+            self.assertEqual(emitted["output_sha256"], sha256_file(out))
+
+    def test_generated_drift_accepts_equivalent_report_paths(self):
+        work = self.root / "drift"
+        seed = self.root / "ouro1"
+        reference = self.root / "reference.c"
+        raw = b"current frontend\n"
+        reference.write_bytes(raw)
+
+        def regenerate(argv, **_kwargs):
+            paths = {}
+            for field, flag in (("seed", "--ouro1"), ("out", "--out"), ("work", "--work")):
+                path = Path(argv[argv.index(flag) + 1])
+                paths[field] = f"{path.parent.as_posix()}/./{path.name}"
+            self.emit_drift_frontend(argv, raw, **paths)
+            return 0
+
+        with patch.object(drift, "run", side_effect=regenerate):
+            issues, details = drift.frontend_regen_check({}, work, 1, seed, {"driver_u.c": reference})
+        self.assertEqual(issues, [])
+        self.assertEqual((drift.ROOT / details["out"]).read_bytes(), raw)
 
     def test_generated_drift_rejects_stale_missing_or_tampered_bootstrap_evidence(self):
         output, selected, cfg = self.drift_fixture()
@@ -1962,12 +2241,15 @@ class BootstrapCompilerTests(unittest.TestCase):
         result = stage_work / "result.json"
         complete = {"pass": True, "frontend_eq": True, "backend_eq": True, "stages": 2}
         write_json_atomic(result, complete)
-        with patch.object(drift, "run", return_value=0):
-            out = work / "frontend-regenerated/driver_u.c"
-            out.parent.mkdir(parents=True)
-            out.write_bytes(b"different current frontend\n")
+
+        def regenerate(argv, **_kwargs):
+            self.emit_drift_frontend(argv, b"different current frontend\n")
+            return 0
+
+        with patch.object(drift, "run", side_effect=regenerate):
             issues, _details = drift.frontend_regen_check({}, work, 1, output, references)
             self.assertEqual([row["reason"] for row in issues], ["frontend generated artifact drift"])
+        with patch.object(drift, "run", return_value=0):
             for name, reference in references.items():
                 with self.subTest(artifact=name):
                     path = stage_work / "stage2" / name

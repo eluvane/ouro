@@ -21,7 +21,6 @@ class KernelScaleTest(unittest.TestCase):
         self.root = Path(temporary.name).resolve()
         self.addCleanup(patch.stopall)
         patch.object(scale, 'ROOT', self.root).start()
-        patch.object(scale.frontend_regen, 'collect_units', side_effect=lambda entry: [entry]).start()
         names = {*scale.native_tool_build.BUILD_INPUTS, *scale.native_tool_build.RUNTIME,
                  *scale.ORCHESTRATION, *scale.ENTRIES.values(), 'runtime/ouro_rt.h',
                  'compiler/file_check_environment.ouro', 'compiler/file_check_work.ouro',
@@ -57,7 +56,8 @@ class KernelScaleTest(unittest.TestCase):
         directory.mkdir(exist_ok=True)
         executable = directory / 'probe.exe'
         executable.write_bytes(b'physical probe fixture')
-        sources = scale.expected_sources(entry)
+        state = scale.input_state(entry, self.compiler)
+        sources = state.sources
         inputs = {'kind': scale.native_tool_build.KIND, 'entry': entry, 'sources': sources,
                   'compiler_sha256': scale.sha256_path(self.compiler), 'fuel': 16000,
                   'cflags': ['-O0', '-std=c99', '-D_POSIX_C_SOURCE=200809L',
@@ -66,7 +66,6 @@ class KernelScaleTest(unittest.TestCase):
                    'key': scale.hash_json(inputs), 'binary_sha256': scale.sha256_path(executable)}
         receipt_path = Path(str(executable) + '.build.json')
         receipt_path.write_text(json.dumps(receipt), encoding='utf-8')
-        state = scale.input_state(entry, self.compiler)
         command = [str(self.compiler), 'check', entry, '999999', '--unit', entry]
         build_command = scale.build_command(self.compiler, entry, executable, directory)
         report = {'kind': scale.REPORT_KIND, 'profile': profile, 'timing_domain': scale.TIMING_DOMAIN,
@@ -74,7 +73,7 @@ class KernelScaleTest(unittest.TestCase):
                   'workers': 1, 'memory_limit_mib': scale.MEMORY_MIB, 'work_limit': scale.WORK_LIMIT,
                   'scale_budget_s': scale.SCALE_BUDGET, 'cpu_affinity': [0],
                   'producer_sha256': scale.sha256_path(self.compiler), 'sources': sources,
-                  'inputs_before': state, 'inputs_after': state, 'inputs_unchanged': True,
+                  'inputs_before': state.files, 'inputs_after': state.files, 'inputs_unchanged': True,
                   'check': self.process(command, 'CHECK_OK\n', scale.CHECK_TIMEOUT),
                   'build': {'executable': scale.relative(executable), 'receipt': receipt,
                             'receipt_sha256': scale.sha256_path(receipt_path),
@@ -100,6 +99,28 @@ class KernelScaleTest(unittest.TestCase):
         path = self.root / 'report.json'
         path.write_text(json.dumps(report), encoding='utf-8')
         return scale.report_evidence(path, profile)
+
+    def test_input_state_reads_each_path_once_and_keeps_import_order(self):
+        entry = scale.ENTRIES['scale']
+        first = 'compiler/file_check_work.ouro'
+        second = 'compiler/file_check_environment.ouro'
+        shared = 'std/data.ouro'
+        (self.root / entry).write_bytes(f'import "../{first}";\r\nimport "../{second}";\r\n'.encode())
+        for name in (first, second):
+            (self.root / name).write_bytes(f'import "../{shared}";\n'.encode())
+        for name in ('compiler/unreached.ouro', 'std/unreached.ouro'):
+            (self.root / name).write_bytes(b'-- outside the entry closure\n')
+        paths = {path for path in self.root.rglob('*') if path.is_file()} - {self.root / scale.ENTRIES['depth']}
+
+        with patch.object(Path, 'open', autospec=True, side_effect=Path.open) as opened:
+            state = scale.input_state(entry, self.compiler)
+
+        self.assertCountEqual((call.args[0] for call in opened.call_args_list), paths)
+        self.assertEqual(state.units, [shared, first, second, entry])
+        self.assertEqual(state.files, {scale.relative(path): scale.sha256_path(path) for path in paths})
+        names = {*state.units, *scale.native_tool_build.BUILD_INPUTS, *scale.native_tool_build.RUNTIME, 'runtime/ouro_rt.h'}
+        self.assertEqual(state.sources, {name: state.files[name] for name in names})
+        self.assertEqual(state.producer_sha256, scale.sha256_path(self.compiler))
 
     def test_complete_profiles_have_exact_owner_credits(self):
         for profile, count in (('scale', 6), ('depth', 1)):
@@ -204,10 +225,15 @@ class KernelScaleTest(unittest.TestCase):
     def test_stale_current_source_or_missing_source_is_rejected(self):
         report = self.fixture('scale')
         for name in ('compiler/file_check_environment.ouro', 'compiler/file_check_work.ouro',
-                     scale.ENTRIES['scale'], 'runtime/ouro_rt.h', 'scripts/kernel_scale.py'):
+                     scale.ENTRIES['scale'], 'runtime/ouro_rt.h', 'scripts/kernel_scale.py',
+                     scale.relative(self.compiler)):
             path = self.root / name
             previous = path.read_bytes()
-            path.write_bytes(previous + b'changed')
+            stamp = path.stat()
+            path.write_bytes(previous[:-1] + b'!')
+            os.utime(path, ns=(stamp.st_atime_ns, stamp.st_mtime_ns))
+            self.assertEqual(path.stat().st_size, stamp.st_size)
+            self.assertEqual(path.stat().st_mtime_ns, stamp.st_mtime_ns)
             self.assertFalse(self.evidence(report, 'scale')['pass'])
             path.write_bytes(previous)
         (self.root / 'compiler/new_checker.ouro').write_text('new', encoding='utf-8')
@@ -265,10 +291,14 @@ class KernelScaleTest(unittest.TestCase):
 
     def test_dirty_source_after_check_stops_before_build(self):
         calls = []
+        source = self.root / 'compiler/file_check_work.ouro'
+        before = source.read_bytes()
+        stamp = source.stat()
 
         def execute(command, _directory, _label, _env, timeout):
             calls.append(command)
-            (self.root / 'compiler/file_check_work.ouro').write_text('dirty source', encoding='utf-8')
+            source.write_bytes(b'-' + before[1:])
+            os.utime(source, ns=(stamp.st_atime_ns, stamp.st_mtime_ns))
             return self.process(command, 'CHECK_OK\n', timeout)
 
         with patch.object(scale, 'execute', side_effect=execute), patch.object(scale, 'pin_one_cpu', return_value=[0]), \
@@ -277,6 +307,30 @@ class KernelScaleTest(unittest.TestCase):
         self.assertFalse(result['pass'])
         self.assertEqual(len(calls), 1)
         self.assertFalse(result['inputs_unchanged'])
+        self.assertEqual(result['error'], 'inputs changed during the source check')
+        self.assertEqual(source.stat().st_size, stamp.st_size)
+        self.assertEqual(source.stat().st_mtime_ns, stamp.st_mtime_ns)
+
+    def test_missing_import_after_check_fails_with_report(self):
+        entry = scale.ENTRIES['scale']
+        imported = 'std/data.ouro'
+        (self.root / entry).write_bytes(f'import "../{imported}";\n'.encode())
+
+        def execute(command, _directory, _label, _env, timeout):
+            (self.root / imported).unlink()
+            return self.process(command, 'CHECK_OK\n', timeout)
+
+        with patch.object(scale, 'execute', side_effect=execute) as execute_probe, \
+                patch.object(scale, 'pin_one_cpu', return_value=[0]), patch.object(scale, 'environment', return_value={}):
+            result = scale.run('scale', self.compiler, self.root / '_build/missing-import')
+
+        execute_probe.assert_called_once()
+        self.assertEqual(execute_probe.call_args.args[0], [str(self.compiler), 'check', entry, '999999',
+                                                         '--unit', imported, '--unit', entry])
+        self.assertFalse(result['pass'])
+        self.assertFalse(result['inputs_unchanged'])
+        self.assertIn(f'missing {imported}', result['error'])
+        self.assertEqual(result['input_error'], result['error'])
 
     def test_successful_wrapper_without_real_build_is_not_evidence(self):
         calls = []

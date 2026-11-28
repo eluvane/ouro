@@ -1,0 +1,406 @@
+import "memory_model.ouro",
+  "../../../std/collections.ouro",
+  "../../../std/natx.ouro",
+  "../../../std/test.ouro";
+
+private def memory_test_empty : MemoryState := memory_empty MemoryWindowsX64;
+
+private def memory_test_binding (width : Nat) (alignment : Nat) : MemoryBinding :=
+    MkMemoryBinding MemoryWindowsX64 7 (MkMemoryLayout width alignment MemoryOctets);
+
+private def memory_test_word : MemoryBinding := memory_test_binding 2 2;
+private def memory_test_octet : MemoryBinding := memory_test_binding 1 1;
+private def memory_test_flag : MemoryBinding :=
+    MkMemoryBinding MemoryWindowsX64 7 (MkMemoryLayout 1 1 MemoryBooleanByte);
+
+private def memory_test_error_code (error : MemoryError) : Nat :=
+    match error with
+    | MemoryInvalidLayout => 1
+    | MemoryMetadataMismatch => 2
+    | MemoryAddressOverflow => 3
+    | MemoryAddressInUse => 4
+    | MemoryAddressMismatch => 5
+    | MemoryStaleIdentity => 6
+    | MemoryPermissionMissing => 7
+    | MemoryPermissionDenied => 8
+    | MemoryBorrowConflict => 9
+    | MemoryActiveBorrow => 10
+    | MemoryOutOfBounds => 11
+    | MemoryMisaligned => 12
+    | MemoryUninitialized => 13
+    | MemoryWrongValueSize => 14
+    | MemoryInvalidValue => 15
+    | MemoryCapacity => 16
+    | MemoryFuelExhausted => 17
+    | MemoryNullAddress => 18
+    end;
+
+private def memory_test_reject (state : MemoryState) (command : MemoryCommand) (wanted : MemoryError) : Bool :=
+    match memory_step state command with
+    | Left error => eq_nat (memory_test_error_code error) (memory_test_error_code wanted)
+    | Right _ => False
+    end;
+
+private def memory_test_step (state : MemoryState) (command : MemoryCommand)
+    (law : MemoryTransition -> Bool) : Bool :=
+    match memory_step state command with | Left _ => False | Right transition => law transition end;
+
+private def memory_test_allocation (binding : MemoryBinding) (address : Nat) (size : Nat)
+    (law : MemoryState -> MemoryAccess -> Bool) : Bool :=
+    memory_test_step memory_test_empty (MemoryAllocate binding address size)
+      (fun (transition : MemoryTransition) => if let MemoryAllocated owner := ((memory_transition_event transition) : MemoryEvent) then
+        law (memory_transition_state transition) owner else False);
+
+private def memory_test_borrow (state : MemoryState) (command : MemoryCommand)
+    (law : MemoryState -> MemoryAccess -> Bool) : Bool :=
+    memory_test_step state command (fun (transition : MemoryTransition) =>
+      if let MemoryBorrowed _ borrowed := ((memory_transition_event transition) : MemoryEvent) then law (memory_transition_state transition) borrowed else False);
+
+private def memory_test_pointer (access : MemoryAccess) (offset : Nat) (bits : Nat) : MemoryAccess :=
+    let pointer : MemoryPointer := (memory_access_pointer access) in
+    MkMemoryAccess (MkMemoryPointer (memory_pointer_identity pointer) offset bits) (memory_access_credential access) (memory_access_binding access);
+
+private def memory_test_binding_as (access : MemoryAccess) (binding : MemoryBinding) : MemoryAccess :=
+    MkMemoryAccess (memory_access_pointer access) (memory_access_credential access) binding;
+
+private def memory_test_read (state : MemoryState) (access : MemoryAccess) (wanted : List Nat) : Bool :=
+    memory_test_step state (MemoryRead access) (fun (transition : MemoryTransition) =>
+      if let MemoryReadDone pointer bytes := ((memory_transition_event transition) : MemoryEvent) then
+        let original : MemoryPointer := (memory_access_pointer access) in
+        andb (eq_nat (memory_pointer_identity pointer) (memory_pointer_identity original))
+          (andb (eq_nat (memory_pointer_offset pointer) (memory_pointer_offset original))
+            (andb (eq_nat (memory_pointer_bits pointer) (memory_pointer_bits original)) (list_eq Nat eq_nat bytes wanted)))
+      else False);
+
+private def memory_test_outcome (run : MemoryRun) : Nat :=
+    match (memory_run_result run) with | Left error => memory_test_error_code error | Right _ => 0 end;
+
+private def memory_test_trace : Bool :=
+    memory_test_allocation memory_test_word 32 4 (fun (state : MemoryState) (owner : MemoryAccess) =>
+      let last : MemoryAccess := memory_test_pointer owner 2 34 in
+      let replay : MemoryRun := memory_run 2 state [MemoryWrite last [65, 255], MemoryRead last] in
+      match (memory_run_trace replay) with
+      | Nil => False
+      | Cons write rest => match rest with
+        | Nil => False
+        | Cons read tail =>
+          if let MemoryWritten written sent := (write : MemoryEvent) then
+            if let MemoryReadDone observed received := (read : MemoryEvent) then
+              andb (eq_nat (memory_test_outcome replay) 0)
+                (andb (eq_nat (length MemoryEvent tail) 0)
+                  (andb (eq_nat (memory_pointer_bits written) 34)
+                    (andb (eq_nat (memory_pointer_bits observed) 34)
+                      (andb (list_eq Nat eq_nat sent [65, 255]) (list_eq Nat eq_nat received [65, 255])))))
+            else False
+          else False
+        end
+      end);
+
+private def memory_test_stale_reuse : Bool :=
+    memory_test_allocation memory_test_octet 32 1 (fun (state : MemoryState) (owner : MemoryAccess) =>
+      memory_test_borrow state (MemoryBorrowRead owner (MkMemoryRange 0 1))
+        (fun (borrowed_state : MemoryState) (borrowed : MemoryAccess) =>
+          let freed : MemoryRun := memory_run 2 borrowed_state [MemoryEndBorrow borrowed, MemoryFree owner] in
+          andb (eq_nat (memory_test_outcome freed) 0)
+            (memory_test_step (memory_run_state freed) (MemoryAllocate memory_test_octet 32 1)
+              (fun (again : MemoryTransition) => if let MemoryAllocated fresh := ((memory_transition_event again) : MemoryEvent) then
+                let pointer : MemoryPointer := memory_access_pointer fresh in
+                let old : MemoryPointer := (memory_access_pointer owner) in
+                andb (eq_nat (memory_pointer_bits old) 32)
+                  (andb (eq_nat (memory_pointer_bits pointer) 32)
+                    (andb (neb_nat (memory_pointer_identity pointer) (memory_pointer_identity old))
+                      (andb (memory_test_reject (memory_transition_state again) (MemoryRead owner) MemoryStaleIdentity)
+                        (andb (memory_test_reject (memory_transition_state again) (MemoryWrite borrowed [9]) MemoryStaleIdentity)
+                          (andb (memory_test_reject (memory_transition_state again) (MemoryFree owner) MemoryStaleIdentity)
+                            (memory_test_step (memory_transition_state again) (MemoryWrite fresh [42]) (fun (written : MemoryTransition) =>
+                              memory_test_read (memory_transition_state written) fresh [42])))))))
+              else False))));
+
+private def memory_test_move : Bool :=
+    memory_test_allocation memory_test_octet 32 1 (fun (state : MemoryState) (owner : MemoryAccess) =>
+      memory_test_step state (MemoryWrite owner [9]) (fun (written : MemoryTransition) =>
+        memory_test_step (memory_transition_state written) (MemoryMove owner) (fun (moved : MemoryTransition) =>
+          if let MemoryMoved fresh := ((memory_transition_event moved) : MemoryEvent) then
+            andb (eq_nat (length MemoryPermission (memory_ledger (memory_transition_state moved))) 1)
+              (andb (memory_test_read (memory_transition_state moved) fresh [9])
+                (andb (memory_test_reject (memory_transition_state moved) (MemoryRead owner) MemoryPermissionMissing)
+                  (andb (memory_test_reject (memory_transition_state moved) (MemoryWrite owner [7]) MemoryPermissionMissing)
+                    (andb (memory_test_reject (memory_transition_state moved) (MemoryFree owner) MemoryPermissionMissing)
+                      (memory_test_step (memory_transition_state moved) (MemoryFree fresh) (fun (freed : MemoryTransition) =>
+                        andb (eq_nat (length MemoryAllocation (memory_heap (memory_transition_state freed))) 0)
+                          (eq_nat (length MemoryPermission (memory_ledger (memory_transition_state freed))) 0)))))))
+          else False)));
+
+private def memory_test_shared_borrows : Bool :=
+    memory_test_allocation memory_test_octet 32 4 (fun (state : MemoryState) (owner : MemoryAccess) =>
+      memory_test_step state (MemoryWrite owner [9]) (fun (written : MemoryTransition) =>
+        memory_test_borrow (memory_transition_state written) (MemoryBorrowRead owner (MkMemoryRange 0 3))
+          (fun (first_state : MemoryState) (first : MemoryAccess) =>
+            memory_test_borrow first_state (MemoryBorrowRead owner (MkMemoryRange 0 1))
+              (fun (second_state : MemoryState) (second : MemoryAccess) =>
+                andb (memory_test_read second_state first [9])
+                  (andb (memory_test_read second_state second [9])
+                    (andb (memory_test_reject second_state (MemoryWrite first [8]) MemoryPermissionDenied)
+                      (andb (memory_test_reject second_state (MemoryBorrowWrite owner (MkMemoryRange 2 2)) MemoryBorrowConflict)
+                        (andb (memory_test_reject second_state (MemoryMove owner) MemoryActiveBorrow)
+                          (memory_test_borrow second_state (MemoryBorrowWrite owner (MkMemoryRange 3 1))
+                            (fun (disjoint_state : MemoryState) (disjoint : MemoryAccess) =>
+                              let ended : MemoryRun := memory_run 3 disjoint_state
+                                [MemoryEndBorrow first, MemoryEndBorrow second, MemoryEndBorrow disjoint] in
+                              andb (eq_nat (memory_test_outcome ended) 0)
+                                (andb (memory_test_reject (memory_run_state ended) (MemoryRead first) MemoryPermissionMissing)
+                                  (memory_test_read (memory_run_state ended) owner [9]))))))))))));
+
+private def memory_test_split_range (state : MemoryState) (access : MemoryAccess) (start : Nat) (end_offset : Nat) : Bool :=
+    all Nat (fun (offset : Nat) =>
+      let current : MemoryAccess := memory_test_pointer access offset (add 16 offset) in
+      if andb (leb_nat start offset) (ltb_nat offset end_offset) then
+        memory_test_step state (MemoryWrite current [9]) (fun (_ : MemoryTransition) => True)
+      else memory_test_reject state (MemoryWrite current [9])
+        (if eq_nat offset 8 then MemoryOutOfBounds else MemoryPermissionDenied))
+      [0, 1, 2, 3, 4, 5, 6, 7, 8];
+
+private def memory_test_split_rejoin (state : MemoryState) (parent : MemoryAccess)
+    (left : MemoryAccess) (right : MemoryAccess) : Bool :=
+    andb (memory_test_split_range state left 2 4)
+      (andb (memory_test_split_range state right 4 6)
+        (andb (memory_test_reject state (MemoryEndBorrow parent) MemoryActiveBorrow)
+          (memory_test_step state (MemoryEndBorrow left) (fun (one_done : MemoryTransition) =>
+            andb (memory_test_reject (memory_transition_state one_done) (MemoryWrite parent [9]) MemoryActiveBorrow)
+              (memory_test_step (memory_transition_state one_done) (MemoryEndBorrow right) (fun (both_done : MemoryTransition) =>
+                andb (memory_test_reject (memory_transition_state both_done) (MemoryWrite right [9]) MemoryPermissionMissing)
+                  (memory_test_split_range (memory_transition_state both_done) parent 2 6)))))));
+
+private def memory_test_split : Bool :=
+    memory_test_allocation memory_test_octet 16 8 (fun (state : MemoryState) (owner : MemoryAccess) =>
+      memory_test_borrow state (MemoryBorrowWrite owner (MkMemoryRange 2 4))
+        (fun (borrowed_state : MemoryState) (parent : MemoryAccess) =>
+          andb (memory_test_reject borrowed_state (MemoryBorrowRead owner (MkMemoryRange 3 1)) MemoryBorrowConflict)
+            (andb (memory_test_reject borrowed_state (MemorySplit parent 0) MemoryOutOfBounds)
+              (andb (memory_test_reject borrowed_state (MemorySplit parent 4) MemoryOutOfBounds)
+                (memory_test_step borrowed_state (MemorySplit parent 2) (fun (split : MemoryTransition) =>
+                  if let MemorySplitDone left right := ((memory_transition_event split) : MemoryEvent) then
+                    memory_test_split_rejoin (memory_transition_state split) parent left right else False))))));
+
+private def memory_test_offsets : List Nat := [0, 1, 2, 3, 4, 5, 6, 7, 8];
+
+private def memory_test_scalar_bytes (width : Nat) (offset : Nat) : List Nat :=
+    if eq_nat width 1 then [add 10 offset] else [add 10 offset, add 40 offset];
+
+private def memory_test_sweep (width : Nat) (count : Nat) : Bool :=
+    let size : Nat := mul width count in
+    let binding : MemoryBinding := memory_test_binding width width in
+    let aligned : Nat -> Bool := if eq_nat width 1 then (fun (_ : Nat) => True) else evenb in
+    memory_test_allocation binding 16 size (fun (state : MemoryState) (owner : MemoryAccess) =>
+      let writes : List MemoryCommand := map Nat MemoryCommand (fun (offset : Nat) =>
+        MemoryWrite (memory_test_pointer owner offset (add 16 offset)) (memory_test_scalar_bytes width offset))
+        (filter Nat (fun (offset : Nat) => andb (leb_nat (add offset width) size) (aligned offset)) memory_test_offsets) in
+      let seeded : MemoryRun := memory_run 3 state writes in
+      andb (eq_nat (memory_test_outcome seeded) 0)
+        (all Nat (fun (offset : Nat) =>
+          let access : MemoryAccess := memory_test_pointer owner offset (add 16 offset) in
+          if ltb_nat size (add offset width) then memory_test_reject (memory_run_state seeded) (MemoryRead access) MemoryOutOfBounds
+          else if notb (aligned offset) then memory_test_reject (memory_run_state seeded) (MemoryRead access) MemoryMisaligned
+          else andb (memory_test_reject state (MemoryRead access) MemoryUninitialized)
+            (memory_test_read (memory_run_state seeded) access (memory_test_scalar_bytes width offset))) memory_test_offsets));
+
+private def memory_test_partial_init : Bool :=
+    memory_test_allocation (memory_test_binding 2 1) 16 4 (fun (state : MemoryState) (owner : MemoryAccess) =>
+      let middle : MemoryAccess := memory_test_pointer owner 1 17 in
+      let last : MemoryAccess := memory_test_pointer owner 2 18 in
+      memory_test_step state (MemoryWrite middle [1, 2]) (fun (written : MemoryTransition) =>
+        andb (memory_test_read (memory_transition_state written) middle [1, 2])
+          (andb (memory_test_reject (memory_transition_state written) (MemoryRead owner) MemoryUninitialized)
+            (memory_test_reject (memory_transition_state written) (MemoryRead last) MemoryUninitialized))));
+
+private def memory_test_validity : Bool :=
+    memory_test_allocation memory_test_flag 16 1 (fun (state : MemoryState) (owner : MemoryAccess) =>
+      andb (memory_test_reject state (MemoryWrite owner [2]) MemoryInvalidValue)
+        (andb (memory_test_reject state (MemoryWrite owner []) MemoryWrongValueSize)
+          (andb (memory_test_reject state (MemoryWrite owner [1, 0]) MemoryWrongValueSize)
+            (andb (memory_test_reject state (MemoryRead owner) MemoryUninitialized)
+              (memory_test_step state (MemoryWrite owner [1]) (fun (written : MemoryTransition) =>
+                memory_test_read (memory_transition_state written) owner [1]))))));
+
+private def memory_test_permission_row (permission : MemoryPermission) : List Nat :=
+    let range : MemoryRange := (memory_permission_range permission) in
+    let kind : Nat := match (memory_permission_kind permission) with | MemoryOwner => 1 | MemoryShared => 2 | MemoryExclusive => 3 end in
+    let parent : Nat := match (memory_permission_parent permission) with | Nothing => 0 | Just token => token end in
+    [(memory_permission_token permission), (memory_permission_identity permission), (memory_range_start range), (memory_range_size range), kind, parent];
+
+private def memory_test_cell_eq (left : Maybe Nat) (right : Maybe Nat) : Bool :=
+    match left, right with
+    | Nothing, Nothing => True
+    | Nothing, Just _ => False
+    | Just _, Nothing => False
+    | Just first, Just second => eq_nat first second
+    end;
+
+private def memory_test_atomic_snapshot (state : MemoryState) (expected_ledger : List (List Nat)) : Bool :=
+    match memory_heap state with
+    | Nil => False
+    | Cons allocation rest =>
+        let expected_cells : List (Maybe Nat) := [Just Nat 10, Just Nat 11, Nothing Nat, Nothing Nat] in
+        andb (eq_nat (length MemoryAllocation rest) 0)
+          (andb (eq_nat (memory_allocation_identity allocation) 1)
+            (andb (eq_nat (memory_allocation_address allocation) 32)
+              (andb (list_eq (Maybe Nat) memory_test_cell_eq (memory_allocation_cells allocation) expected_cells)
+                (list_eq (List Nat) (list_eq Nat eq_nat)
+                  (map MemoryPermission (List Nat) memory_test_permission_row (memory_ledger state)) expected_ledger))))
+    end;
+
+private def memory_test_atomic_result (run : MemoryRun) (error : MemoryError) (ledger : List (List Nat)) : Bool :=
+    andb (eq_nat (memory_test_outcome run) (memory_test_error_code error))
+      (andb (eq_nat (length MemoryEvent (memory_run_trace run)) 0) (memory_test_atomic_snapshot (memory_run_state run) ledger));
+
+private def memory_test_atomic_failures : Bool :=
+    memory_test_allocation memory_test_word 32 4 (fun (state : MemoryState) (owner : MemoryAccess) =>
+      memory_test_step state (MemoryWrite owner [10, 11]) (fun (written : MemoryTransition) =>
+        let root : List Nat := [1, 1, 0, 4, 1, 0] in
+        let failed_write : MemoryRun := memory_run 2 (memory_transition_state written) [MemoryWrite owner [40, 256], MemoryFree owner] in
+        andb (memory_test_atomic_result failed_write MemoryInvalidValue [root])
+          (memory_test_borrow (memory_transition_state written) (MemoryBorrowRead owner (MkMemoryRange 0 4))
+            (fun (borrowed_state : MemoryState) (borrowed : MemoryAccess) =>
+              let ledger : List (List Nat) := [[2, 1, 0, 4, 2, 1], root] in
+              let last : MemoryAccess := memory_test_pointer borrowed 2 34 in
+              let failed_read : MemoryRun := memory_run 2 borrowed_state [MemoryRead last, MemoryEndBorrow borrowed] in
+              let failed_free : MemoryRun := memory_run 2 borrowed_state [MemoryFree owner, MemoryEndBorrow borrowed] in
+              andb (memory_test_atomic_result failed_read MemoryUninitialized ledger)
+                (andb (memory_test_atomic_result failed_free MemoryActiveBorrow ledger)
+                  (memory_test_read (memory_run_state failed_free) borrowed [10, 11]))))));
+
+private def memory_test_metadata : Bool :=
+    memory_test_allocation memory_test_flag 32 1 (fun (state : MemoryState) (owner : MemoryAccess) =>
+      let forgeries : List MemoryBinding :=
+        [ MkMemoryBinding MemoryLinuxX64 7 (MkMemoryLayout 1 1 MemoryBooleanByte)
+        , MkMemoryBinding MemoryWindowsX64 8 (MkMemoryLayout 1 1 MemoryBooleanByte)
+        , MkMemoryBinding MemoryWindowsX64 7 (MkMemoryLayout 2 1 MemoryBooleanByte)
+        , MkMemoryBinding MemoryWindowsX64 7 (MkMemoryLayout 1 2 MemoryBooleanByte)
+        , memory_test_octet
+        ] in
+      all MemoryBinding (fun (binding : MemoryBinding) =>
+        memory_test_reject state (MemoryWrite (memory_test_binding_as owner binding) [1]) MemoryMetadataMismatch) forgeries);
+
+private def memory_test_replay_other_target : Bool :=
+    memory_test_allocation memory_test_octet 32 1 (fun (_ : MemoryState) (windows : MemoryAccess) =>
+      let binding : MemoryBinding := MkMemoryBinding MemoryLinuxX64 7 (MkMemoryLayout 1 1 MemoryOctets) in
+      memory_test_step (memory_empty MemoryLinuxX64) (MemoryAllocate binding 32 1)
+        (fun (allocated : MemoryTransition) => if let MemoryAllocated linux := ((memory_transition_event allocated) : MemoryEvent) then
+          let other : MemoryAccess := MkMemoryAccess (memory_access_pointer linux) (memory_access_credential windows) binding in
+          andb (memory_test_reject (memory_transition_state allocated) (MemoryWrite other [1]) MemoryMetadataMismatch)
+            (memory_test_step (memory_transition_state allocated) (MemoryFree linux) (fun (_ : MemoryTransition) => True))
+        else False));
+
+private def memory_test_replay_other_permission : Bool :=
+    memory_test_allocation memory_test_octet 32 1 (fun (state : MemoryState) (owner : MemoryAccess) =>
+      memory_test_borrow state (MemoryBorrowRead owner (MkMemoryRange 0 1))
+        (fun (borrowed_state : MemoryState) (borrowed : MemoryAccess) =>
+          memory_test_step state (MemoryMove owner) (fun (moved : MemoryTransition) =>
+            if let MemoryMoved fresh := ((memory_transition_event moved) : MemoryEvent) then
+              let a : Nat := memory_credential_id (memory_access_credential borrowed) in
+              let b : Nat := memory_credential_id (memory_access_credential fresh) in
+              let closed : MemoryRun := memory_run 2 borrowed_state [MemoryEndBorrow borrowed, MemoryFree owner] in
+              andb (eq_nat a b)
+                (andb (memory_test_reject (memory_transition_state moved) (MemoryFree borrowed) MemoryPermissionMissing)
+                  (andb (eq_nat (memory_test_outcome closed) 0)
+                    (memory_test_step (memory_transition_state moved) (MemoryFree fresh) (fun (_ : MemoryTransition) => True))))
+            else False)));
+
+private def memory_test_replay_other_address : Bool :=
+    memory_test_allocation memory_test_octet 32 1 (fun (_ : MemoryState) (first : MemoryAccess) =>
+      memory_test_allocation memory_test_octet 64 1 (fun (state : MemoryState) (second : MemoryAccess) =>
+        let wrong : MemoryAccess := MkMemoryAccess (memory_access_pointer second) (memory_access_credential first)
+          (memory_access_binding second) in
+        andb (memory_test_reject state (MemoryFree wrong) MemoryPermissionMissing)
+          (memory_test_step state (MemoryFree second) (fun (_ : MemoryTransition) => True))));
+
+private def memory_test_allocation_limits : Bool :=
+    andb (memory_test_reject memory_test_empty (MemoryAllocate (memory_test_binding 0 1) 32 1) MemoryInvalidLayout)
+      (andb (memory_test_reject memory_test_empty (MemoryAllocate (memory_test_binding 3 3) 32 3) MemoryInvalidLayout)
+        (andb (memory_test_reject memory_test_empty (MemoryAllocate memory_test_word 32 3) MemoryInvalidLayout)
+          (andb (memory_test_reject memory_test_empty (MemoryAllocate memory_test_word 33 2) MemoryMisaligned)
+            (andb (memory_test_reject memory_test_empty (MemoryAllocate memory_test_octet 32 0) MemoryOutOfBounds)
+              (memory_test_reject memory_test_empty (MemoryAllocate memory_test_octet 32 9) MemoryOutOfBounds)))));
+
+private def memory_test_address_limits : Bool :=
+    let word16 : Nat := mul 256 256 in
+    let word32 : Nat := mul word16 word16 in
+    let last : Nat := sub (mul word32 word32) 1 in
+    andb (memory_test_reject memory_test_empty (MemoryAllocate memory_test_octet 0 1) MemoryNullAddress)
+      (andb (memory_test_reject memory_test_empty (MemoryAllocate memory_test_octet last 1) MemoryAddressOverflow)
+      (memory_test_allocation memory_test_octet (sub last 1) 1
+        (fun (state : MemoryState) (owner : MemoryAccess) =>
+          match memory_access_at state owner 1 with
+          | Left _ => False
+          | Right one_past =>
+              let pointer : MemoryPointer := memory_access_pointer one_past in
+              andb (eq_nat (memory_pointer_bits pointer) last)
+                (andb (eq_nat (memory_pointer_offset pointer) 1)
+                  (andb (memory_test_reject state (MemoryRead one_past) MemoryOutOfBounds)
+                    (andb (memory_test_reject state (MemoryWrite one_past [1]) MemoryOutOfBounds)
+                      (andb (memory_test_reject state (MemoryRead (memory_test_pointer owner 0 last)) MemoryAddressMismatch)
+                        (memory_test_step state (MemoryWrite owner [255]) (fun (written : MemoryTransition) =>
+                          memory_test_read (memory_transition_state written) owner [255]))))))
+          end)));
+
+private def memory_test_capacity : Bool :=
+    let allocations : List MemoryCommand := map Nat MemoryCommand (fun (address : Nat) =>
+      MemoryAllocate memory_test_octet address 1) [32, 33, 34, 35, 36] in
+    let full : MemoryRun := memory_run 5 memory_test_empty allocations in
+    andb (eq_nat (memory_test_outcome full) (memory_test_error_code MemoryCapacity))
+      (andb (eq_nat (length MemoryAllocation (memory_heap (memory_run_state full))) 4)
+        (memory_test_allocation memory_test_octet 32 2 (fun (state : MemoryState) (owner : MemoryAccess) =>
+          let commands : List MemoryCommand := replicate MemoryCommand (MemoryBorrowRead owner (MkMemoryRange 1 1)) 16 in
+          let borrows : MemoryRun := memory_run 16 state commands in
+          andb (memory_test_reject state (MemoryAllocate memory_test_octet 33 1) MemoryAddressInUse)
+            (andb (eq_nat (memory_test_outcome borrows) (memory_test_error_code MemoryCapacity))
+              (andb (eq_nat (length MemoryEvent (memory_run_trace borrows)) 15)
+                (eq_nat (length MemoryPermission (memory_ledger (memory_run_state borrows))) 16))))));
+
+private def memory_test_fuel : Bool :=
+    memory_test_allocation memory_test_octet 32 1 (fun (start : MemoryState) (owner : MemoryAccess) =>
+      all Nat (fun (fuel : Nat) =>
+        let accepts : MemoryRun := memory_run fuel start [MemoryWrite owner [9], MemoryRead owner] in
+        let refuses : MemoryRun := memory_run fuel start [MemoryRead owner, MemoryWrite owner [9]] in
+        let exhausted : Nat := memory_test_error_code MemoryFuelExhausted in
+        andb (eq_nat (memory_test_outcome accepts) (if ltb_nat fuel 2 then exhausted else 0))
+          (andb (eq_nat (length MemoryEvent (memory_run_trace accepts)) (minNat fuel 2))
+            (andb (eq_nat (memory_test_outcome refuses)
+                (if eq_nat fuel 0 then exhausted else memory_test_error_code MemoryUninitialized))
+              (andb (eq_nat (length MemoryEvent (memory_run_trace refuses)) 0)
+                (if ltb_nat fuel 2 then True else memory_test_read (memory_run_state accepts) owner [9]))))) [0, 1, 2, 3, 4, 5]);
+
+private def memory_test_law (name : String) (check : Unit -> Bool) : Pair String (Unit -> Bool) :=
+    MkPair String (Unit -> Bool) name check;
+
+private def memory_test_report (passed : Bool) (law : Pair String (Unit -> Bool)) : IO Bool :=
+    let (MkPair name check) := law in
+    let result : Bool := check MkUnit in
+    do test_report (assert_true name result);
+       io_pure Bool (andb passed result);
+
+-- @entry main
+def main : IO Unit :=
+    do let! passed := io_fold (Pair String (Unit -> Bool)) Bool memory_test_report True
+         [ memory_test_law "memory/ordered-write-read-trace" (fun (_ : Unit) => memory_test_trace)
+         , memory_test_law "memory/stale-after-address-reuse" (fun (_ : Unit) => memory_test_stale_reuse)
+         , memory_test_law "memory/move-transfers-owner" (fun (_ : Unit) => memory_test_move)
+         , memory_test_law "memory/shared-and-disjoint-borrows" (fun (_ : Unit) => memory_test_shared_borrows)
+         , memory_test_law "memory/split-partitions-and-restores-subrange" (fun (_ : Unit) => memory_test_split)
+         , memory_test_law "memory/bounded-geometry-and-init-sweep" (fun (_ : Unit) =>
+             all Nat (fun (width : Nat) => all Nat (memory_test_sweep width) [1, 2, 3]) [1, 2])
+         , memory_test_law "memory/partial-scalar-initialization" (fun (_ : Unit) => memory_test_partial_init)
+         , memory_test_law "memory/typed-value-size-and-validity" (fun (_ : Unit) => memory_test_validity)
+         , memory_test_law "memory/read-write-free-failure-atomicity" (fun (_ : Unit) => memory_test_atomic_failures)
+         , memory_test_law "memory/metadata-substitution" (fun (_ : Unit) => memory_test_metadata)
+         , memory_test_law "memory/credential-target-replay" (fun (_ : Unit) => memory_test_replay_other_target)
+         , memory_test_law "memory/credential-permission-replay" (fun (_ : Unit) => memory_test_replay_other_permission)
+         , memory_test_law "memory/credential-address-replay" (fun (_ : Unit) => memory_test_replay_other_address)
+         , memory_test_law "memory/size-layout-and-alignment-limits" (fun (_ : Unit) => memory_test_allocation_limits)
+         , memory_test_law "memory/one-past-and-address-overflow" (fun (_ : Unit) => memory_test_address_limits)
+         , memory_test_law "memory/live-heap-and-ledger-capacity" (fun (_ : Unit) => memory_test_capacity)
+         , memory_test_law "memory/fuel-monotonicity" (fun (_ : Unit) => memory_test_fuel)
+         , memory_test_law "memory/empty-input-needs-no-fuel" (fun (_ : Unit) =>
+             eq_nat (memory_test_outcome (memory_run 0 memory_test_empty [])) 0)
+         ];
+       exit (if passed then 0 else 1);

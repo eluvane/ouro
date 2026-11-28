@@ -56,6 +56,7 @@ class Task:
     memory_mib: int = 1024
     base_memory_mib: int = 0
     preferred_jobs: int = 1
+    preferred_parallel_memory_mib: int = 0
 
     def memory_for(self, jobs: int) -> int:
         return self.base_memory_mib + jobs * self.memory_mib
@@ -84,6 +85,7 @@ def run_tasks(tasks, *, jobs, memory_mib, run, stop=None, failed=None):
             raise ValueError(f"{task.name}: unknown scheduler dependency")
         task_memory = task.memory_for(1)
         if (task.memory_mib < 0 or task.base_memory_mib < 0 or task_memory < 1 or task.preferred_jobs < 1
+                or task.preferred_parallel_memory_mib < 0
                 or (task.max_jobs is not None and task.max_jobs < 1)):
             raise ValueError(f"{task.name}: invalid CPU or memory request")
         if memory_mib is not None and task_memory > memory_mib:
@@ -138,8 +140,14 @@ def run_tasks(tasks, *, jobs, memory_mib, run, stop=None, failed=None):
                         free_memory -= task.memory_mib
                 if free_jobs == previous:
                     break
+            # An optional reserve must leave room for every task already admitted.
             for task, slots in ready.items():
-                allocation = Allocation(slots, task.memory_for(slots))
+                task_memory = task.memory_for(slots)
+                extra_memory = task.preferred_parallel_memory_mib - task_memory
+                if memory_mib is not None and slots > 1 and 0 < extra_memory <= free_memory:
+                    task_memory += extra_memory
+                    free_memory -= extra_memory
+                allocation = Allocation(slots, task_memory)
                 future = pool.submit(execute, task, allocation)
                 active[future] = task.name, allocation
                 del pending[task.name]
@@ -167,11 +175,12 @@ def run_tasks(tasks, *, jobs, memory_mib, run, stop=None, failed=None):
 
 
 class CheckoutSnapshot:
-    def __init__(self, source: Path):
+    def __init__(self, source: Path, *, excluded_relative_path: Path | None = None):
         self.source = source
-        self.paths = tuple(dict.fromkeys(Path(os.fsdecode(path)) for path in subprocess.check_output(
+        paths = (Path(os.fsdecode(path)) for path in subprocess.check_output(
             ["git", "ls-files", "-z", "--cached", "--others", "--exclude-standard"], cwd=source,
-        ).split(b"\0") if path))
+        ).split(b"\0") if path)
+        self.paths = tuple(dict.fromkeys(path for path in paths if path != excluded_relative_path))
 
     def content_key(self, root: Path | None = None) -> str:
         root = self.source if root is None else root

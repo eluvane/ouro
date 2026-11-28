@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import argparse
-from dataclasses import asdict
+from dataclasses import asdict, dataclass
 import os
 from pathlib import Path
 import sys
@@ -52,6 +52,14 @@ WORK = {
 }
 
 
+@dataclass(frozen=True)
+class InputState:
+    units: list[str]
+    sources: dict[str, str]
+    producer_sha256: str
+    files: dict[str, str]
+
+
 def relative(path: Path) -> str:
     path = path.resolve()
     return path.relative_to(ROOT).as_posix() if path.is_relative_to(ROOT) else str(path)
@@ -62,21 +70,24 @@ def resolve(name: str) -> Path:
     return path.resolve() if path.is_absolute() else (ROOT / path).resolve()
 
 
-def expected_sources(entry: str) -> dict[str, str]:
-    names = {*frontend_regen.collect_units(entry), *native_tool_build.BUILD_INPUTS,
-             *native_tool_build.RUNTIME,
-             *(path.relative_to(ROOT).as_posix() for path in (ROOT / 'runtime').glob('*.h'))}
-    if entry not in names:
+def input_state(entry: str, compiler: Path) -> InputState:
+    # Bind import order and digest to the same source bytes.
+    try:
+        closures, captured = frontend_regen.capture_unit_inputs([entry], source_root=ROOT)
+    except SystemExit as error:
+        raise ValueError(str(error)) from error
+    units = closures[entry]
+    if entry not in units:
         raise ValueError('the actual native-tool source inventory omits the probe')
-    return {name: sha256_path(ROOT / name) for name in sorted(names)}
-
-
-def input_state(entry: str, compiler: Path) -> dict[str, str]:
-    paths = {compiler, *(ROOT / name for name in expected_sources(entry)),
-             *(ROOT / name for name in ORCHESTRATION)}
+    names = {*units, *native_tool_build.BUILD_INPUTS, *native_tool_build.RUNTIME,
+             *(path.relative_to(ROOT).as_posix() for path in (ROOT / 'runtime').glob('*.h'))}
+    paths = {compiler, *(ROOT / name for name in names), *(ROOT / name for name in ORCHESTRATION)}
     for directory in ('compiler', 'std'):
         paths.update((ROOT / directory).rglob('*.ouro'))
-    return {relative(path): sha256_path(path) for path in sorted(paths)}
+    closure_hashes = {ROOT / name: digest.sha256 for name, digest in captured.items()}
+    hashes = {path: closure_hashes[path] if path in closure_hashes else sha256_path(path) for path in sorted(paths)}
+    return InputState(units, {name: hashes[ROOT / name] for name in sorted(names)}, hashes[compiler],
+                      {relative(path): digest for path, digest in hashes.items()})
 
 
 def process_ok(result: dict, timeout: int) -> bool:
@@ -154,12 +165,11 @@ def evaluate(report: dict, profile: str) -> dict:
     try:
         entry = ENTRIES[profile]
         compiler = resolve(report['compiler'])
-        sources = expected_sources(entry)
         state = input_state(entry, compiler)
         executable = resolve(report['build']['executable'])
         directory = resolve(report['run_directory'])
         check_command = [str(compiler), 'check', entry, '999999',
-                         *(value for unit in frontend_regen.collect_units(entry) for value in ('--unit', unit))]
+                         *(value for unit in state.units for value in ('--unit', unit))]
         checks['report_domain'] = (report.get('kind') == REPORT_KIND and report.get('profile') == profile
             and report.get('timing_domain') == TIMING_DOMAIN and report.get('entry') == entry
             and type(report.get('workers')) is int and report['workers'] == 1
@@ -169,14 +179,14 @@ def evaluate(report: dict, profile: str) -> dict:
             and 'error' not in report
             and isinstance(report.get('cpu_affinity'), list) and len(report['cpu_affinity']) == 1
             and type(report['cpu_affinity'][0]) is int and report['cpu_affinity'][0] >= 0)
-        checks['current_inputs'] = (report['sources'] == sources and report['producer_sha256'] == sha256_path(compiler)
-            and report.get('inputs_before') == state and report.get('inputs_after') == state
+        checks['current_inputs'] = (report['sources'] == state.sources and report['producer_sha256'] == state.producer_sha256
+            and report.get('inputs_before') == state.files and report.get('inputs_after') == state.files
             and report.get('inputs_unchanged') is True)
         checks['source_check'] = (process_ok(report['check'], CHECK_TIMEOUT)
             and report['check']['stdout'] == 'CHECK_OK\n' and report['check']['command'] == check_command)
         checks['actual_build'] = (process_ok(report['build']['process'], BUILD_TIMEOUT)
             and report['build']['process']['command'] == build_command(compiler, entry, executable, directory)
-            and receipt_valid(report['build'], entry, sources, report['producer_sha256']))
+            and receipt_valid(report['build'], entry, state.sources, report['producer_sha256']))
         rows = report['rows']
         inventory = [(row.get('operation'), row.get('depth')) for row in rows]
         checks['complete_inventory'] = inventory == expected_cases(profile)
@@ -263,13 +273,13 @@ def run(profile: str, compiler: Path, output: Path) -> dict:
     try:
         report['cpu_affinity'] = pin_one_cpu()
         entry = ENTRIES[profile]
-        sources = expected_sources(entry)
         before = input_state(entry, compiler)
-        report.update(sources=sources, producer_sha256=sha256_path(compiler), inputs_before=before)
+        sources, producer_sha = before.sources, before.producer_sha256
+        report.update(sources=sources, producer_sha256=producer_sha, inputs_before=before.files)
         env = environment(jobs=1, build=True)
         env.update(OURO_JOBS='1', OURO_FRONTEND_JOBS='1', OURO_CCACHE='disabled')
         command = [str(compiler), 'check', entry, '999999',
-                   *(value for unit in frontend_regen.collect_units(entry) for value in ('--unit', unit))]
+                   *(value for unit in before.units for value in ('--unit', unit))]
         report['check'] = execute(command, directory, 'check', env, CHECK_TIMEOUT)
         if not process_ok(report['check'], CHECK_TIMEOUT) or report['check']['stdout'] != 'CHECK_OK\n':
             raise ValueError('the canonical strict source check failed')
@@ -281,7 +291,7 @@ def run(profile: str, compiler: Path, output: Path) -> dict:
         build['process'] = execute(build_command(compiler, entry, executable, directory), directory, 'build', env, BUILD_TIMEOUT)
         receipt_path = Path(str(executable) + '.build.json')
         build.update(receipt=read_json_object(receipt_path), receipt_sha256=sha256_path(receipt_path))
-        if not process_ok(build['process'], BUILD_TIMEOUT) or not receipt_valid(build, entry, sources, report['producer_sha256']):
+        if not process_ok(build['process'], BUILD_TIMEOUT) or not receipt_valid(build, entry, sources, producer_sha):
             raise ValueError('the actual fresh native build/receipt failed')
         if profile == 'scale':
             if input_state(entry, compiler) != before:
@@ -290,18 +300,19 @@ def run(profile: str, compiler: Path, output: Path) -> dict:
                 [str(executable), '--operation', 'inventory', '--depth', '20000'], directory,
                 'constant-inventory', env, INVENTORY_TIMEOUT)
         for operation, depth in expected_cases(profile):
-            if input_state(entry, compiler) != before or not receipt_valid(build, entry, sources, report['producer_sha256']):
+            if input_state(entry, compiler) != before or not receipt_valid(build, entry, sources, producer_sha):
                 raise ValueError('inputs or executable receipt changed before an operation')
             result = execute([str(executable), '--operation', operation, '--depth', str(depth)], directory,
                              operation + '-' + str(depth), env, RUN_TIMEOUT[profile])
             report['rows'].append({'operation': operation, 'depth': depth, 'process': result,
                                   'inputs_unchanged': input_state(entry, compiler) == before,
-                                  'receipt_valid': receipt_valid(build, entry, sources, report['producer_sha256'])})
+                                  'receipt_valid': receipt_valid(build, entry, sources, producer_sha)})
     except (OSError, ValueError, KeyError, TypeError) as error:
         report['error'] = str(error)
     try:
-        report['inputs_after'] = input_state(ENTRIES[profile], compiler)
-        report['inputs_unchanged'] = before is not None and report['inputs_after'] == before
+        after = input_state(ENTRIES[profile], compiler)
+        report['inputs_after'] = after.files
+        report['inputs_unchanged'] = after == before
     except (OSError, ValueError) as error:
         report.update(inputs_unchanged=False, input_error=str(error))
     report['evaluation'] = evaluate(report, profile)

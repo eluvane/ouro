@@ -90,6 +90,9 @@ registry order.
 Cold Manual validation bootstraps every group independently; job and process
 limits stay unchanged.
 
+The full release scan in `syntax-quality-firewall` uses the verified scanner
+prepared by that suite. Separate strict quality gates run their own scans.
+
 The generated-artifact drift gate retains the historical stage0 manifest checks
 and compares fresh frontend regeneration and the full stage-loop fixpoint with
 the verified current P2 generated C. The installed compiler receipt must bind
@@ -107,6 +110,9 @@ total CPU slots for the run and its nested schedulers. It defaults to
 `OURO_JOBS` or 20, with a ceiling of 20. The runner also reserves memory for
 active tasks using available physical memory and headroom. Use `--jobs 1`
 for a serial run.
+With at least two assigned CPU slots, compiler preparation can reserve spare
+memory to reach 6144 MiB and overlap eligible bootstrap phases. The reservation
+counts toward the scheduler's memory budget. Per-process limits still apply.
 Local `compiler-scale` and `compiler-depth` each reserve one CPU slot and
 3072 MiB. Each runs its checks sequentially on one logical CPU.
 The local `selfhost-module-cache` and `stage-loop-c-object-cache` suites also
@@ -118,11 +124,12 @@ including runtime IO. Production lint shards share one preparation of
 Each consumer receives private copies of the binaries and their build evidence.
 Local preparation uses `_build/ci-host` for the source snapshot and
 `_build/ci-bootstrap` for checked compiler artifacts and historical stages.
-Changes outside the compiler's own inputs can reuse the checked compiler
-after verifying its bootstrap evidence. `OURO_CACHE=0` selects fresh
-preparation. Independent checks in the `checks` group can use separate local
-checkouts. The hosted group inventory and nightly stage-to-Smith dependency
-retain their existing order.
+The verified default build in `_build/c` can seed this locked cache. Reuse
+requires the full bootstrap key, including matching reproducibility flags, and
+verification of the binary and its complete bootstrap evidence. `OURO_CACHE=0`
+selects fresh preparation. Independent checks in the `checks` group can use
+separate local checkouts. The hosted group inventory and nightly stage-to-Smith
+dependency retain their existing order.
 The runner rejects a group
 inventory that omits, duplicates, or invents a gate; its self-test also checks
 complete matrix coverage and the affected-path routing contracts. The
@@ -180,8 +187,6 @@ interrupted run leaves no old successful aggregate at the current report path.
 The native CI runner also invalidates selected gate reports and the delegated
 host-inventory report. Failure to remove a report stops execution; a directory
 at a report path is never removed. Listing profiles does not change reports.
-Manual and Release prepare the current compiler before running each validation
-group, including when a restored compiler cache lacks its bootstrap evidence.
 PR and Nightly validation jobs allow 120 minutes for the complete group;
 per-program execution and memory limits remain separate. Independent PR matrix
 groups finish when a sibling fails. Each group retains its fail-fast command,
@@ -195,13 +200,25 @@ host toolchain, and bootstrap evidence before running gates. Partial job retries
 use the successful producer's artifact name, including its original attempt.
 Release artifacts use the workflow run ID so branch names containing `/` remain
 valid for uploads and downstream downloads.
+
+On Linux pull requests, a routed regular compiler shard can use two C object
+workers when the scheduler has two slots and at least 3584 MiB available.
+Fixture execution and frontend work use one slot. A smaller or unknown memory
+budget uses one C worker. The source-spans shard also uses one C worker.
+With 6144 MiB available, two workers can prepare fixture binaries in the build
+cache before the native runner checks, builds, and runs each fixture in order.
+
 OuroSmith compiler evidence requires all sixteen compiler gate commands and their
 source-bound receipts. The shard runners must agree on the full inventory and
 binary identity; their combined artifacts must cover every fixture exactly once.
 The standalone `sh scripts/test_suite.sh --compiler-checking` schedules all
 sixteen shards with `OURO_JOBS` or 20 slots and one slot per shard. It writes
-`shards.json` and separate logs under the suite output directory. `--list` and
-an explicit numbered `--shard` keep their existing behavior.
+`shards.json` and separate logs under the suite output directory. In parallel
+runs with multiple waves, a recent successful local report can put longer
+shards first if it covers every shard and matches the fixture inventory and
+backend. Reports list shards by number, and fixture results print in inventory
+order. `--list` displays the selected fixtures. A numbered `--shard` runs one
+shard.
 
 Samples use two shards with separate output directories. The native selector
 alternates native builds and check-only cases independently, preserving all
@@ -278,11 +295,13 @@ The `trust` job runs the stage-loop fixpoint/drift gate and then the deeper
 OuroSmith profile in the same checkout. The required `smith-selftest` group
 runs the harness self-tests separately, preserving all gates and per-program limits.
 The PR `smith` group runs the same blocking self-tests before its generated
-profile. In the hosted `PR (smith)` job for a pull request, `ouro-smith`
-reserves 4096 MiB for two CPU slots when the job has exactly two slots and a
-known memory budget of at least 4096 MiB after headroom. The one-slot minimum
-is 3072 MiB. A smaller or unknown budget uses the ordinary scheduling policy.
-OuroSmith child processes still use their existing limits.
+profile. In the hosted `PR (smith)` job for a pull request with exactly two
+CPU slots, `ouro-smith` reserves 6144 MiB when that much memory is available
+after headroom. This allows two native tool builds at 3072 MiB each. With
+4096 to 6143 MiB available it reserves 4096 MiB. The hosted `kernel-extra`
+OuroSmith gate reserves 4096 MiB with two slots and at least that much memory.
+A smaller or unknown budget uses the ordinary scheduling policy. The one-slot
+minimum is 3072 MiB. Child processes keep their existing limits.
 
 `Full` runs even after a job failure and requires the compiler producer and
 every matrix group to succeed. Reports are uploaded separately as
@@ -293,8 +312,8 @@ or `PR (compiler-1)`, for example.
 When portable checks are selected, `PR (checks)` checks Python syntax on Linux.
 `PR (checker)` verifies the imported compiler with the build driver and runs
 `kernel_hardening_suite.py`. Its report is in the `checker-Linux` artifact.
-`Portable (macos-latest)` starts after `Paths`, restores its own bootstrap
-evidence, and builds or verifies `ouro1` before running the same hardening suite.
+`Portable (macos-latest)` starts after `Paths` and runs the same hardening suite
+after building or verifying `ouro1` with its [macOS bootstrap cache](#caches).
 macOS keeps the inherited Python stack when the host CPython build rejects
 `setrlimit(RLIMIT_STACK)`. Darwin also rejects finite `RLIMIT_AS` (EINVAL);
 POSIX children on Linux still apply a sticky AS cap when the host allows it,
@@ -350,6 +369,9 @@ Before a selected host compiler build, `Paths` runs
 `python3 scripts/pack_frontend.py --selftest`. A core plan that needs the
 compiler also runs `python3 scripts/clippy_import_gap.py --self-test`.
 The checks group installs Ruff and ShellCheck individually when it needs them.
+The `compiler_groups` output lists matrix groups with a selected gate that needs
+the host compiler. These groups restore the suite cache and download, verify,
+and install the compiler artifact.
 
 The following inputs have mapped consumers in `scripts/ci_gate.py`.
 
@@ -384,6 +406,10 @@ For unclassified inputs the planner selects the complete PR inventory and
 portable checks. Shared compiler, runtime and standard-library inputs also
 select kernel-extra.
 
+Edits to `README.md` in `samples/demo`, `samples/examples`, `samples/tutorial`,
+`samples/scientific`, or `samples/bioinformatics` select `docs-examples` and
+`structural-quality` in the `checks` group.
+
 Sample shards derive from the runnable and check-only cases in
 `tools/test/sample_cases.ouro`. A registered `.stdin` or `.golden` companion
 selects every shard that consumes it. For a registered sample source the
@@ -396,13 +422,12 @@ full validation.
 the registered workflow fixture is its sole owner. Ambiguous ownership or
 another consumer requires full validation.
 
-For narrowed routes, the planner follows transitive imports from the canonical
-compiler fixture inventory, using the build system's import reader and checking
-its import count against the existing source tokenizer. A tool
-dependency of a compiler fixture adds that fixture's assigned shard. The
-planner also accounts for sibling golden files and sources read as fixture data.
-An unreadable dependency, unsupported import layout or inventory shape selects
-full validation.
+An explicitly mapped compiler fixture or support file selects its owning shard
+and any additional consumers. For narrowed routes, the planner follows
+transitive imports from the canonical compiler fixture inventory. It checks the
+build system's import count against the existing source tokenizer and accounts
+for sibling golden files and sources read as fixture data. An unreadable
+dependency, unsupported import layout or inventory shape selects full validation.
 New tool families remain full-validation inputs until their consumers are mapped.
 
 The job outputs contain the changed paths, a dynamic matrix and a digest of the
@@ -683,8 +708,12 @@ python3 scripts/kernel_hardening_suite.py
 
 This command uses the configured compiler in `OURO_C_BUILD_DIR`. `--compiler`
 selects an explicit compiler, and `--repo-gate` can supply an existing boundary
-executable with a current build receipt. Reports and fresh per-run logs are
-written under `_build/kernel`, or `--out`. The old JSON replay timing is a
+executable with a current build receipt. Otherwise the suite prepares the
+boundary executable through the configured native-tool cache. The builder checks
+the complete matching cache entry before installing a copy for the run.
+`OURO_CACHE=0` forces a cold boundary build. The retained-law modes use their
+own per-run cache. Reports and fresh per-run logs are written under
+`_build/kernel`, or `--out`. The old JSON replay timing is a
 different measurement and is not reused as an executable baseline.
 `kernel_profile.py --baseline-out` records an explicitly requested baseline;
 it never updates the blocking budgets.
@@ -833,8 +862,12 @@ Host-script retirement follows the evidence rules in
 | `ouro-release.yml` | Build host toolchains and publish tag drafts and snapshots every three days |
 | `ouro-pages.yml` | Build selected site changes on push or manual dispatch and publish GitHub Pages from `main` |
 
-The release workflow builds the host toolchains described in
-[Releasing](releasing.md). Its build and assemble jobs stay read-only.
+Release prepares one Linux compiler for validation. Each validation group and
+the metadata job verify the producer's artifact SHA-256, current inputs, host
+toolchain, binary, and bootstrap evidence. Partial job retries use the artifact
+from the successful producer's attempt. The compiler, validation, toolchain,
+metadata, and assembly jobs use read-only repository access. See
+[Releasing](releasing.md).
 
 Manual validates the complete selected profile on Ubuntu and Windows. With
 caching enabled, one compiler producer per OS exports the bootstrap evidence;
@@ -845,6 +878,7 @@ group. Windows Manual and Release jobs pin MinGW 16.1.0 and select only
 the next steps' `PATH` and set `CC=gcc`; a native Python check requires that
 exact compiler path and version before building or importing the compiler.
 Compiler and bootstrap receipts retain their complete identity checks.
+The `manual` profile sets up Ruff and ShellCheck in its `checks` group.
 
 Select `task=frontend-security` in Manual for the canonical frontend-security
 suite alone on Ubuntu and Windows. The diagnostic task reuses compiler
@@ -883,14 +917,16 @@ can publish only on `main`, after a push or manual dispatch.
 
 The stable `Dependencies / Review` job starts for pull requests and merge
 groups. It selects dependency review for changes to `Ouro.seal` or either npm
-project's manifest or lockfile. It selects the native workflow-policy scan for
-changes to workflow definitions, its launchers, or inputs needed to build or
-run the scanner. For pull requests, the selector checks the tested merge and
-PR head diffs against the base for manifest and lockfile changes. The pinned
+project's manifest or lockfile. For pull requests, the selector checks the
+tested merge and PR head diffs against the base for these changes. The pinned
 dependency-review action compares the PR head with the base. The selector uses
-the tested merge diff for workflow policy, and the scanner reads the current
-checkout. For merge groups, the selector and dependency-review action use the
-group base and head. An empty, invalid or unavailable diff selects both checks.
+the tested merge diff to determine whether workflow definitions, launchers, or
+scanner inputs need the native workflow-policy scan. `Review` runs required
+scans outside the main CI plan. The scanner reads the current checkout. For
+merge groups, the selector and dependency-review action use the group base and
+head. An empty, invalid or unavailable diff selects both `Review` checks, as
+does an oversized PR head diff. An oversized tested merge diff selects
+dependency review and uses the complete CI plan for workflow policy.
 
 The nightly and manual profiles also run `analyze-production`
 (`python3 scripts/analyze_production_suite.py`), which sweeps the production
@@ -986,52 +1022,68 @@ and resource allocations. Its peak task, CPU-slot, and memory counts describe
 scheduled work. Compiler shards reserve 3 GiB each and record sampled peak RSS
 for the process tree when the host provides it.
 
+For runs with isolated workspaces, the Python runner writes `ci-setup.json`
+beside the summary. It records source freeze, preparation cache access and hashes,
+workspace copies, and compiler and tool evidence installs. Each entry names the
+workspace and, when applicable, the gate and evidence producer. A phase starts
+with status `running` and gets a duration and status `completed` or `failed` at
+its end. After an interruption, a `running` entry identifies unfinished setup.
+Times are in seconds from the start of the scheduler. A new run clears the
+previous journal in its output directory.
+
 ## Caches
 
 Hosted and local caches may accelerate C objects, native tool binaries,
-frontend regeneration, self-hosted modules, and generated-C shards. Pull requests use restore-only
-cache policy; trusted branch or scheduled workflows may save accelerator state.
+frontend regeneration, self-hosted modules, and generated-C shards.
 
-CI, `Dependencies / Review`, and Nightly restore the compiler cache by the
-same exact key. It includes the runner OS and architecture and the bootstrap
-driver's full current input identity, including the host C compiler and flags.
+CI, `Dependencies / Review`, Nightly, Release, and standalone Lint restore the
+compiler cache by the same exact key. It includes the runner OS, architecture,
+and the bootstrap driver's full current input identity, including the host C
+compiler and flags.
 The cache holds the compiler, `ouro1.bootstrap.json`, the completion report,
 the input manifest, and the P1/P2 generated C referenced by the receipt. The
 build driver verifies the evidence before reusing the compiler. It builds a
-current compiler when reuse is unavailable.
+current compiler when reuse is unavailable. Portable uses the same input
+identity in its macOS cache key and retains the suite cache prefix fallbacks.
 
-In CI's `Build and verify host compiler` step, `Host compiler exact cache
-lookup hit=true` records the cache action's lookup result. The build driver's
+`Host compiler exact cache lookup hit=true` and `Portable compiler exact cache
+lookup hit=true` record cache action lookup results. The build driver's
 `BOOTSTRAP: current compiler unchanged; checked successor reused` records
-verified reuse. CI saves verified compiler evidence on a miss for pull requests
-and pushes to `main` or `master`. GitHub scopes pull request writes to the PR's
-merge ref. Nightly saves it on a miss during a scheduled run or manual dispatch
-on either branch.
+verified reuse.
+
+On an exact miss, `Host compiler` and `Portable (macos-latest)` save verified
+compiler evidence for pull requests and pushes to `main` or `master`. GitHub
+scopes pull request cache writes to the PR's merge ref. Successful
+compiler-consuming matrix jobs and `Compiler kernel` save suite caches on an
+exact miss in those same scopes. Portable saves its suite cache with its
+compiler evidence. The `runtime-io` and `frontend-security` groups try their
+own keys first and can fall back to the `tests` suite cache. `Compiler kernel`
+tries its own suite cache prefix first.
+
+Nightly saves compiler evidence on a miss during scheduled runs or manual
+dispatch on `main` or `master`. `Dependencies / Review` restores it for workflow
+scans. Release restores it for the validation compiler job when an exact entry
+is available in the run's cache scope. Standalone Lint uses a restore-only
+policy.
 
 Nightly prepares one compiler in `Host compiler` and publishes it in a
 workflow-local artifact. Each matrix job downloads the artifact and verifies
 its SHA-256, compiler, inputs, host toolchain, and bootstrap evidence before
 running its group. Suite caches remain separate.
 
-In public repositories, CI and `Dependencies / Review` can restore the
-historical cache into the runner's temporary directory after a compiler cache
-miss. It covers C0 and both historical bridges in the
-[bootstrap sequence](build.md#c-bootstrap). The driver uses the verified second
-bridge to build current P1, which then builds P2. Private and internal
-repositories build from the pinned historical inputs on a miss.
+In public repositories, CI's `Host compiler` and `Portable` jobs and
+`Dependencies / Review` can restore the historical cache into the runner's
+temporary directory after an exact compiler cache miss. It covers C0 and both
+historical bridges in the [bootstrap sequence](build.md#c-bootstrap). The driver
+uses the verified second bridge to build current P1, which then builds P2.
+Private and internal repositories build historical stages from pinned inputs
+when they need a bootstrap.
 
-Each historical cache entry includes the full historical input key and the
-producing run. The archive digest must match evidence from a successful first
-CI attempt on a push to `main` or `master` in the same repository. An unavailable
-digest or a mismatch triggers a build from the pinned inputs.
-
-Successful matrix, Kernel, and Portable jobs save suite caches on a miss in the
-same scopes. `runtime-io` and `frontend-security` try their own keys and can also
-restore the `tests` suite cache.
-
-`Dependencies / Review` runs dependency review for manifest changes. It also
-runs the workflow policy scan when the main CI route does not cover it or the
-selection is incomplete.
+Each historical cache entry is specific to the runner OS, architecture, full
+historical input key, and producing run. The archive digest must match evidence
+from a successful first CI attempt on a push to `main` or `master` in the same
+repository. An unavailable digest or a mismatch triggers a build from the
+pinned inputs.
 
 Restored data is followed by the relevant parity, hash, regeneration, or
 compiler-checking validation. Cache state does not establish program acceptance

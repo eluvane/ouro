@@ -227,6 +227,7 @@ def test_adjacent_stage_object_reuse(tmp: Path) -> None:
     seed = tmp / "adjacent-seed"
     seed.write_bytes(b"fixture seed\n")
     mod = import_stage_loop(repo)
+    signature = ("fixture-inputs", {"digests": {"seed_binary": mod.file_digest(seed)}})
     static = {"static/ouro_rt", "static/bootstrap", "static/fe_link"}
 
     def run_case(index: int, case: str, expected: set[str]) -> None:
@@ -260,7 +261,7 @@ def test_adjacent_stage_object_reuse(tmp: Path) -> None:
             return {}
 
         with patch.dict(os.environ, env), patch.object(mod, "ensure_seed", return_value=seed), \
-             patch.object(mod, "stage_signature", return_value=("fixture-inputs", {})), \
+             patch.object(mod, "stage_signature", return_value=signature), \
              patch.object(mod, "emit_backend", side_effect=emit_backend) as backend, \
              patch.object(mod, "emit_frontend", side_effect=emit_frontend) as frontend:
             cfg = make_cfg(mod, repo)
@@ -407,6 +408,7 @@ def test_stage_stamp_artifacts(tmp: Path) -> None:
     frontend, backend = write_generated_sources(seed_dir)
     seed = tmp / "seed"
     seed.write_bytes(b"seed")
+    signature = ("fixture-inputs", {"digests": {"seed_binary": mod.file_digest(seed)}})
     work = tmp / "work"
     cfg = SimpleNamespace(work=work, cache_root=tmp / "cache", cache_enabled=False,
                           result=work / "result.json", status_pub=work / "status.json",
@@ -430,7 +432,7 @@ def test_stage_stamp_artifacts(tmp: Path) -> None:
 
     with patch.dict(os.environ, {"OURO_STAGE_FAST_PATH": "0"}), patch.object(mod, "ROOT", tmp), \
          patch.object(mod, "ensure_seed", return_value=seed), \
-         patch.object(mod, "stage_signature", return_value=("fixture-inputs", {})), \
+         patch.object(mod, "stage_signature", return_value=signature), \
          patch.object(mod, "emit_backend", side_effect=emit_backend), \
          patch.object(mod, "emit_frontend", side_effect=emit_frontend), \
          patch.object(mod, "build_stage_binary", side_effect=build) as builder:

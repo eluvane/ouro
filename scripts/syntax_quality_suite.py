@@ -8,9 +8,11 @@ import subprocess
 import sys
 from copy import deepcopy
 from dataclasses import dataclass, replace
+from functools import partial
+from io import StringIO
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any, Sequence
+from typing import Any, Sequence, TextIO
 from unittest.mock import patch
 
 from repo_support import bind_relative_path, read_json_value, write_json_atomic
@@ -127,6 +129,15 @@ def scan_source(path: Path, text: str, registry: dict[str, dict[str, Any]], prof
         require_strict_unchanged("during execution")
 
 
+def run_prepared_strict(argv: Sequence[str], *, output: TextIO) -> int:
+    executable = strict_preparation()[0]
+    require_strict_unchanged("before execution")
+    try:
+        return strict_quality.run_native_cli(argv, executable=executable, stdout=output, stderr=output)
+    finally:
+        require_strict_unchanged("during execution")
+
+
 def check_strict_preparation() -> Check:
     # Stand-ins cover preparation and transport; all rule fixtures execute the owner.
     previous = _STRICT_PREPARATION[0]
@@ -145,21 +156,29 @@ def check_strict_preparation() -> Check:
             for text in ("first fixture", "second fixture"):
                 if scan_source(OUT / "fixture.ouro", text, registry, "release") != []:
                     raise AssertionError("strict scan transport changed the owner result")
-            if prepare.call_count != 1 or scans.call_count != 2:
-                raise AssertionError("strict scanner was rebuilt or a fixture was not freshly scanned")
+            scans.return_value = SimpleNamespace(ok=True, returncode=0, stdout="release output\n", stderr="release diagnostic\n")
+            output = StringIO()
+            if run_prepared_strict(["--profile", "release"], output=output) != 0:
+                raise AssertionError("prepared strict scanner changed the release status")
+            if output.getvalue() != scans.return_value.stdout + scans.return_value.stderr:
+                raise AssertionError("prepared strict scanner changed the release log")
+            if prepare.call_count != 1 or scans.call_count != 3:
+                raise AssertionError("strict scanner was rebuilt or a native scan was missed")
             prepare.assert_called_once_with("tools/strict/main.ouro", "ouro-syntax-quality-scanner")
-            if receipts.call_count != 5:
+            if receipts.call_count != 7:
                 raise AssertionError("strict scanner skipped initial or per-run receipt checks")
             parse_bytes = receipts.call_args_list[0].kwargs.get("parse_bytes")
             if not isinstance(parse_bytes, CachedImportParser) or any(
                 call.kwargs.get("parse_bytes") is not parse_bytes for call in receipts.call_args_list
             ):
                 raise AssertionError("strict receipt checks did not share one import parser")
-            for call, text in zip(scans.call_args_list, ("first fixture", "second fixture"), strict=True):
+            for call, text in zip(scans.call_args_list[:2], ("first fixture", "second fixture"), strict=True):
                 if (call.args[0] != [str(executable), "--scan-source", str(OUT / "fixture.ouro"), "--profile", "release"]
                         or call.kwargs["stdin_text"] != text or call.kwargs["timeout_s"] != 1800
                         or call.kwargs["memory_mb"] != 3072 or call.kwargs["cwd"] != ROOT):
                     raise AssertionError("strict preparation changed a fixture frame or its limits")
+            scans.assert_called_with([str(executable), "--profile", "release"], cwd=ROOT,
+                                     env=strict_quality.native_env(), timeout_s=1800, memory_mb=3072)
             for stdout, message in (
                 ("{}", "native strict scan did not return a JSON array"),
                 ("[null]", "native strict scan returned a non-object finding"),
@@ -191,25 +210,29 @@ def check_strict_preparation() -> Check:
                    {**evidence, "binary_sha256": "changed-binary"},
                    {**evidence, "sources": {"unit.ouro": "changed"}},
                    ValueError("missing or stale strict receipt"))
-        for phase in ("before", "during"):
-            for changed in changes:
-                _STRICT_PREPARATION[0] = None
-                observations = [evidence, changed] if phase == "before" else [evidence, evidence, changed]
-                with patch("ourosmith.host.prepare_entry", return_value=executable) as prepare, \
-                        patch(__name__ + ".binary", return_value=compiler), \
-                        patch(__name__ + ".strict_evidence", side_effect=observations), \
-                        patch("ourosmith.limits.run_limited", return_value=outcome) as scans:
-                    try:
-                        scan_source(OUT / "fixture.ouro", "source", {}, "release")
-                    except ValueError:
-                        pass
-                    else:
-                        raise AssertionError("strict preparation accepted changed inputs " + phase)
-                    if prepare.call_count != 1 or scans.call_count != int(phase == "during"):
-                        raise AssertionError("strict mutation caused a rebuild or an unsafe scan")
+        for run_scan in (
+            lambda: scan_source(OUT / "fixture.ouro", "source", {}, "release"),
+            lambda: run_prepared_strict(["--profile", "release"], output=StringIO()),
+        ):
+            for phase in ("before", "during"):
+                for changed in changes:
+                    _STRICT_PREPARATION[0] = None
+                    observations = [evidence, changed] if phase == "before" else [evidence, evidence, changed]
+                    with patch("ourosmith.host.prepare_entry", return_value=executable) as prepare, \
+                            patch(__name__ + ".binary", return_value=compiler), \
+                            patch(__name__ + ".strict_evidence", side_effect=observations), \
+                            patch("ourosmith.limits.run_limited", return_value=outcome) as scans:
+                        try:
+                            run_scan()
+                        except ValueError:
+                            pass
+                        else:
+                            raise AssertionError("strict preparation accepted changed inputs " + phase)
+                        if prepare.call_count != 1 or scans.call_count != int(phase == "during"):
+                            raise AssertionError("strict mutation caused a rebuild or an unsafe scan")
     finally:
         _STRICT_PREPARATION[0] = previous
-    return Check("strict-scanner-preparation", "pass", "one preparation, fresh frames/caps, build refusal and 8 mutation guards")
+    return Check("strict-scanner-preparation", "pass", "one preparation, fresh frames/caps, build refusal and 16 mutation guards")
 
 
 def load_json_object(path: Path) -> dict[str, Any]:
@@ -867,7 +890,7 @@ def check_style_grouped_imports() -> Check:
 
 
 def check_release_firewall() -> Check:
-    from io import StringIO
+    from tempfile import TemporaryDirectory
 
     from ourosmith.limits import RunResult
 
@@ -884,26 +907,73 @@ def check_release_firewall() -> Check:
             if (code, stdout.getvalue(), stderr.getvalue()) != (expected, result.stdout, result.stderr):
                 raise AssertionError(f"release firewall changed process result for {status} exit={returncode}")
 
-    report = OUT / "release.json"
-    sarif = OUT / "release.sarif"
-    migration = OUT / "release.md"
-    run([
-        sys.executable,
-        "scripts/strict_quality_firewall.py",
-        "--profile",
-        "release",
-        "--report",
-        rel(report),
-        "--sarif",
-        rel(sarif),
-        "--migration-report",
-        rel(migration),
-    ], stdout=OUT / "release.log")
+    with TemporaryDirectory(prefix="release-test-", dir=OUT) as directory:
+        out = Path(directory)
+        artifacts = (out / "release.json", out / "release.sarif", out / "release.md")
+        clean = {"diagnostics_debt_allowed": 0, "diagnostics_blocking": 0}
+
+        def publish(argv, *, output, counts, omit, exit_code):
+            expected = ["--profile", "release", "--report", rel(artifacts[0]),
+                        "--sarif", rel(artifacts[1]), "--migration-report", rel(artifacts[2])]
+            if argv != expected:
+                raise AssertionError(f"strict release runner received unexpected arguments: {argv}")
+            if any(path.exists() for path in artifacts):
+                raise AssertionError("strict release runner found stale artifacts")
+            for path, body in zip(artifacts, (json.dumps(counts), "{}", "# Migration\n"), strict=True):
+                if path.name != omit:
+                    path.write_text(body, encoding="utf-8")
+            output.write("fresh release output\n")
+            return exit_code
+
+        for counts, omit, exit_code, error in (
+            (clean, None, 0, None),
+            ({**clean, "diagnostics_debt_allowed": False}, None, 0, "unexpected release firewall counts"),
+            ({**clean, "diagnostics_blocking": 0.0}, None, 0, "unexpected release firewall counts"),
+            (clean, "release.json", 0, "missing release firewall artifacts"),
+            (clean, "release.sarif", 0, "missing release firewall artifacts"),
+            (clean, "release.md", 0, "missing release firewall artifacts"),
+            (clean, None, 7, "scripts/strict_quality_firewall.py returned 7"),
+        ):
+            for path in artifacts:
+                path.write_text("old release output", encoding="utf-8")
+            publish_case = partial(publish, counts=counts, omit=omit, exit_code=exit_code)
+            with patch(__name__ + ".run_prepared_strict", side_effect=publish_case):
+                try:
+                    run_release_firewall(out)
+                except AssertionError as exc:
+                    if error is None or not str(exc).startswith(error):
+                        raise
+                else:
+                    if error is not None:
+                        raise AssertionError(f"strict release firewall accepted invalid output, expected {error}")
+
+    return run_release_firewall(OUT)
+
+
+def run_release_firewall(out: Path) -> Check:
+    report = out / "release.json"
+    sarif = out / "release.sarif"
+    migration = out / "release.md"
+    artifacts = (report, sarif, migration)
+    for artifact in artifacts:
+        artifact.unlink(missing_ok=True)
+    with (out / "release.log").open("w", encoding="utf-8") as log:
+        code = run_prepared_strict([
+            "--profile", "release",
+            "--report", rel(report),
+            "--sarif", rel(sarif),
+            "--migration-report", rel(migration),
+        ], output=log)
+    if code != 0:
+        raise AssertionError(f"scripts/strict_quality_firewall.py returned {code}, expected 0")
+    missing = [rel(artifact) for artifact in artifacts if not artifact.is_file()]
+    if missing:
+        raise AssertionError(f"missing release firewall artifacts {', '.join(missing)}")
     data = load_json_object(report)
     debt = data.get("diagnostics_debt_allowed")
     blocking = data.get("diagnostics_blocking")
-    if debt != 0 or blocking != 0:
-        raise AssertionError(f"unexpected release firewall counts debt={debt} blocking={blocking}")
+    if any(type(count) is not int or count != 0 for count in (debt, blocking)):
+        raise AssertionError(f"unexpected release firewall counts debt={debt!r} blocking={blocking!r}")
     return Check("release-firewall", "pass", f"debt={debt} blocking={blocking}")
 
 

@@ -212,21 +212,9 @@ def module_lookup_contract(digests: Mapping[str, "FileDigest"], *, token_cache=N
             "sources": [asdict(digests[path]) for path in sources]}
 
 
-def _matches_binding_units(root: str, units: Sequence[str], required: Sequence[str],
-                           parse_bytes: ImportBytesParser | None) -> bool:
-    expected = list(units)
-    current = (collect_units(root) if parse_bytes is None
-               else collect_units_many([root], parse_bytes=parse_bytes)[root])
-    return expected == current and all(units.count(path) == 1 for path in required)
-
-
 def module_lookup_binding(root: str, units: Sequence[str], digests: Mapping[str, "FileDigest"], *,
                           parse_bytes: ImportBytesParser | None = None, token_cache=None) -> dict:
-    contract = module_lookup_contract(digests, token_cache=token_cache)
-    selected = contract["capability"] and packer.MODULE_LOOKUP_OWNER in units
-    if selected and not _matches_binding_units(root, units, packer.MODULE_LOOKUP_SOURCE_PATHS, parse_bytes):
-        raise RuntimeError("module lookup canonical source closure changed")
-    return {**contract, "selected": selected}
+    return _ScopeBindingChecks(root, units, digests, parse_bytes, token_cache).module_lookup()
 
 
 def lower_local_lookup_contract(digests: Mapping[str, "FileDigest"], *, token_cache=None) -> dict:
@@ -253,11 +241,7 @@ def lower_local_lookup_contract(digests: Mapping[str, "FileDigest"], *, token_ca
 
 def lower_local_lookup_binding(root: str, units: Sequence[str], digests: Mapping[str, "FileDigest"], *,
                                parse_bytes: ImportBytesParser | None = None, token_cache=None) -> dict:
-    contract = lower_local_lookup_contract(digests, token_cache=token_cache)
-    selected = contract["capability"] and packer.LOWER_LOCAL_LOOKUP_OWNER in units
-    if selected and not _matches_binding_units(root, units, packer.LOWER_LOCAL_LOOKUP_SOURCE_PATHS, parse_bytes):
-        raise RuntimeError("lower local lookup canonical source closure changed")
-    return {**contract, "selected": selected}
+    return _ScopeBindingChecks(root, units, digests, parse_bytes, token_cache).lower_local_lookup()
 
 
 def elem_scope_capability(text: str) -> bool:
@@ -297,11 +281,7 @@ def elem_scope_contract(digests: Mapping[str, "FileDigest"], *, token_cache=None
 
 def elem_scope_binding(root: str, units: Sequence[str], digests: Mapping[str, "FileDigest"], *,
                        parse_bytes: ImportBytesParser | None = None, token_cache=None) -> dict:
-    contract = elem_scope_contract(digests, token_cache=token_cache)
-    selected = contract["capability"] and packer.ELEM_OWNER in units
-    if selected and not _matches_binding_units(root, units, packer.ELEM_SOURCE_PATHS, parse_bytes):
-        raise RuntimeError("elem scope canonical source closure changed")
-    return {**contract, "selected": selected}
+    return _ScopeBindingChecks(root, units, digests, parse_bytes, token_cache).elem_scope()
 
 
 def source_name_compare_capability(text: str) -> bool:
@@ -342,40 +322,12 @@ def source_name_compare_contract(digests: Mapping[str, "FileDigest"], *, token_c
 
 def source_name_compare_binding(root: str, units: Sequence[str], digests: Mapping[str, "FileDigest"], *,
                                 parse_bytes: ImportBytesParser | None = None, token_cache=None) -> dict:
-    contract = source_name_compare_contract(digests, token_cache=token_cache)
-    selected = contract["capability"] and packer.SOURCE_NAME_COMPARE_OWNER in units
-    if selected and not _matches_binding_units(root, units, packer.SOURCE_NAME_COMPARE_SOURCE_PATHS, parse_bytes):
-        raise RuntimeError("source name compare scope canonical source closure changed")
-    return {**contract, "selected": selected}
+    return _ScopeBindingChecks(root, units, digests, parse_bytes, token_cache).source_name_compare()
 
 
 def prelude_arithmetic_binding(root: str, units: Sequence[str], digests: Mapping[str, "FileDigest"], *,
                               parse_bytes: ImportBytesParser | None = None, token_cache=None) -> dict:
-    if not any(owner in units for _name, owner in packer.PRELUDE_ARITHMETIC_ROUTES):
-        return {"selected": False}
-    source_paths = packer.prelude_arithmetic_source_paths(units)
-    if not _matches_binding_units(root, units, source_paths, parse_bytes):
-        raise RuntimeError("prelude arithmetic canonical source closure changed")
-    names = (*source_paths,
-             "scripts/scoped_host_exports.py", "scripts/structural_quality_legacy.py")
-    source_bytes = {}
-    for name in names:
-        path = ROOT / name
-        changed = "prelude arithmetic input changed or is missing: " + name
-        if name not in digests or not path.is_file():
-            raise RuntimeError(changed)
-        if name in source_paths:
-            source_bytes[name] = _read_bound_bytes(path, digests[name], changed)
-        elif digests[name] != digest(path):
-            raise RuntimeError(changed)
-    sources = {name: _decode_bound_text(ROOT / name, data, "prelude arithmetic source")
-               for name, data in source_bytes.items()}
-    packer.prelude_arithmetic_source_contract(sources, token_cache=token_cache)
-    return {"selected": True, "inputs": [asdict(digests[name]) for name in names],
-            "prelude_list_length": {"owner": packer.PRELUDE_LIST_LENGTH_ROUTE[1],
-                                    "value_arity": packer.PRELUDE_LIST_LENGTH_ROUTE[2]},
-            "prelude_list_append": {"owner": packer.PRELUDE_LIST_APPEND_ROUTE[1],
-                                    "value_arity": packer.PRELUDE_LIST_APPEND_ROUTE[2]}}
+    return _ScopeBindingChecks(root, units, digests, parse_bytes, token_cache).prelude_arithmetic()
 
 
 @dataclass(frozen=True)
@@ -629,21 +581,88 @@ def _tu_key_inputs(tag: str, mod: str, root: str, units: Sequence[str], digests:
     }
 
 
+class _ScopeBindingChecks:
+    def __init__(self, root: str, units: Sequence[str], digests: Mapping[str, FileDigest],
+                 parse_bytes: ImportBytesParser | None, token_cache) -> None:
+        self._root = root
+        self._units = units
+        self._digests = digests
+        self._parse_bytes = parse_bytes
+        self._token_cache = token_cache
+        self._current_units: List[str] | None = None
+
+    def _require_units(self, required: Sequence[str], label: str) -> None:
+        expected = list(self._units)
+        if self._current_units is None:
+            self._current_units = (
+                collect_units(self._root) if self._parse_bytes is None
+                else collect_units_many([self._root], parse_bytes=self._parse_bytes)[self._root]
+            )
+        if expected != self._current_units or any(self._units.count(path) != 1 for path in required):
+            raise RuntimeError(label + " canonical source closure changed")
+
+    def _select(self, contract: dict, owner: str, required: Sequence[str], label: str) -> dict:
+        selected = contract["capability"] and owner in self._units
+        if selected:
+            self._require_units(required, label)
+        return {**contract, "selected": selected}
+
+    def module_lookup(self) -> dict:
+        return self._select(module_lookup_contract(self._digests, token_cache=self._token_cache),
+                            packer.MODULE_LOOKUP_OWNER, packer.MODULE_LOOKUP_SOURCE_PATHS, "module lookup")
+
+    def lower_local_lookup(self) -> dict:
+        return self._select(lower_local_lookup_contract(self._digests, token_cache=self._token_cache),
+                            packer.LOWER_LOCAL_LOOKUP_OWNER, packer.LOWER_LOCAL_LOOKUP_SOURCE_PATHS,
+                            "lower local lookup")
+
+    def source_name_compare(self) -> dict:
+        return self._select(source_name_compare_contract(self._digests, token_cache=self._token_cache),
+                            packer.SOURCE_NAME_COMPARE_OWNER, packer.SOURCE_NAME_COMPARE_SOURCE_PATHS,
+                            "source name compare scope")
+
+    def elem_scope(self) -> dict:
+        return self._select(elem_scope_contract(self._digests, token_cache=self._token_cache),
+                            packer.ELEM_OWNER, packer.ELEM_SOURCE_PATHS, "elem scope")
+
+    def prelude_arithmetic(self) -> dict:
+        if not any(owner in self._units for _name, owner in packer.PRELUDE_ARITHMETIC_ROUTES):
+            return {"selected": False}
+        source_paths = packer.prelude_arithmetic_source_paths(self._units)
+        self._require_units(source_paths, "prelude arithmetic")
+        digests = self._digests
+        names = (*source_paths,
+                 "scripts/scoped_host_exports.py", "scripts/structural_quality_legacy.py")
+        source_bytes = {}
+        for name in names:
+            path = ROOT / name
+            changed = "prelude arithmetic input changed or is missing: " + name
+            if name not in digests or not path.is_file():
+                raise RuntimeError(changed)
+            if name in source_paths:
+                source_bytes[name] = _read_bound_bytes(path, digests[name], changed)
+            elif digests[name] != digest(path):
+                raise RuntimeError(changed)
+        sources = {name: _decode_bound_text(ROOT / name, data, "prelude arithmetic source")
+                   for name, data in source_bytes.items()}
+        packer.prelude_arithmetic_source_contract(sources, token_cache=self._token_cache)
+        return {"selected": True, "inputs": [asdict(digests[name]) for name in names],
+                "prelude_list_length": {"owner": packer.PRELUDE_LIST_LENGTH_ROUTE[1],
+                                        "value_arity": packer.PRELUDE_LIST_LENGTH_ROUTE[2]},
+                "prelude_list_append": {"owner": packer.PRELUDE_LIST_APPEND_ROUTE[1],
+                                        "value_arity": packer.PRELUDE_LIST_APPEND_ROUTE[2]}}
+
+
 def _tu_scope_bindings(root: str, units: Sequence[str], digests: Mapping[str, FileDigest], *,
                        module_lookup: dict | None = None, historical_bridge: bool,
                        parse_bytes: ImportBytesParser | None) -> dict:
-    token_cache = {}
+    checks = _ScopeBindingChecks(root, units, digests, parse_bytes, {})
     return {
-        "module_lookup": (module_lookup_binding(root, units, digests, parse_bytes=parse_bytes, token_cache=token_cache)
-                          if module_lookup is None else module_lookup),
-        "lower_local_lookup": lower_local_lookup_binding(root, units, digests, parse_bytes=parse_bytes,
-                                                        token_cache=token_cache),
-        "source_name_compare_scope": source_name_compare_binding(root, units, digests, parse_bytes=parse_bytes,
-                                                                token_cache=token_cache),
-        "elem_scope": elem_scope_binding(root, units, digests, parse_bytes=parse_bytes, token_cache=token_cache),
-        "prelude_arithmetic": (prelude_arithmetic_binding(root, units, digests, parse_bytes=parse_bytes,
-                                                         token_cache=token_cache)
-                               if not historical_bridge else {"selected": False}),
+        "module_lookup": checks.module_lookup() if module_lookup is None else module_lookup,
+        "lower_local_lookup": checks.lower_local_lookup(),
+        "source_name_compare_scope": checks.source_name_compare(),
+        "elem_scope": checks.elem_scope(),
+        "prelude_arithmetic": checks.prelude_arithmetic() if not historical_bridge else {"selected": False},
     }
 
 

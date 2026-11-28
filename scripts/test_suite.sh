@@ -240,6 +240,13 @@ if [ "$SUITE_MODE" = compiler-checking ]; then
 		fi
 		run_suite "$PYTHON" "$ROOT/scripts/compiler_shards.py" "$@"
 	fi
+	if [ -z "$NATIVE_TOOLS" ] && [ "${OURO_CI_COMPILER_SHARD_PREWARM:-}" = 1 ] && [ "$#" -eq 1 ]; then
+		case "$1" in
+		--shard=*)
+			run_suite "$PYTHON" "$ROOT/scripts/compiler_shards.py" --runner "$SUITE" --out "$OUT" --prewarm-shard="${1#--shard=}"
+			;;
+		esac
+	fi
 	run_suite "$SUITE" --native-suite=compiler-checking "--out=$OUT" "$@"
 fi
 FIXTURES=$("$PYTHON" scripts/ouro_smith.py prepare --group test --out "$OUT/inputs" --stable)

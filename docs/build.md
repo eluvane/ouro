@@ -611,6 +611,9 @@ bootstrap inputs. Its regeneration reference is the current P2 frontend and
 backend C, whose installed receipt must match the current source and host
 toolchain and retain the complete P1/P2 equality evidence. Fresh frontend
 regeneration and the stage-loop fixpoint must reproduce that verified pair.
+The frontend runs with its cache disabled in a new work directory for each
+invocation. The gate rejects manifest and other fast-path hits and checks the
+fresh output against its regeneration report.
 Missing, stale, or changed evidence fails the gate. The reference stays in the
 configured bootstrap directory; regeneration does not update committed stage0.
 

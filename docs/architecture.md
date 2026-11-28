@@ -279,6 +279,164 @@ imports, managed operations, and frames of 4096 bytes or more. The dedicated
 dispatch, the Linux runtime, and a native seed remain outside the slice.
 [Linux source lowering](../compiler/native/lower_linux_source.ouro)
 
+## Systems contract support
+
+This inventory describes the experimental pre-1.0 systems slice. `CON-BASE-01`
+ties each checked identity to its lowering and the evidence needed at execution.
+The proposed resource and memory rules have their own acceptance criteria.
+[Systems proposal](design.md#proposed-systems-foundation) ·
+[Decision record](rfc/README.md#systems-design-decisions)
+
+### Checked identities
+
+The declaration checker resolves an `intrinsic` by registry key, checks its
+signature against registered primitive types and representation roles, and
+retains any normalized specialization with the checked binding. An `extern`
+retains the checked target, ABI, library, symbol, GC policy, and concrete scalar
+signature. Native lowering replays the ordered declarations and binding metadata
+before deriving MIR. A matching source name confers no binding authority.
+[Source syntax](syntax.md#experimental-native-declarations) ·
+[Declaration checker](../compiler/file_elab.ouro) ·
+[Primitive checking](../compiler/primitive_check.ouro) ·
+[Native replay](../compiler/native/lower_boundary.ouro)
+
+Machine-word computations and typed null are `PrimitivePureValue`. Type
+conversion treats these values, externs, and `PrimitiveRuntimeAction` terms as
+opaque. `PrimitiveNoGc` describes the scalar operation. Managed boxing and
+action construction can allocate, so the backend derives safepoints from MIR.
+[Primitive contracts](../compiler/primitive_contracts.ouro) ·
+[Primitive model](../compiler/primitive_model.ouro) ·
+[MIR call effects](../compiler/native/mir_gc.ouro)
+
+### Machine words
+
+The `PrimitiveTypeOnly` keys `ouro.u8`, `ouro.u32`, `ouro.u64`, `ouro.i32`, and
+`ouro.usize` select 8, 32, 64, 32, and 64 bits in the current x86-64 slice. Only
+`I32` is signed. `W` below is one of these registered types, and `w` is its
+registry spelling. Source numeric literals produce mathematical `Nat` values.
+[Shared vocabulary](../runtime/native_types.ouro) ·
+[Signature templates](../compiler/primitive_registry_base.ouro) ·
+[Number syntax](syntax.md#numbers-and-strings)
+
+| Registry key and checked signature | Result and failure | Lowering and MIR |
+| --- | --- | --- |
+| `ouro.w.add.wrap`, `sub.wrap`, `mul.wrap`, `and`, `or`, `xor` use `W -> W -> W`. `shl`, `shr` use `W -> U32 -> W`. `eq`, `lt` use `W -> W -> Bool`. | Wrapping arithmetic keeps the low bits. Shifts mask their count by the width minus one. Right shift and less-than use signed semantics for `I32`. These keys have `PrimitiveNoGc` metadata. | `lower_binary` emits `MirBinaryOp` or `MirCompare`. Managed `managed_word_operation` unboxes inputs and represents the result as a managed value. The x64 encoder selects operand width, shift kind, and comparison condition. [Scalar lowering](../compiler/native/lower_ops.ouro) · [Managed words](../compiler/native/managed_word.ouro) · [x64 emission](../compiler/native/codegen_ops.ouro) |
+| `ouro.w.add.checked`, `sub.checked`, `mul.checked`, `div.checked`, `rem.checked` use `W -> W -> Maybe W`. | The registry checks the `Maybe` role and assigns `PrimitiveMayGc`. The checked contract calls for `Nothing` on overflow, a zero divisor, or `I32` minimum divided by `-1`. | Managed Windows implements checked `USize` addition with `MirBinaryOp MirAdd`, an unsigned comparison, and a `MirBranch` to build the registered `Maybe`. The remaining managed identities and all scalar checked arithmetic keys return `LowerUnsupportedPrimitive`. MIR `MirDiv` and `MirRem` have separate x64 trap guards. [Managed words](../compiler/native/managed_word.ouro) · [Scalar lowering](../compiler/native/lower_ops.ouro) · [Division trap cases](../tests/native_mir_tests.ouro) |
+| `ouro.convert.src.dst.narrow.wrap`, `zext`, `sext`, `reinterpret` use `Src -> Dst`. `ouro.convert.src.dst.checked` uses `Src -> Maybe Dst`. | The registry checks widths and signedness for truncation, extension, and equal-width reinterpretation. Checked conversions between distinct word types have `PrimitiveMayGc` metadata. The other modes have `PrimitiveNoGc` metadata. | `lower_conversion` emits `MirConvert` for unchecked modes. Managed Windows also implements checked `USize -> Maybe U32` with the `U32` upper bound and a branch to the registered `Maybe`. Remaining managed checked conversions and all scalar checked word conversions return `LowerUnsupportedPrimitive`. [Conversion rules](../compiler/primitive_contracts.ouro) · [Scalar lowering](../compiler/native/lower_ops.ouro) · [Managed words](../compiler/native/managed_word.ouro) |
+| `ouro.w.from_nat.checked` uses `Nat -> Maybe W`. `ouro.w.to_nat.bits` uses `W -> Nat`. | Out-of-range `Nat` gives `Nothing`. Conversion back interprets `I32` as unsigned bits. Both keys have `PrimitiveMayGc` metadata. | `lower_from_nat` reduces a bounded constant `Nat` for local `Maybe` elimination with a typed `MirBits` payload. The scalar path supports only this constant conversion. Managed Windows supports both keys for dynamic values, using guards and a branch for `Maybe` and preserving all word bits on return to `Nat`. [Scalar constants](../compiler/native/lower_constants.ouro) · [Managed words](../compiler/native/managed_word.ouro) · [Managed `Nat`](../compiler/native/managed_nat.ouro) |
+
+### Raw pointers, calls, and actions
+
+`ouro.raw_ptr`, `ouro.raw_fn`, and `ouro.runtime` are `PrimitiveTypeOnly` keys
+for constructors of kind `Type -> Type`. Scalar lowering classifies `Runtime`
+as an action and retains normalized pointee and function signature types when
+selecting `MirRawPtr` for raw values.
+Storage specialization uses the same classifier as the scalar ABI. `RawPtr A`
+describes an address with pointee type `A`. The caller must justify access to
+the complete width of the storage, its required alignment, lifetime and
+read or write permission. Reads require initialized storage. Raw instructions
+provide no typed address-failure result.
+[ABI and storage registry](../compiler/primitive_registry.ouro) ·
+[Native scalar types](../compiler/native/lower_types.ouro)
+
+| Registry key or declaration | Checked signature and effect | Lowering and representation |
+| --- | --- | --- |
+| `ouro.raw.null` | `(A : Type) -> RawPtr A`. Pure typed zero address with `PrimitiveNoGc` metadata. | `lower_raw_null` emits `MirBits MirRawPtr` zero. The managed path boxes zero as a raw pointer payload. [Scalar raw lowering](../compiler/native/lower_raw.ouro) · [Managed pointer boxing](../compiler/native/managed_actions.ouro) |
+| `ouro.raw.add.wrap` | `(A : Type) -> RawPtr A -> USize -> Runtime (RawPtr A)`. Adds bytes modulo 2^64. | `lower_raw_add` and `managed_raw_add` emit `MirPointerAdd`; x64 adds the offset to the base. [Scalar raw lowering](../compiler/native/lower_raw.ouro) · [Managed raw lowering](../compiler/native/managed_raw.ouro) · [x64 emission](../compiler/native/codegen_ops.ouro) |
+| `ouro.raw.cast` | `(A : Type) -> (B : Type) -> RawPtr A -> Runtime (RawPtr B)`. Preserves the address bits. | `lower_raw_cast` retains the scalar value under the checked result type. `managed_raw_cast` wraps the existing pointer value in a deferred action. [Scalar raw lowering](../compiler/native/lower_raw.ouro) · [Managed raw lowering](../compiler/native/managed_raw.ouro) |
+| `ouro.raw.to_bits`, `ouro.raw.from_bits` | `(A : Type) -> RawPtr A -> Runtime USize` and `(A : Type) -> USize -> Runtime (RawPtr A)`. Preserves bits without an allocation identity or permission. | `lower_raw_bits` and `managed_raw_bits` emit `MirConvert MirRawToBits` or `MirRawFromBits`. x64 transfers the bits without changing them. [Scalar raw lowering](../compiler/native/lower_raw.ouro) · [Managed actions](../compiler/native/managed_actions.ouro) · [x64 emission](../compiler/native/codegen_ops.ouro) |
+| `ouro.raw.load`, `ouro.raw.store` with specialization `T` | `RawPtr T -> Runtime T` and `RawPtr T -> T -> Runtime Unit`. `T` resolves to a word, raw pointer, or concrete `RawFn`. | `lower_raw_load`, `lower_raw_store`, and `managed_raw_storage` emit `MirLoad` or `MirStore` at displacement zero. Operand types select 1, 4, or 8 bytes for ordinary x64 loads and stores. [Scalar raw lowering](../compiler/native/lower_raw.ouro) · [Managed raw lowering](../compiler/native/managed_raw.ouro) · [x64 emission](../compiler/native/codegen_ops.ouro) |
+| `ouro.fn.call` with specialization `S` | `RawFn S -> S` for a concrete nondependent telescope `S` of scalar arguments ending in `Runtime R`. `R` is a scalar or the registered `Unit`. The address must designate a live callable with the selected ABI and signature. Calls are `PrimitiveMayGc`. | `lower_fn_call` and `managed_fn_call` derive a concrete `MirSignature` and a `MirCall` with `MirIndirect`. The ABI backends select the argument and result locations. The managed path defers invocation in an action. [Scalar raw lowering](../compiler/native/lower_raw.ouro) · [Managed raw lowering](../compiler/native/managed_raw.ouro) · [Win64 calls](../compiler/native/codegen_ops.ouro) · [System V calls](../compiler/native/sysv_call.ouro) |
+| `ouro.runtime.pure`, `ouro.runtime.bind`, `ouro.runtime.loop` | `(A : Type) -> A -> Runtime A`, `(A : Type) -> (B : Type) -> Runtime A -> (A -> Runtime B) -> Runtime B`, and `(A : Type) -> A -> (A -> Runtime U8) -> (A -> Runtime A) -> Runtime A`. All have `PrimitiveMayGc` metadata. | Scalar `pure` keeps the returned value, `bind` sequences a saturated action with a lambda, and `loop` initializes state and emits a `MirBranch` before each step. A zero condition returns the current state. Managed actions capture values and invoke the action bodies when run. The loop carries no termination or single-use guarantee. [Scalar sequencing](../compiler/native/lower_ops.ouro) · [Scalar loops](../compiler/native/lower_loop.ouro) · [Managed actions](../compiler/native/managed_actions.ouro) · [IO surface](effects_design.md#runtime-surface) |
+| `extern` with `windows-x86_64`, `win64` | Concrete nondependent scalar arguments and a scalar or registered `Unit` inside `Runtime`. The registry requires bounded nonempty ASCII library and symbol fields and a nonvariadic signature. `nogc` is a foreign contract and `maygc` permits collection. | `lower_libraries` retains `MirExtern` signatures and mappings. Raw calls are direct. Managed `managed_external` defers the call until invocation and adapts boxed arguments and results. x64 emits Win64 argument placement and a PE import call. A correct foreign implementation and its declared policy are caller obligations. [Extern registry](../compiler/primitive_registry.ouro) · [Import lowering](../compiler/native/lower.ouro) · [Managed extern lowering](../compiler/native/managed_extern.ouro) · [PE imports](../compiler/native/pe_imports.ouro) |
+
+Raw add, cast, bit conversion, load, and store have metadata
+`PrimitiveRuntimeAction` and `PrimitiveNoGc`. For a live byte buffer,
+`raw_buffer_range` checks that the range fits the supplied capacity. For a
+nonempty range, it rejects a null base or an address calculation that wraps.
+The caller owns the allocation and supplies its true capacity.
+[Raw buffer helpers](../runtime/raw_buffer.ouro) ·
+[Primitive effects](../compiler/primitive_contracts.ouro)
+
+### Layout and managed roots
+
+`primitive_validate_layout` checks a supplied `PrimitiveRawLayout` and returns
+`Either PrimitiveError PrimitiveCheckedLayout`. It requires a positive size at
+most 2^31 minus one, a power-of-two alignment through 4096, and a size divisible
+by that alignment. Fields have unique IDs and ordered nonoverlapping ranges.
+Bounds use `offset <= size` and `width <= size - offset` before calculating the
+end. Unpacked fields require offsets divisible by the scalar width and aggregate
+alignment at least that width. Packed fields bypass just those field alignment
+checks. Invalid sizes, alignments and field ranges yield `PrimitiveInvalidLayout`.
+The validator also rechecks normalized ABI field types. Production source
+declarations and MIR currently have no raw aggregate layout consumer.
+[Layout validator](../compiler/primitive_registry.ouro) ·
+[Alignment rules](../compiler/primitive_contracts.ouro) ·
+[Layout cases](../tests/compiler_primitive_registry_tests.ouro)
+
+In the Windows managed heap, a raw pointer box is a managed object whose address
+payload is untraced. The box can be rooted and gives no ownership of the storage
+the payload points to. `MirRawToBits`, `MirRawFromBits`, and `MirPointerAdd` use raw
+pointers. Managed indexed access keeps the `MirManagedPtr` owner and `MirUSize`
+offset as separate operands of `MirLoadAt` or `MirStoreAt`. Liveness keeps a
+needed owner rooted across a preceding safepoint. Code generation computes the
+effective address inside the memory instruction. The collector uses typed
+descriptors and shadow roots. It traces only owned managed objects. The Windows
+private heap stores managed objects, and the collector uses a separate raw page
+reservation for its worklist.
+[MIR types](../compiler/native/mir_types.ouro) ·
+[Liveness](../compiler/native/mir_live.ouro) ·
+[Shadow roots](../compiler/native/codegen_roots.ouro) ·
+[Runtime roots](../runtime/managed_roots.ouro) ·
+[Mark worklist](../runtime/managed_mark.ouro) ·
+[Managed heap trust](tcb.md#native-windows-managed-heap)
+
+### Verification and expected rejection
+
+Case names and fixture paths identify intended assertions. Execution evidence
+identifies the revision, host, producer, target, command and observed outcome.
+Record `pass`, `fail`, `not-run`, `unsupported`, and `resource-limit` separately.
+A resource limit, timeout, or skipped probe leaves the obligation open. A
+negative case passes when it reports the expected failure at its owning phase.
+[Validation matrix](ci.md#validation-matrix) ·
+[Reports and failures](ci.md#reports-and-failures)
+
+| Verifier | Positive and negative assertions | Evidence boundary |
+| --- | --- | --- |
+| Source checker and binding replay | `compiler_primitive_registry` checks canonical roles, ABI and layout. `compiler_primitive_binding` checks integration with declaration checking. `native_lower` exercises concrete adapters and rejects generic raw storage, wrong pointees or widths, dependent call signatures, and attempts to use an action as a pure result. Forged primitive metadata fails replay. Invalid primitive metadata yields `CheckPrimitiveFailure`, signature conversion can yield a type failure, and exhausted registry fuel yields `CheckResourceLimit`. [Registry cases](../tests/compiler_primitive_registry_tests.ouro) · [Binding cases](../tests/compiler_primitive_binding_tests.ouro) · [Lowering cases](../tests/native_lower_tests.ouro) | Complete import checking, normalized binding identities and typed rejections. |
+| Native lowering and MIR | Checked-word fixtures in `native_managed_phase` inspect the guarded `Maybe` control flow, payload roots and `LowerUnsupportedPrimitive`. `native_mir`, `native_gc`, and `native_live` cover operand types, call shape, initialized MIR locals, and safepoints. The verifiers reject examples of `MirTypeMismatch`, `MirInvalidCall`, `MirUninitialized`, and false `NoGc` claims. MIR local initialization concerns compiler temporaries. [Checked words](../tests/native_word_checked_fixtures.ouro) · [MIR validator](../compiler/native/mir.ouro) · [Indexed memory cases](../tests/native_indexed_memory_tests.ouro) · [GC cases](../tests/native_gc_tests.ouro) · [Live roots](../tests/native_live_tests.ouro) | MIR and GC metadata, including a replay before code generation. Heap initialization and foreign ABI behavior require separate evidence. |
+| Machine code and image validation | `native_mir` checks x64 byte vectors and generated PE images. `native_pe` exercises import, fixup, frame and layout checks. `native_linux_source`, `native_sysv`, and `native_elf_data` cover source-to-ELF, the scalar ABI and ELF segments. The Linux source fixture requires `LinuxImportsUnsupported` for even an unused Win64 extern, and checks rejection of unsupported source operations. [PE cases](../tests/native_pe_tests.ouro) · [Linux source cases](../tests/native_linux_source_tests.ouro) · [System V cases](../tests/native_sysv_tests.ouro) · [ELF data cases](../tests/native_elf_data_tests.ouro) | Image emission and validation. Observe generated executables on the corresponding target for behavior. |
+| Runtime, GC and FFI | The Windows frontend host suite emits and runs native RawFn, heap observation and liveness cases. The probes check deferred effect ordering, process status and streams, and exercised allocation and collection behavior. The C host has separate runtime selftests for its bound word operations and action sequencing. [Windows host probes](../scripts/frontend_host_suite.py) · [C runtime selftests](../runtime/ouro_io_selftest.c) | Target behavior on exercised paths. Keep evidence of faults and sustained reclamation alongside successful paths. |
+
+The [compiler suite catalog](../tools/test/suites.ouro) registers the named
+compiler cases. The [systems validation plan](design.md#systems-validation)
+owns the proposed positive and negative scenarios. Their current owners are
+as follows.
+
+| Requirement and contract | Current owner and model obligation |
+| --- | --- |
+| `REQ-MEM-IDENTITY` / `CON-MEM-IDENTITY` | The memory model tracks allocation identity across free and address reuse. Managed collector exact-base tracking applies to its own heap and current allocation list. Raw pointer bits have no allocation identity. [Memory model cases](../tests/compiler/systems/memory_model_tests.ouro) |
+| `REQ-MEM-BOUNDS` / `CON-MEM-BOUNDS` | `raw_buffer_range` checks capacity for byte-buffer callers. The layout validator checks static field extents. The memory model requires the full scalar access to fit a live allocation. [Raw buffer helpers](../runtime/raw_buffer.ouro) · [Memory model cases](../tests/compiler/systems/memory_model_tests.ouro) |
+| `REQ-MEM-ALIGN` / `CON-MEM-ALIGN` | The layout validator checks field offsets. The memory model rejects a misaligned typed access. Raw loads and stores rely on their caller's storage contract. [Layout checks](#layout-and-managed-roots) · [Memory model cases](../tests/compiler/systems/memory_model_tests.ouro) |
+| `REQ-MEM-INIT` / `CON-MEM-INIT` | `mir_flow` checks local definitions before use. The memory model tracks initialized bytes and a typed load's complete width. [MIR flow](../compiler/native/mir_flow.ouro) · [Memory model cases](../tests/compiler/systems/memory_model_tests.ouro) |
+| `REQ-RES-UNIQUE` / `CON-RES-UNIQUE` | `RawPtr` carries no ownership. The resource model tracks unique ownership, moves and loans with explicit state. [Resource model cases](../tests/compiler/systems/resource_model_tests.ouro) |
+| `REQ-ACTION-ONCE` / `CON-ACTION-ONCE` | Managed and hosted `Runtime` actions can run repeatedly. The resource model checks single consumption for actions with owning captures. [Resource model cases](../tests/compiler/systems/resource_model_tests.ouro) · [Managed reuse case](../tests/native_managed/source_loop_reuse.ouro) |
+| `REQ-PURE-BOUNDARY` / `CON-PURE-BOUNDARY` | The pure checker keeps runtime operations and loops opaque. The proposed checker must apply that boundary to systems obligations over immutable indices. [Pure closure](tcb.md#pure-dependency-closure) · [Systems checking](design.md#scope-and-checking) |
+| `REQ-ERASE-RELEVANCE` / `CON-ERASE-RELEVANCE` | Checked erasure prepares normalized type arguments for emission. The proposal also requires a relevance check and a simulation showing that witness erasure preserves runtime results and effects. [Checked erasure](../compiler/erasure_checked.ouro) · [Systems validation](design.md#systems-validation) |
+| `REQ-TRUST-DEPENDENCY` / `CON-TRUST-DEPENDENCY` | Compiler checking accepts explicitly declared axioms as assumptions. The proposed systems trust policy must reject a disallowed transitive axiom at a strict safety root and identify the dependency chain. [Current assurance limits](tcb.md#assurance-limits) · [Systems trust](design.md#systems-trust) |
+| `REQ-LOWER-NO-UB` / `CON-LOWER-NO-UB` | Scalar and managed lowering and target emitters already reject unsupported mappings. The proposed contract requires a simulation from defined model steps through MIR and the target, including rejection before any unsupported operation executes. [Native replay](../compiler/native/lower_boundary.ouro) · [Systems validation](design.md#systems-validation) |
+
+### Stages and targets
+
+| Stage or target | Implemented slice | Required evidence |
+| --- | --- | --- |
+| Source checking on a C host or with native `coil` | The Ouro checker accepts or rejects the complete import closure and checks registry keys, signatures, and metadata. Check mode also serves modules without executable entries. | Preserve acceptance and rejection in the compiler-checking suites and kernel profile. Check results cover the declaration phase. [Checking entry points](kernel_design.md#entry-points-and-results) · [Local profiles](ci.md#local-profiles) |
+| C bootstrap and transitional C execution | The pinned generated C and handwritten runtime build the host producer. C execution implements `Runtime` pure, bind and loop, checked `Nat` construction of `U8`, `U32`, and `U64`, and `U8` wrapping subtraction in this inventory. The C host reports unwired raw operations, `RawFn` calls and Win64 externs on stderr and exits with status 70. | Record the producer, pinned inputs and artifact hashes. The stage loop compares generated frontend and backend C. The C runtime suite checks executable behavior separately. [Build and stage loop](build.md#generated-artifacts-and-stage-loop) · [Checked C binding keys](../compiler/checked_program_output.ouro) · [C bindings](../runtime/ouro_io.c) · [Runtime IO suite](../scripts/runtime_io_suite.sh) |
+| Windows x86-64 scalar PE | `native_compile_units` lowers directly to x64 and PE with Win64 imports. It supports raw scalar operations, concrete indirect calls, and the bounded scalar `Runtime` slice. The raw user entry returns a `U32` representation from `U32` or `Runtime U32`. | Require checker and MIR verification, instruction and PE assertions, and the observed exit status and effects of the emitted PE on Windows x86-64. [Scalar source entry](../compiler/native/lower_source.ouro) |
+| Windows x86-64 managed PE | The managed path supports closures, deferred actions, checked boxed word cases, native roots, and platform adapters. `coil build` and `ouro1 build FILE.ouro` use the Windows target. | Require isolated native tool acceptance and target behavior separately from compiler build and PE emission. Include GC stress, foreign outcomes, and retained checked IO behavior. [Managed lowering](../compiler/native/managed_source.ouro) · [Compile commands](tooling.md#native-program-compile) · [Native tool acceptance](ci.md#native-tool-acceptance) |
+| Experimental Linux x86-64 ELF | `native_compile_linux_units` lowers the checked scalar source slice to freestanding ELF with concrete System V calls. The MIR writer supports image-local data. Managed values, imports, and large frames are rejected. CLI target dispatch, a Linux runtime and a published seed are outside this slice. | Check the ELF and call bytes, then run a matching emitted image on Linux x86-64 for target behavior. `native_linux_source` can emit the byte vector for `--image exit42`. Record target execution separately from that vector. [Linux backend](#experimental-linux-backend) · [Linux source cases](../tests/native_linux_source_tests.ouro) |
+| Native seed and release transition | Seed provenance, successor builds, and compatibility with retained stages remain separate obligations. | Require isolated-host rebuilds, unsigned stage comparison, artifact inspection and behavior tests for every retained target. Matching stages or valid images alone leave execution obligations open. [Native toolchain contract](design.md#native-toolchain-contract) · [Release acceptance criteria](roadmap.md#acceptance-and-compatibility) |
+
 ## Bootstrap and generated artifacts
 
 [Build and bootstrap](build.md#generated-artifacts-and-stage-loop) owns the

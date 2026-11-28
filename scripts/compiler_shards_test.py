@@ -7,15 +7,22 @@ import io
 import json
 import os
 from pathlib import Path
+from stat import FILE_ATTRIBUTE_REPARSE_POINT, S_IFDIR
 import subprocess
+import sys
 import tempfile
 from threading import Barrier
+from types import SimpleNamespace
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import compiler_shards
-from compiler_shards import COMPILER_SHARDS, SHARD_MEMORY_MIB
-from local_scheduler import CheckoutSnapshot, MEMORY_ENV
+from compiler_shards import (
+    COMPILER_SHARDS, SHARD_MEMORY_MIB, SHARD_PREWARM_ENV, SHARD_PREWARM_MEMORY_MIB, SHARD_PREWARM_TIMEOUT_S,
+)
+from local_scheduler import CheckoutSnapshot, JOBS_ENV, MEMORY_ENV
+from native_tool_build import COMPILER_SHARD_C_WORKERS_ENV
+from repo_support import hash_json
 
 
 class CompilerShardTests(unittest.TestCase):
@@ -88,6 +95,206 @@ class CompilerShardTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "prepared test runner inputs differ"):
                 compiler_shards.verify_prepared_runner(runner, runner, compiler)
 
+    def test_hosted_prewarm_reuses_build_protocol_and_keeps_the_native_verdict(self):
+        rows = [(f"case{index}", f"tests/case{index}.ouro") for index in range(16)]
+        rows.append(("source_spans", "tests/source_span_tests.ouro"))
+        names = ("case0", "case15")
+
+        def exercise(fault, expected_warmed):
+            with tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary).resolve()
+                wrapper = (root / "scripts/build_tool.sh").as_posix()
+                compiler_dir = (root / "_build/c").as_posix()
+                state = {"locked": False}
+
+                @contextlib.contextmanager
+                def cache_access(_config):
+                    state["locked"] = True
+                    try:
+                        yield
+                    finally:
+                        state["locked"] = False
+
+                index = COMPILER_SHARDS if fault == "isolated-shard" else 1
+                out = root / "_build" / f"compiler_check_suite_{index}"
+                out.mkdir(parents=True, exist_ok=True)
+                runner = out / "ouro-test-suite"
+                shard = f"{index}/{COMPILER_SHARDS}"
+                command = [str(runner), "--native-suite=compiler-checking", f"--out={out}", f"--shard={shard}"]
+                cache = root.parent if fault == "outside-cache" else root / "_cache/ouro"
+                config = Mock()
+                config.get_bool.return_value = fault != "disabled"
+                config.path.return_value = cache
+                worker_started = Barrier(2)
+                built = []
+                env = {
+                    SHARD_PREWARM_ENV: "1", COMPILER_SHARD_C_WORKERS_ENV: "2", JOBS_ENV: "2",
+                    MEMORY_ENV: str(SHARD_PREWARM_MEMORY_MIB - (fault == "budget")),
+                    "GITHUB_ACTIONS": "true", "GITHUB_EVENT_NAME": "pull_request",
+                    "OURO_TEST_BUILD": wrapper, "OURO_C_BUILD_DIR": compiler_dir,
+                    "OURO_JOBS": "1", "OURO_FRONTEND_JOBS": "1", "RAYON_NUM_THREADS": "1",
+                }
+                native_env = {key: value for key, value in env.items() if key != SHARD_PREWARM_ENV}
+
+                def launch(argv, *, cwd, env, **options):
+                    self.assertEqual(cwd, root)
+                    self.assertEqual(env, native_env)
+                    if argv[-1] == "--check":
+                        self.assertTrue(state["locked"])
+                        self.assertEqual(argv[1:], ["scripts/native_tool_build.py", "tools/test/main.ouro",
+                                                    str(runner), "--compiler", str(Path(compiler_dir) / "ouro1"),
+                                                    "--check"])
+                        self.assertEqual(options["timeout"], 60)
+                        return SimpleNamespace(returncode=int(fault == "stale-runner"))
+                    if argv[-1] == "--list":
+                        self.assertTrue(state["locked"])
+                        self.assertEqual(argv, [*command, "--list"])
+                        listing = b"tests/case0.ouro\ntests/case15.ouro\n"
+                        return SimpleNamespace(returncode=0, stderr=b"",
+                                               stdout=listing if fault != "inventory" else b"")
+                    self.assertFalse(state["locked"])
+                    self.assertEqual(argv, command)
+                    self.assertCountEqual(built, names if expected_warmed else ())
+                    return SimpleNamespace(returncode=0 if expected_warmed else -9)
+
+                def build(argv, *, cwd, env, timeout_s, memory_mb):
+                    self.assertTrue(state["locked"])
+                    self.assertEqual(cwd, root)
+                    name = Path(argv[3]).stem
+                    self.assertIn(name, names)
+                    self.assertEqual(argv, ["sh", wrapper, f"tests/{name}.ouro", str(out / f"{name}.exe")])
+                    self.assertEqual((env[JOBS_ENV], env[MEMORY_ENV], env["OURO_JOBS"],
+                                      env["OURO_FRONTEND_JOBS"], env["RAYON_NUM_THREADS"], memory_mb),
+                                     ("1", "3072", "1", "1", "1", SHARD_MEMORY_MIB))
+                    self.assertEqual(timeout_s, SHARD_PREWARM_TIMEOUT_S)
+                    self.assertNotIn(COMPILER_SHARD_C_WORKERS_ENV, env)
+                    self.assertNotIn(SHARD_PREWARM_ENV, env)
+                    built.append(name)
+                    worker_started.wait(timeout=5)
+                    failed = fault == "worker" and name == names[0]
+                    return SimpleNamespace(status="ok", returncode=int(failed),
+                                           stdout=b"build output\n", stderr=b"build error\n")
+
+                with (patch.dict(os.environ, env, clear=True), patch.object(compiler_shards, "ROOT", root),
+                      patch.object(compiler_shards.sys, "platform", "linux"),
+                      patch("ouro_build.load_config", return_value=config),
+                      patch("ouro_build.cache_build_access", side_effect=cache_access),
+                      patch("ouro_build.trim_cache") as trim,
+                      patch("ci_gate.compiler_fixture_rows", return_value=rows),
+                      patch.object(compiler_shards.subprocess, "run", side_effect=launch),
+                      patch("ourosmith.limits.run_limited_bytes", side_effect=build)):
+                    self.assertEqual(compiler_shards.run_hosted_shard(runner, out, shard),
+                                     0 if expected_warmed else 137)
+                if expected_warmed:
+                    trim.assert_called_once_with(config)
+                    report_path = next(out.glob("prewarm-*/prewarm.json"))
+                    report = json.loads(report_path.read_text(encoding="utf-8"))
+                    self.assertEqual(report["failed"], [names[0]] if fault == "worker" else [])
+                    self.assertEqual(report["schedule"]["peak_tasks"], 2)
+                    self.assertEqual(report["schedule"]["peak_memory_mib"], SHARD_PREWARM_MEMORY_MIB)
+                    self.assertEqual((report_path.parent / f"{names[0]}.stderr").read_bytes(), b"build error\n")
+
+        for fault, expected_warmed in (
+            ("none", True), ("worker", True), ("stale-runner", False), ("inventory", False), ("budget", False),
+            ("disabled", False), ("outside-cache", False), ("isolated-shard", False),
+        ):
+            with self.subTest(fault=fault):
+                exercise(fault, expected_warmed)
+
+    def test_prewarm_cli_rejects_modes_that_own_the_runner_or_verdict(self):
+        for extra in (["--verify-with", "ouro1"], ["--native"], ["--suite-probe-failure"], ["--jobs=2"]):
+            with (self.subTest(extra=extra),
+                  patch.object(sys, "argv", ["compiler_shards.py", "--runner", "runner", "--out", "out",
+                                            "--prewarm-shard=1/16", *extra]),
+                  contextlib.redirect_stderr(io.StringIO()) as stderr, self.assertRaises(SystemExit) as stopped):
+                compiler_shards.main()
+            self.assertEqual(stopped.exception.code, 2)
+            self.assertIn("--prewarm-shard cannot be combined", stderr.getvalue())
+
+    def test_timing_history_requires_matching_successful_shards(self):
+        checks = {"1": ["first", "second"], "2": ["third"]}
+        rows = [("first", "tests/first.ouro"), ("third", "tests/third.ouro"), ("second", "tests/second.ouro")]
+        inventory_sha256 = hash_json(rows)
+        shards = [{"shard": int(name), "pass": True, "returncode": 0, "elapsed_s": 90 if name == "1" else 2,
+                   "fixture_rows": expected, "completed_rows": expected} for name, expected in checks.items()]
+        report = {"kind": compiler_shards.SHARD_REPORT_KIND, "pass": True, "native": True,
+                  "inventory_sha256": inventory_sha256, "shards": shards}
+        first, second = shards
+        invalid = (
+            ("failed report", {**report, "pass": False}),
+            ("runner mode", {**report, "native": False}),
+            ("legacy report", {key: value for key, value in report.items() if key != "inventory_sha256"}),
+            ("fixture path", {**report, "inventory_sha256": hash_json([("first", "tests/moved.ouro"), *rows[1:]])}),
+            ("inventory order", {**report, "inventory_sha256": hash_json(rows[::-1])}),
+            ("shard order", {**report, "shards": shards[::-1]}),
+            ("missing shard", {**report, "shards": [first]}),
+            ("boolean shard index", {**report, "shards": [{**first, "shard": True}, second]}),
+            ("float shard index", {**report, "shards": [{**first, "shard": 1.0}, second]}),
+            ("failed shard", {**report, "shards": [{**first, "pass": False}, second]}),
+            ("failed process", {**report, "shards": [{**first, "returncode": 1}, second]}),
+            ("boolean return code", {**report, "shards": [{**first, "returncode": False}, second]}),
+            ("float return code", {**report, "shards": [{**first, "returncode": 0.0}, second]}),
+            ("shard fixture order", {**report, "shards": [{**first, "fixture_rows": checks["1"][::-1]}, second]}),
+            ("incomplete shard", {**report, "shards": [{**first, "completed_rows": ["first"]}, second]}),
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+
+            def publish(name, raw, mtime):
+                directory = root / name
+                directory.mkdir(exist_ok=True)
+                path = directory / "shards.json"
+                path.write_bytes(raw)
+                os.utime(path, (mtime, mtime))
+
+            def timings(out):
+                return compiler_shards.recent_shard_timings(out, checks, inventory_sha256, native=True)
+
+            other = json.dumps(report).encode()
+            publish("run.z-older", other, 100)
+            publish("run.a-newer", json.dumps({**report, "shards": [{**first, "elapsed_s": 1}, second]}).encode(), 101)
+            publish("run.current", other, 104)
+            publish("other-directory", other, 105)
+            out = root / "run.current"
+            self.assertEqual(timings(out), {"1": 1, "2": 2})
+            for label, bad in invalid:
+                with self.subTest(label=label):
+                    publish("run.invalid", json.dumps(bad).encode(), 102)
+                    self.assertEqual(timings(out), {"1": 1, "2": 2})
+            for elapsed in (False, 0, -1, "4", float("nan"), float("inf"), 10**400):
+                with self.subTest(elapsed=elapsed):
+                    bad = {**report, "shards": [{**first, "elapsed_s": elapsed}, second]}
+                    publish("run.invalid", json.dumps(bad).encode(), 102)
+                    self.assertEqual(timings(out), {"1": 1, "2": 2})
+            for field, duplicate in (
+                (b'"pass": true', b'"pass": false, "pass": true'),
+                (b'"returncode": 0', b'"returncode": 1, "returncode": 0'),
+            ):
+                with self.subTest(duplicate=duplicate):
+                    publish("run.invalid", other.replace(field, duplicate, 1), 102)
+                    self.assertEqual(timings(out), {"1": 1, "2": 2})
+            publish("run.invalid", b"{", 102)
+            publish("run.oversize", other + b" " * compiler_shards.TIMING_REPORT_MAX_BYTES, 103)
+            self.assertEqual(timings(out), {"1": 1, "2": 2})
+            self.assertIsNone(timings(root / "direct-output"))
+
+            junction = Mock(name="junction")
+            junction.name = "run.junction"
+            junction.path = str(root / "other-directory")
+            junction.is_dir.return_value = True
+            junction.stat.return_value = SimpleNamespace(
+                st_mode=S_IFDIR, st_file_attributes=FILE_ATTRIBUTE_REPARSE_POINT,
+            )
+            with os.scandir(root) as entries:
+                candidates = [junction, *entries]
+            with patch.object(compiler_shards.os, "scandir") as scan:
+                scan.return_value.__enter__.return_value = candidates
+                self.assertEqual(timings(out), {"1": 1, "2": 2})
+
+            for index in range(compiler_shards.TIMING_REPORT_LIMIT):
+                publish(f"run.invalid-{index}", b"{", 106 + index)
+            self.assertIsNone(timings(out))
+
     def test_budgets_preserve_inventory_and_detect_the_same_failure(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -101,8 +308,12 @@ class CompilerShardTests(unittest.TestCase):
                              encoding="utf-8")
             expected = [f"COMPILER_CHECK_OK {name}-run" for name in names]
 
-            def exercise(jobs, *, inject_failure=False, memory=SHARD_MEMORY_MIB * COMPILER_SHARDS):
-                out = root / f"result-{jobs}-{inject_failure}-{memory}"
+            shard_order = list(range(1, COMPILER_SHARDS + 1))
+
+            def exercise(jobs, *, inject_failure=False, memory=SHARD_MEMORY_MIB * COMPILER_SHARDS,
+                         out=None, expected_order=shard_order):
+                if out is None:
+                    out = root / f"result-{jobs}-{inject_failure}-{memory}"
                 out.mkdir()
                 active = min(jobs, memory // SHARD_MEMORY_MIB, COMPILER_SHARDS)
                 barrier = Barrier(active) if active > 1 else None
@@ -119,7 +330,7 @@ class CompilerShardTests(unittest.TestCase):
                     marker = cwd / "_build/source_spans.progress"
                     with marker.open("x", encoding="utf-8") as stream:
                         stream.write(str(shard))
-                    if barrier is not None and shard <= active:
+                    if barrier is not None and shard in expected_order[:active]:
                         barrier.wait(timeout=10)
                     if inject_failure and shard == 2:
                         stderr.write(b"COMPILER_CHECK_FAIL case_2-run exit=1 want=0\n")
@@ -136,6 +347,7 @@ class CompilerShardTests(unittest.TestCase):
                           patch.object(compiler_shards, "ROOT", root),
                           patch.object(compiler_shards, "CheckoutSnapshot") as snapshot,
                           patch.object(compiler_shards.subprocess, "run", side_effect=run),
+                          patch.object(compiler_shards, "run_tasks", wraps=compiler_shards.run_tasks) as schedule,
                           patch.dict(os.environ, {MEMORY_ENV: str(memory)})):
                         snapshot.return_value.copy_to.side_effect = lambda path: path.mkdir()
                         status = compiler_shards.run_shards(root / "runner", out, jobs=jobs,
@@ -144,7 +356,8 @@ class CompilerShardTests(unittest.TestCase):
                     report = json.loads((out / "shards.json").read_text(encoding="utf-8"))
                     self.assertEqual(status, int(inject_failure))
                     self.assertEqual(report["pass"], not inject_failure)
-                    self.assertEqual([row["shard"] for row in report["shards"]], list(range(1, COMPILER_SHARDS + 1)))
+                    self.assertEqual([int(task.name) for task in schedule.call_args.args[0]], expected_order)
+                    self.assertEqual([row["shard"] for row in report["shards"]], shard_order)
                     self.assertEqual([[line] for line in expected], [row["fixture_rows"] for row in report["shards"]])
                     self.assertEqual(len(list(out.glob("*/src/_build/source_spans.progress"))), COMPILER_SHARDS)
                     return report, stdout.getvalue().splitlines(), stderr_bytes.getvalue()
@@ -163,6 +376,26 @@ class CompilerShardTests(unittest.TestCase):
                     self.assertIn(b"COMPILER_CHECK_FAIL case_2-run", error)
             throttled, _, _ = exercise(20, memory=SHARD_MEMORY_MIB)
             self.assertEqual(throttled["schedule"]["peak_tasks"], 1)
+
+            prior = root / "run.prior"
+            timed, _, _ = exercise(1, out=prior)
+            for row in timed["shards"]:
+                row["elapsed_s"] = {COMPILER_SHARDS: 30, 3: 20, 12: 20}.get(row["shard"], 10)
+            (prior / "shards.json").write_text(json.dumps(timed), encoding="utf-8")
+            longest_first = [COMPILER_SHARDS, 3, 12, *(shard for shard in shard_order
+                                                     if shard not in {COMPILER_SHARDS, 3, 12})]
+            timed_failure, lines, error = exercise(20, inject_failure=True, memory=2 * SHARD_MEMORY_MIB,
+                                                   out=root / "run.timed-failure", expected_order=longest_first)
+            self.assertEqual(timed_failure["schedule"]["peak_tasks"], 2)
+            self.assertEqual(timed_failure["schedule"]["peak_memory_mib"], 2 * SHARD_MEMORY_MIB)
+            self.assertEqual(lines, [expected[0], *expected[2:]])
+            self.assertIn(b"COMPILER_CHECK_FAIL case_2-run", error)
+            _, lines, error = exercise(2, out=root / "run.timed-success", expected_order=longest_first)
+            self.assertEqual(lines[:-1], expected)
+            self.assertEqual(error, b"")
+            exercise(1, out=root / "run.serial")
+            exercise(20, out=root / "run.serial-memory", memory=SHARD_MEMORY_MIB)
+            exercise(20, out=root / "run.one-wave")
 
 
 if __name__ == "__main__":

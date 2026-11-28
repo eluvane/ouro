@@ -7,6 +7,7 @@ import hashlib
 import os
 import subprocess
 import sys
+import tempfile
 import time
 from pathlib import Path
 from typing import Any, Optional, Sequence
@@ -133,39 +134,96 @@ def promotion_bytes(raw: bytes) -> bytes:
     return raw.replace(b"\r\n", b"\n").replace(b"\r", b"\n")
 
 
+def reported_path_matches(value: object, expected: Path) -> bool:
+    if not isinstance(value, str):
+        return False
+    path = Path(value)
+    try:
+        # Windows path equality folds case even in case-sensitive directories.
+        return path == expected and (str(path) == str(expected) or path.samefile(expected))
+    except OSError:
+        return False
+
+
 def frontend_regen_check(
     env: dict[str, str], work: Path, jobs: int, seed: Path, reference: dict[str, Path]
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     issues: list[dict[str, Any]] = []
-    out = work / "frontend-regenerated" / "driver_u.c"
-    fe_work = work / "frontend-regenerated" / "work"
-    report = work / "frontend-regenerated" / "frontend-regeneration.json"
-    cmd = [
-        "sh",
-        "scripts/emit_frontend.sh",
-        "--ouro1",
-        str(seed),
-        "--out",
-        str(out),
-        "--work",
-        str(fe_work),
-        "--report",
-        str(report),
-        "--jobs",
-        str(max(1, jobs)),
-        "--no-cache",
-    ]
-    rc = run(cmd, env=env, log=work / "frontend-regeneration.log")
-    data: dict[str, Any] = {"out": rel(out), "report": rel(report), "command_rc": rc}
-    if rc != 0:
-        issues.append({"reason": "frontend regeneration failed", "log": rel(work / "frontend-regeneration.log")})
-        return issues, data
+    directory = work / "frontend-regenerated"
+    directory.mkdir(parents=True, exist_ok=True)
+    log = work / "frontend-regeneration.log"
+    with tempfile.TemporaryDirectory(prefix=".regen-", dir=directory) as temporary:
+        staging = Path(temporary)
+        out = staging / "driver_u.c"
+        report = staging / "frontend-regeneration.json"
+        fe_work = staging / "work"
+        cmd = [
+            "sh",
+            "scripts/emit_frontend.sh",
+            "--ouro1",
+            str(seed),
+            "--out",
+            str(out),
+            "--work",
+            str(fe_work),
+            "--report",
+            str(report),
+            "--jobs",
+            str(max(1, jobs)),
+            "--no-cache",
+        ]
+        rc = run(cmd, env=env, log=log)
+        data: dict[str, Any] = {"command_rc": rc}
+        if rc != 0:
+            issues.append({"reason": "frontend regeneration failed", "log": rel(log)})
+            return issues, data
+        result = read_json_object_or_none(report) if report.is_file() and not report.is_symlink() else None
+        if result is None:
+            issues.append({"reason": "missing or invalid frontend regeneration report", "path": rel(report)})
+            return issues, data
+        if (
+            result.get("gate") != "frontend_regen"
+            or result.get("pass") is not True
+            or result.get("cache_enabled") is not False
+            or result.get("fast_path") is not False
+            or result.get("final_cache") != "disabled"
+            or result.get("output") != "updated"
+            or not reported_path_matches(result.get("seed"), seed)
+            or not reported_path_matches(result.get("out"), out)
+            or not reported_path_matches(result.get("work"), fe_work)
+        ):
+            issues.append({"reason": "frontend regeneration report did not prove fresh uncached output", "path": rel(report)})
+            return issues, data
+        try:
+            if out.is_symlink() or not out.is_file():
+                raise ValueError("expected a regular file")
+            raw = out.read_bytes()
+        except (OSError, ValueError) as exc:
+            issues.append({"reason": "unreadable frontend regeneration output", "path": rel(out), "error": str(exc)})
+            return issues, data
+        out_hash = hashlib.sha256(raw).hexdigest()
+        if not raw or result.get("output_sha256") != out_hash:
+            issues.append({"reason": "frontend regeneration output does not match its report", "path": rel(out)})
+            return issues, data
+        verified = staging / "verified"
+        publication = directory / staging.name.removeprefix(".")
+        published_out = publication / out.name
+        published_report = publication / report.name
+        try:
+            verified.mkdir()
+            with (verified / out.name).open("xb") as verified_file:
+                verified_file.write(raw)
+            write_json_atomic(verified / report.name, {**result, "out": str(published_out)})
+            # One rename keeps each report with the bytes it describes.
+            verified.rename(publication)
+        except OSError as exc:
+            issues.append({"reason": "could not publish frontend regeneration", "path": rel(publication), "error": str(exc)})
+            return issues, data
+        data.update({"out": rel(published_out), "report": rel(published_report)})
     expected = reference["driver_u.c"]
-    raw = out.read_bytes()
     promoted = promotion_bytes(raw)
     reference_bytes = expected.read_bytes()
     normalized_reference = promotion_bytes(reference_bytes)
-    out_hash = hashlib.sha256(raw).hexdigest()
     promoted_hash = out_hash if promoted is raw else hashlib.sha256(promoted).hexdigest()
     reference_hash = hashlib.sha256(reference_bytes).hexdigest()
     normalized_reference_hash = (reference_hash if normalized_reference is reference_bytes
@@ -182,7 +240,7 @@ def frontend_regen_check(
     if promoted != normalized_reference:
         issues.append({
             "reason": "frontend generated artifact drift",
-            "regenerated": rel(out),
+            "regenerated": rel(published_out),
             "reference": rel(expected),
             "regenerated_sha256": out_hash,
             "promotion_normalized_sha256": promoted_hash,

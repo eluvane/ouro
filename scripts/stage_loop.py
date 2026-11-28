@@ -143,7 +143,6 @@ def stage_signature(cfg: StageConfig, seed: Path) -> Tuple[str, dict]:
     roots = [BACKEND_ROOT] + [root for _tag, _mod, root, _file in freg.FRONTEND_TUS]
     graph, captured = freg.capture_unit_inputs(roots)
     files: Dict[str, Path] = {
-        "seed_binary": seed,
         "stage_loop_py": ROOT / "scripts/stage_loop.py",
         "stage_loop_sh": ROOT / "scripts/stage_loop.sh",
         "frontend_regen_py": ROOT / "scripts/frontend_regen.py",
@@ -162,6 +161,7 @@ def stage_signature(cfg: StageConfig, seed: Path) -> Tuple[str, dict]:
     files.update((name, ROOT / name) for name in captured)
     digests = {name: asdict(captured[name]) if name in captured else file_digest(path)
                for name, path in sorted(files.items()) if name in captured or path.exists()}
+    digests["seed_binary"] = file_digest(seed)
     meta = {
         "kind": "ouro.stage-loop.v5",
         "max_stages": cfg.max_stages,
@@ -235,10 +235,17 @@ def verified_stage_artifacts(stamp: Path, *, signature: str, stage: int, prev_sh
     data = load_json(stamp)
     if not isinstance(data, dict):
         return None
-    if data.get("input_signature") != signature or data.get("stage") != stage or data.get("prev_sha256") != prev_sha:
+    stamped_stage = data.get("stage")
+    expected = data.get("artifacts")
+    if (
+        data.get("input_signature") != signature
+        or type(stamped_stage) is not int
+        or stamped_stage != stage
+        or data.get("prev_sha256") != prev_sha
+        or not isinstance(expected, dict)
+    ):
         return None
     arts = artifact_summary(stage_dir, bin_path)
-    expected = data.get("artifacts", {})
     for key in ("backend_sha256", "frontend_sha256", "binary_sha256"):
         if not arts.get(key) or arts.get(key) != expected.get(key):
             return None
@@ -262,15 +269,15 @@ def maybe_fast_path(cfg: StageConfig, signature: str, started: float) -> bool:
     data = load_json(cfg.result)
     if not isinstance(data, dict):
         return False
-    if not (data.get("pass") and data.get("fixpoint") and data.get("input_signature") == signature):
+    if not (data.get("pass") is True and data.get("fixpoint") is True and data.get("input_signature") == signature):
         return False
-    last = int(data.get("stages") or 0)
-    if last < 2:
+    last = data.get("stages")
+    expected = data.get("artifacts")
+    if type(last) is not int or not 2 <= last <= cfg.max_stages or not isinstance(expected, dict):
         return False
     stage_dir = cfg.work / f"stage{last}"
     bin_path = cfg.work / f"ouro1_stage{last}"
     arts = artifact_summary(stage_dir, bin_path)
-    expected = data.get("artifacts", {})
     for key in ("backend_sha256", "frontend_sha256", "binary_sha256"):
         if not arts.get(key) or arts.get(key) != expected.get(key):
             return False
@@ -670,21 +677,22 @@ def _run_loop(cfg: StageConfig, *, reuse_static: bool) -> int:
     started = now()
     cfg.work.mkdir(parents=True, exist_ok=True)
     seed = ensure_seed(cfg)
-    stage0 = cfg.work / "ouro1_stage0"
-    copy_atomic(seed, stage0)
-    (cfg.work / "stage0_driver_u.c").unlink(missing_ok=True)
-    (cfg.work / "stage0_backend_u.c").unlink(missing_ok=True)
-    try:
-        (cfg.work / "stage0_driver_u.c").symlink_to(ROOT / "compiler/stage0/driver_u.c")
-        (cfg.work / "stage0_backend_u.c").symlink_to(ROOT / "compiler/stage0/backend_u.c")
-    except OSError:
-        shutil.copyfile(ROOT / "compiler/stage0/driver_u.c", cfg.work / "stage0_driver_u.c")
-        shutil.copyfile(ROOT / "compiler/stage0/backend_u.c", cfg.work / "stage0_backend_u.c")
-
     signature, sig_meta = stage_signature(cfg, seed)
     print(f"=== stage_loop max={cfg.max_stages} fuel={cfg.fuel} signature={signature[:16]} ===")
     if maybe_fast_path(cfg, signature, started):
         return 0
+
+    seed_sha = sig_meta["digests"]["seed_binary"]["sha256"]
+    stage0 = cfg.work / "ouro1_stage0"
+    copy_atomic(seed, stage0)
+    for name in ("driver_u.c", "backend_u.c"):
+        source = ROOT / "compiler/stage0" / name
+        staged = cfg.work / f"stage0_{name}"
+        staged.unlink(missing_ok=True)
+        try:
+            staged.symlink_to(source)
+        except OSError:
+            shutil.copyfile(source, staged)
 
     prev = stage0
     fixpoint = False
@@ -702,6 +710,15 @@ def _run_loop(cfg: StageConfig, *, reuse_static: bool) -> int:
         bin_path = cfg.work / f"ouro1_stage{i}"
         stamp = sdir / "stage.stamp.json"
         prev_sha = sha256_file(prev)
+        if i == 1 and prev_sha != seed_sha:
+            return fail_stage(
+                cfg,
+                started=started,
+                signature=signature,
+                stage=0,
+                failed_at="stage0_seed",
+                message=f"STAGE_LOOP: FAIL seed changed while staging {seed} -> {stage0}",
+            )
         report: dict = {"stage": i, "reused": False}
         arts = verified_stage_artifacts(stamp, signature=signature, stage=i, prev_sha=prev_sha,
                                         stage_dir=sdir, bin_path=bin_path)
